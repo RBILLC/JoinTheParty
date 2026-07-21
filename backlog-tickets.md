@@ -3,6 +3,18 @@
 **Phase:** `/to-tickets`
 **Sources:** `architecture-spec.md` · `technical-requirements.md` · `ui-ux-design-system.md`
 **Date:** 2026-07-21
+
+## Status (updated 2026-07-21)
+
+| Ticket | Status | Commit |
+|---|---|---|
+| SCAF-01 | ✅ Done | `4e59105` |
+| CORE-01 | ✅ Done | `4e59105` |
+| CORE-02 | ✅ Done | `a1b79fe` |
+| CORE-03 | ✅ Done (+ online command-latency learning, added after closed-loop sim findings) | `9d54de9` |
+| CORE-04 | ✅ Done | `5c15379` |
+| SCAF-04 | 🟡 Partial (tokens + codegen; shell wiring blocked on SCAF-02/03) | `702eea3` |
+| Everything else | ⬜ Not started | — |
 **MVP definition:** one device (iOS first — no token vendor needed for ShazamKit) recognizes a live speaker, plays the same track via Spotify, converges to lock, meter + wheel functional. Android reaches parity in the same epics via its own tickets.
 
 ---
