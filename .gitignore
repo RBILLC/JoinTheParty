@@ -1,0 +1,27 @@
+# Build output
+build/
+cmake-build-*/
+
+# IDE / editor
+.idea/
+.vs/
+.vscode/
+*.user
+
+# macOS / Xcode (populated by SCAF-02)
+.DS_Store
+ios/**/xcuserdata/
+ios/**/DerivedData/
+
+# Android / Gradle (populated by SCAF-03)
+android/.gradle/
+android/**/build/
+android/local.properties
+
+# Node / backend
+backend/node_modules/
+
+# Secrets — never committed
+*.p8
+*.pem
+.env

@@ -1,0 +1,47 @@
+# SCAF-01: desktop build + test gate for SyncCore.
+# Sanitizer job satisfies CORE-01's TSAN/ASAN acceptance criterion on Linux
+# (MSVC has no TSAN; the Windows job covers the MSVC toolchain build).
+name: core-ci
+
+on:
+  push:
+    paths: ["core/**", ".github/workflows/core-ci.yml"]
+  pull_request:
+    paths: ["core/**", ".github/workflows/core-ci.yml"]
+
+jobs:
+  linux-asan-ubsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S core -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DSYNCCORE_SANITIZE=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  linux-tsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S core -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows-msvc:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S core -B build -G "Visual Studio 17 2022"
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
