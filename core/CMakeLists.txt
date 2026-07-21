@@ -16,11 +16,21 @@ add_library(synccore STATIC
     src/synccore.cpp
     src/estimator/estimator.cpp
     src/policy/policy.cpp
+    src/correlate/correlate.cpp
+    third_party/kissfft/kiss_fft.c
+    third_party/kissfft/kiss_fftr.c
 )
 
 target_include_directories(synccore
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft
+)
+
+# Vendored code builds with warnings suppressed — ours does not.
+set_source_files_properties(
+    third_party/kissfft/kiss_fft.c third_party/kissfft/kiss_fftr.c
+    PROPERTIES COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/w,-w>"
 )
 
 find_package(Threads REQUIRED)
@@ -64,6 +74,7 @@ if(SYNCCORE_BUILD_TESTS)
     synccore_add_test(synccore_tests tests/test_synccore.cpp)
     synccore_add_test(estimator_tests tests/test_estimator.cpp)
     synccore_add_test(policy_tests tests/test_policy.cpp)
+    synccore_add_test(correlate_tests tests/test_correlate.cpp)
 
     # The public header must stay consumable as plain C99 — compile a pure C
     # translation unit that includes it.

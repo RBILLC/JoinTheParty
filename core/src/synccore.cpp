@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 
+#include "correlate/correlate.h"
 #include "estimator/estimator.h"
 #include "policy/policy.h"
 #include "spsc_ring.h"
@@ -82,6 +83,7 @@ struct sc_session {
     struct {
         synccore::SyncEstimator estimator;
         synccore::CorrectionPolicy policy;
+        synccore::ChirpDetector detector{kSupportedRateHz};
         uint64_t now_ns = 0;        // latest input timestamp seen
         uint64_t last_emit_ns = 0;  // last SC_EVT_SYNC_ESTIMATE emission
         int64_t last_commanded_position_ms = -1;  // self-hearing guard, CORE-06
@@ -120,12 +122,18 @@ struct sc_session {
             }
 
             // Drain captured audio; capture timestamps advance session time.
-            wk.scratch.clear();
-            while (ring.try_read(&hdr, &wk.scratch)) {
+            for (;;) {
+                wk.scratch.clear();  // keeps capacity — no realloc per block
+                if (!ring.try_read(&hdr, &wk.scratch)) break;
                 frames_consumed.fetch_add(hdr.frames, std::memory_order_relaxed);
-                wk.now_ns = std::max(wk.now_ns, hdr.capture_mono_ns);
-                if (wk.scratch.size() > static_cast<size_t>(kSupportedRateHz))
-                    wk.scratch.clear();  // bound scratch growth per iteration
+                const uint64_t block_end =
+                    hdr.capture_mono_ns +
+                    static_cast<uint64_t>(hdr.frames) * 1'000'000'000ull /
+                        kSupportedRateHz;
+                wk.now_ns = std::max(wk.now_ns, block_end);
+                if (wk.detector.armed())
+                    wk.detector.push(wk.scratch.data(), wk.scratch.size(),
+                                     hdr.capture_mono_ns);
             }
 
             for (const Command& cmd : pending) process(cmd);
@@ -173,6 +181,17 @@ struct sc_session {
         }
         if (wk.policy.fix_request_due(wk.now_ns))
             dispatch(SC_EVT_REQUEST_FIX, nullptr);
+        if (wk.detector.armed()) {
+            const auto det = wk.detector.poll(wk.now_ns);
+            if (det.done) {
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    calibrating = false;
+                }
+                sc_evt_calibration_result_t out{det.latency_ms, det.valid};
+                dispatch(SC_EVT_CALIBRATION_RESULT, &out);
+            }
+        }
     }
 
     void process(const Command& cmd) {
@@ -223,11 +242,16 @@ struct sc_session {
                     static_cast<double>(cmd.value_ms));
                 break;
             case Command::Kind::kBeginCalibration: {
+                // t0 = current capture time. Contract: the shell calls
+                // sc_begin_calibration at the instant it commands chirp
+                // playback, with capture already flowing.
+                wk.detector.arm(wk.now_ns);
                 std::lock_guard<std::mutex> lock(mtx);
                 calibrating = true;
                 break;
             }
             case Command::Kind::kCancelCalibration: {
+                wk.detector.disarm();
                 std::lock_guard<std::mutex> lock(mtx);
                 calibrating = false;
                 break;
