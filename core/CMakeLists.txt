@@ -14,6 +14,7 @@ option(SYNCCORE_SANITIZE "Enable Address/Undefined sanitizers (clang/gcc) or ASa
 
 add_library(synccore STATIC
     src/synccore.cpp
+    src/estimator/estimator.cpp
 )
 
 target_include_directories(synccore
@@ -42,21 +43,25 @@ endif()
 if(SYNCCORE_BUILD_TESTS)
     enable_testing()
 
-    add_executable(synccore_tests tests/test_synccore.cpp)
-    target_link_libraries(synccore_tests PRIVATE synccore)
-    # Tests may include internal headers (synccore_testing.h).
-    target_include_directories(synccore_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    if(MSVC)
-        target_compile_options(synccore_tests PRIVATE /W4 /permissive-)
-    else()
-        target_compile_options(synccore_tests PRIVATE -Wall -Wextra -Wpedantic)
-    endif()
-    if(SYNCCORE_SANITIZE AND NOT MSVC)
-        target_compile_options(synccore_tests PRIVATE -fsanitize=address,undefined)
-        target_link_options(synccore_tests PRIVATE -fsanitize=address,undefined)
-    endif()
+    # Test targets may include internal headers (src/…).
+    function(synccore_add_test name source)
+        add_executable(${name} ${source})
+        target_link_libraries(${name} PRIVATE synccore)
+        target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(MSVC)
+            target_compile_options(${name} PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(${name} PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        if(SYNCCORE_SANITIZE AND NOT MSVC)
+            target_compile_options(${name} PRIVATE -fsanitize=address,undefined)
+            target_link_options(${name} PRIVATE -fsanitize=address,undefined)
+        endif()
+        add_test(NAME ${name} COMMAND ${name})
+    endfunction()
 
-    add_test(NAME synccore_tests COMMAND synccore_tests)
+    synccore_add_test(synccore_tests tests/test_synccore.cpp)
+    synccore_add_test(estimator_tests tests/test_estimator.cpp)
 
     # The public header must stay consumable as plain C99 — compile a pure C
     # translation unit that includes it.
