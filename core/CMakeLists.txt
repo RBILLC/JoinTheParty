@@ -15,6 +15,7 @@ option(SYNCCORE_SANITIZE "Enable Address/Undefined sanitizers (clang/gcc) or ASa
 add_library(synccore STATIC
     src/synccore.cpp
     src/estimator/estimator.cpp
+    src/policy/policy.cpp
 )
 
 target_include_directories(synccore
@@ -62,6 +63,7 @@ if(SYNCCORE_BUILD_TESTS)
 
     synccore_add_test(synccore_tests tests/test_synccore.cpp)
     synccore_add_test(estimator_tests tests/test_estimator.cpp)
+    synccore_add_test(policy_tests tests/test_policy.cpp)
 
     # The public header must stay consumable as plain C99 — compile a pure C
     # translation unit that includes it.

@@ -119,6 +119,24 @@ bool SyncEstimator::on_fix(int64_t match_offset_ms, uint64_t capture_mono_ns,
     return true;
 }
 
+void SyncEstimator::on_local_seek(int64_t target_ms, uint64_t issued_mono_ns,
+                                  double command_latency_ms) {
+    if (!valid_ || !has_player_) return;
+    predict_to(issued_mono_ns);
+    const uint64_t landing_ns =
+        issued_mono_ns +
+        static_cast<uint64_t>(command_latency_ms > 0.0 ? command_latency_ms * 1e6
+                                                       : 0.0);
+    const double delta =
+        static_cast<double>(target_ms) - projected_local_ms(landing_ns);
+    e_ += delta;
+    p00_ += cfg_.seek_exec_var_ms2;
+    if (std::abs(e_) > cfg_.deadband_ms) {
+        in_deadband_streak_ = 0;
+        converged_ = false;
+    }
+}
+
 Estimate SyncEstimator::estimate_at(uint64_t now_ns) const {
     Estimate est;
     if (!valid_) return est;

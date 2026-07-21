@@ -152,7 +152,9 @@ void test_events_and_payloads() {
     for (int i = 0; i < 200 && log.estimates.load() < 1; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     CHECK(log.estimates.load() == 1);
-    CHECK(log.last_error_ms.load() == 50.0);
+    // Kalman posterior after one high-confidence fix against a huge prior:
+    // essentially the measurement (50 ms), not exactly it.
+    CHECK(std::abs(log.last_error_ms.load() - 50.0) < 0.5);
     // Events arrive on the worker thread, never the caller's.
     CHECK(log.callback_thread_hash.load() !=
           std::hash<std::thread::id>{}(std::this_thread::get_id()));

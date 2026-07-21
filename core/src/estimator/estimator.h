@@ -26,6 +26,7 @@ struct EstimatorConfig {
     double q_drift_per_s = 4e-5;       // process noise, drift state (ms/s)²/s
     double init_error_var_ms2 = 1e6;
     double init_drift_var = 1e-2;      // (0.1 ms/s)² = (100 ppm)²
+    double seek_exec_var_ms2 = 2500.0;  // execution uncertainty added per seek
     double deadband_ms = 25.0;
     int convergence_fixes = 3;         // consecutive in-deadband fixes → converged
     double conf_var_scale_ms = 25.0;   // posterior-std scale in confidence
@@ -54,6 +55,14 @@ public:
     // has been seen yet or the fix is older than the last fused one.
     bool on_fix(int64_t match_offset_ms, uint64_t capture_mono_ns,
                 double frequency_skew, float provider_confidence);
+
+    // A local seek was issued toward target_ms: shift the error state by the
+    // commanded jump (evaluated at the expected landing time, issue +
+    // command latency) and widen its variance by the execution uncertainty.
+    // Without this, the filter carries pre-seek error into post-seek fixes
+    // and the control loop chases a phantom offset.
+    void on_local_seek(int64_t target_ms, uint64_t issued_mono_ns,
+                       double command_latency_ms);
 
     // Projects the state to `now` without mutating it.
     Estimate estimate_at(uint64_t now_ns) const;

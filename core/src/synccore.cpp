@@ -1,11 +1,11 @@
-// synccore.cpp — CORE-01 skeleton: session lifecycle, RT-safe capture path,
-// control-plane command queue, worker thread + event dispatch.
+// synccore.cpp — session lifecycle, RT-safe capture path, control-plane
+// command queue, worker thread + event dispatch.
 //
-// No DSP lives here yet. The worker drains the audio ring (so the capture
-// path behaves exactly as it will in production) and answers control inputs
-// with synthetic events where the contract requires a response, so the
-// shell bridges (NAT-03/04) can be built and tested against real event
-// traffic before CORE-02 lands the estimator.
+// CORE-02/03: recognition fixes and player states feed the Kalman estimator
+// (estimator/), whose filtered estimates drive the correction policy
+// (policy/). Time inside the worker advances only from input timestamps —
+// SyncCore never reads a clock — so the 15 Hz estimate cadence and the
+// recognition-request scheduler are both driven by capture-buffer progress.
 
 #include "synccore/synccore.h"
 
@@ -18,6 +18,8 @@
 #include <thread>
 #include <vector>
 
+#include "estimator/estimator.h"
+#include "policy/policy.h"
 #include "spsc_ring.h"
 #include "synccore_testing.h"
 
@@ -28,6 +30,7 @@ constexpr int32_t kSupportedChannels = 1;
 constexpr int32_t kDefaultCommandLatencyMs = 250;
 constexpr int32_t kNudgeClampMs = 750;
 constexpr int32_t kMaxFramesPerPush = 1 << 16;
+constexpr uint64_t kEstimateEmitPeriodNs = 66'666'667ull;  // ≤ 15 Hz
 // ~12 s of 48 kHz mono float + headers, rounded up to 4 MiB by the ring.
 constexpr size_t kRingBytes = static_cast<size_t>(kSupportedRateHz) * sizeof(float) * 12;
 
@@ -37,6 +40,8 @@ struct Command {
         kPlayerState,
         kSeekIssued,
         kLocalPlayback,
+        kSetNudge,
+        kSetOutputLatency,
         kBeginCalibration,
         kCancelCalibration
     } kind;
@@ -75,10 +80,11 @@ struct sc_session {
 
     // Worker-thread-only session state (no lock needed).
     struct {
-        bool has_player_state = false;
-        sc_player_state_t last_player{};
-        int64_t last_commanded_position_ms = -1;
-        uint64_t settle_until_mono_ns = 0;
+        synccore::SyncEstimator estimator;
+        synccore::CorrectionPolicy policy;
+        uint64_t now_ns = 0;        // latest input timestamp seen
+        uint64_t last_emit_ns = 0;  // last SC_EVT_SYNC_ESTIMATE emission
+        int64_t last_commanded_position_ms = -1;  // self-hearing guard, CORE-06
         std::vector<float> scratch;
     } wk;
 
@@ -113,51 +119,108 @@ struct sc_session {
                 if (stopping && pending.empty()) return;
             }
 
-            // Drain captured audio. CORE-02 will feed this to the DSP chain;
-            // for now consuming it keeps the producer-side contract honest.
+            // Drain captured audio; capture timestamps advance session time.
             wk.scratch.clear();
             while (ring.try_read(&hdr, &wk.scratch)) {
                 frames_consumed.fetch_add(hdr.frames, std::memory_order_relaxed);
+                wk.now_ns = std::max(wk.now_ns, hdr.capture_mono_ns);
                 if (wk.scratch.size() > static_cast<size_t>(kSupportedRateHz))
                     wk.scratch.clear();  // bound scratch growth per iteration
             }
 
             for (const Command& cmd : pending) process(cmd);
+
+            tick();
         }
+    }
+
+    void emit_estimate(const synccore::Estimate& e) {
+        sc_evt_sync_estimate_t out{};
+        out.error_ms = e.error_ms;
+        out.drift_ppm = e.drift_ppm;
+        out.confidence = e.confidence;
+        out.converged = e.converged;
+        out.last_fix_mono_ns = e.last_fix_mono_ns;
+        dispatch(SC_EVT_SYNC_ESTIMATE, &out);
+    }
+
+    void apply(const synccore::Action& action) {
+        switch (action.kind) {
+            case synccore::ActionKind::kNone:
+                break;
+            case synccore::ActionKind::kSeek: {
+                sc_evt_correction_t corr{action.seek_to_ms};
+                dispatch(SC_EVT_CORRECTION, &corr);
+                break;
+            }
+            case synccore::ActionKind::kTrackLost:
+                wk.estimator.reset();
+                wk.policy.reset();
+                dispatch(SC_EVT_TRACK_LOST, nullptr);
+                break;
+        }
+    }
+
+    // Time-driven duties: interpolated estimate emissions (≤ 15 Hz) and the
+    // recognition-request scheduler. Runs on capture-time progress.
+    void tick() {
+        if (wk.now_ns == 0) return;
+        const synccore::Estimate est = wk.estimator.estimate_at(wk.now_ns);
+        if (est.valid &&
+            wk.now_ns - wk.last_emit_ns >= kEstimateEmitPeriodNs) {
+            wk.last_emit_ns = wk.now_ns;
+            emit_estimate(est);
+        }
+        if (wk.policy.fix_request_due(wk.now_ns))
+            dispatch(SC_EVT_REQUEST_FIX, nullptr);
     }
 
     void process(const Command& cmd) {
         switch (cmd.kind) {
             case Command::Kind::kRecognitionFix: {
-                if (cmd.fix.capture_mono_ns < wk.settle_until_mono_ns) {
+                const uint64_t t = cmd.fix.capture_mono_ns;
+                wk.now_ns = std::max(wk.now_ns, t);
+                if (wk.policy.is_settling(t)) {
                     sc_evt_fix_rejected_t rej{SC_REJECT_SETTLING};
                     dispatch(SC_EVT_FIX_REJECTED, &rej);
                     return;
                 }
-                // Synthetic estimate: echoes the fix so bridges see realistic
-                // traffic. Replaced by the Kalman estimator in CORE-02.
-                sc_evt_sync_estimate_t est{};
-                est.error_ms = wk.has_player_state
-                                   ? static_cast<double>(wk.last_player.position_ms -
-                                                         cmd.fix.match_offset_ms)
-                                   : 0.0;
-                est.drift_ppm = 0.0;
-                est.confidence = cmd.fix.confidence;
-                est.converged = false;
-                est.last_fix_mono_ns = cmd.fix.capture_mono_ns;
-                dispatch(SC_EVT_SYNC_ESTIMATE, &est);
+                if (!wk.estimator.on_fix(cmd.fix.match_offset_ms, t,
+                                         cmd.fix.frequency_skew,
+                                         cmd.fix.confidence)) {
+                    sc_evt_fix_rejected_t rej{SC_REJECT_LOW_CONFIDENCE};
+                    dispatch(SC_EVT_FIX_REJECTED, &rej);
+                    return;
+                }
+                wk.policy.on_fix_accepted(t);
+                const synccore::Estimate est = wk.estimator.estimate_at(t);
+                wk.last_emit_ns = t;
+                emit_estimate(est);
+                apply(wk.policy.on_estimate(
+                    est, wk.estimator.projected_local_ms(t), t));
                 break;
             }
             case Command::Kind::kPlayerState:
-                wk.has_player_state = true;
-                wk.last_player = cmd.player;
+                wk.now_ns = std::max(wk.now_ns, cmd.player.received_mono_ns);
+                wk.estimator.on_player_state(cmd.player.position_ms,
+                                             cmd.player.is_paused,
+                                             cmd.player.received_mono_ns);
                 break;
             case Command::Kind::kSeekIssued:
-                // 3 s settle window (technical-requirements.md §1.2 note).
-                wk.settle_until_mono_ns = cmd.mono_ns + 3'000'000'000ull;
+                wk.now_ns = std::max(wk.now_ns, cmd.mono_ns);
+                wk.estimator.on_local_seek(cmd.value_ms, cmd.mono_ns,
+                                           wk.policy.command_latency_ms());
+                wk.policy.on_seek_issued(cmd.mono_ns);
                 break;
             case Command::Kind::kLocalPlayback:
                 wk.last_commanded_position_ms = cmd.value_ms;
+                break;
+            case Command::Kind::kSetNudge:
+                wk.estimator.set_nudge_ms(static_cast<double>(cmd.value_ms));
+                break;
+            case Command::Kind::kSetOutputLatency:
+                wk.estimator.set_output_latency_ms(
+                    static_cast<double>(cmd.value_ms));
                 break;
             case Command::Kind::kBeginCalibration: {
                 std::lock_guard<std::mutex> lock(mtx);
@@ -202,6 +265,11 @@ sc_status_t sc_create(const sc_config_t* cfg, sc_session_t** out) {
         s->cfg.command_latency_prior_ms = kDefaultCommandLatencyMs;
     s->route = cfg->initial_route;
     s->route_latency_prior_ms = cfg->output_latency_prior_ms;
+    if (cfg->output_latency_prior_ms > 0)
+        s->wk.estimator.set_output_latency_ms(
+            static_cast<double>(cfg->output_latency_prior_ms));
+    s->wk.policy.set_command_latency_ms(
+        static_cast<double>(s->cfg.command_latency_prior_ms));
     s->worker = std::thread([s] { s->worker_loop(); });
     *out = s;
     return SC_OK;
@@ -251,8 +319,15 @@ sc_status_t sc_submit_player_state(sc_session_t* s, const sc_player_state_t* ps)
 
 sc_status_t sc_set_user_nudge_ms(sc_session_t* s, int32_t nudge_ms) {
     if (!s) return SC_ERR_INVALID_ARG;
-    std::lock_guard<std::mutex> lock(s->mtx);
-    s->nudge_ms = std::clamp(nudge_ms, -kNudgeClampMs, kNudgeClampMs);
+    const int32_t clamped = std::clamp(nudge_ms, -kNudgeClampMs, kNudgeClampMs);
+    {
+        std::lock_guard<std::mutex> lock(s->mtx);
+        s->nudge_ms = clamped;
+    }
+    Command cmd;
+    cmd.kind = Command::Kind::kSetNudge;
+    cmd.value_ms = clamped;
+    s->enqueue(std::move(cmd));
     return SC_OK;
 }
 
@@ -261,9 +336,15 @@ sc_status_t sc_set_output_route(sc_session_t* s, sc_route_t route,
     if (!s) return SC_ERR_INVALID_ARG;
     if (route < SC_ROUTE_SPEAKER || route > SC_ROUTE_BLUETOOTH)
         return SC_ERR_INVALID_ARG;
-    std::lock_guard<std::mutex> lock(s->mtx);
-    s->route = route;
-    s->route_latency_prior_ms = latency_prior_ms;
+    {
+        std::lock_guard<std::mutex> lock(s->mtx);
+        s->route = route;
+        s->route_latency_prior_ms = latency_prior_ms;
+    }
+    Command cmd;
+    cmd.kind = Command::Kind::kSetOutputLatency;
+    cmd.value_ms = latency_prior_ms > 0 ? latency_prior_ms : 0;
+    s->enqueue(std::move(cmd));
     return SC_OK;
 }
 
