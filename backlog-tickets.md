@@ -21,6 +21,8 @@
 | UI-03 | 🟡 Done — implemented + emulator-verified in 3 states; pending: Layout Inspector recomposition-count evidence, TalkBack pass | `acf8bc6` |
 | UI-04 | 🟡 Done — drum/detents/haptics/debounce, emulator drag-verified; deferred: numeric entry, A/B button, reset confirm | — |
 | UI-02 | ✅ Done — SessionViewModel + allowlisted state machine, SyncEngine seam, per-route DataStore persistence, 8/8 JVM tests | — |
+| NAT-02 | 🟡 Done — Oboe C++ RT capture + HAL timestamping + route observer, emulator-verified (mic indicator); pending: 30-min drop test + reference-device matrix per AC | — |
+| UI-05 | 🟡 Done — SessionScreen assembled, IDLE→LISTENING emulator-verified; gates are placeholders pending UI-06 | — |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.

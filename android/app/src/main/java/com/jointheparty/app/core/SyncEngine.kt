@@ -14,6 +14,12 @@ import kotlinx.coroutines.flow.SharedFlow
  * calibration surface (`pushCapture`, `pushReference`, `setAecMode`,
  * `beginCalibration`, `cancelCalibration`) — none of that is
  * ViewModel-driven per technical-requirements.md §2.3.
+ *
+ * `startCapture`/`stopCapture` (NAT-02) are the exception: they don't touch
+ * the audio thread themselves, only start/stop the native Oboe capture
+ * stream that runs on it, so a ViewModel can drive them off session
+ * lifecycle (join → startCapture, leave/background → stopCapture) same as
+ * every other control-plane call here.
  */
 interface SyncEngine {
 
@@ -22,6 +28,18 @@ interface SyncEngine {
 
     /** ≤15 Hz estimate stream for the sync meter; conflated per collector. */
     val meterFrames: Flow<SyncCore.Event.SyncEstimate>
+
+    /**
+     * Opens and starts the Oboe input stream, pushing capture audio
+     * straight into SyncCore (no JNI on the audio thread — see
+     * android/app/src/main/cpp/audio_capture.h). Returns false if the
+     * stream couldn't be opened/started or the device negotiated a format
+     * other than 48 kHz mono.
+     */
+    fun startCapture(): Boolean
+
+    /** Stops the Oboe capture stream. Idempotent; safe if never started. */
+    fun stopCapture()
 
     fun setUserNudgeMs(nudgeMs: Int): Boolean
 

@@ -89,6 +89,19 @@ class SyncCore(
     fun pushCapture(samples: FloatArray, frames: Int, captureMonoNs: Long) =
         nativePushCapture(handle, samples, frames, captureMonoNs)
 
+    /**
+     * NAT-02: starts the native Oboe input stream, which pushes capture
+     * audio straight into SyncCore from its own C++ callback (no JNI on the
+     * audio thread — android/app/src/main/cpp/audio_capture.h). Returns
+     * false if the stream couldn't be opened/started, or if the device
+     * negotiated a sample rate/channel count other than 48 kHz mono (the
+     * only format SyncCore v1 accepts).
+     */
+    override fun startCapture(): Boolean = nativeStartCapture(handle)
+
+    /** Stops the Oboe capture stream. Idempotent; safe if never started. */
+    override fun stopCapture() = nativeStopCapture(handle)
+
     // NOTE (UI-02): Kotlin forbids default parameter values on overriding
     // functions, so implementing SyncEngine.submitRecognitionFix required
     // dropping this method's `frequencySkew = 0.0` default. Call sites that
@@ -167,6 +180,8 @@ class SyncCore(
     private external fun nativePushCapture(
         handle: Long, samples: FloatArray, frames: Int, captureMonoNs: Long,
     )
+    private external fun nativeStartCapture(handle: Long): Boolean
+    private external fun nativeStopCapture(handle: Long)
 
     private external fun nativeSubmitRecognitionFix(
         handle: Long, source: Int, matchOffsetMs: Long, captureMonoNs: Long,

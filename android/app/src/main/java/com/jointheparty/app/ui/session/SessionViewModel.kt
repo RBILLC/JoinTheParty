@@ -89,8 +89,13 @@ class SessionViewModel(
 
     // ---- Shell-driven intents ---------------------------------------------
 
-    /** idle/lost/error → listening (user taps Join, or manual retry). */
+    /**
+     * idle/lost/error → listening (user taps Join, or manual retry). Starts
+     * the native Oboe capture stream first — LISTENING with a dead mic would
+     * be a lie. Caller must hold RECORD_AUDIO before invoking.
+     */
     fun startListening() {
+        if (!engine.startCapture()) return
         transition(SessionPhase.LISTENING)
     }
 
@@ -124,6 +129,7 @@ class SessionViewModel(
     /** any → idle: user-initiated escape hatch, e.g. leaving the session. */
     fun reset() {
         if (transition(SessionPhase.IDLE)) {
+            engine.stopCapture()
             consecutiveLosses = 0
             _syncState.update {
                 SyncState(routeId = it.routeId, routeName = it.routeName, nudgeMs = it.nudgeMs)

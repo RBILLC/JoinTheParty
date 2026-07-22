@@ -8,18 +8,23 @@
 //    block JVM shutdown, and repeated calls are cheap no-ops once attached).
 //  - Destruction order is the memory-safety contract: sc_destroy joins the
 //    worker (guaranteeing no further callbacks) BEFORE the global ref is
-//    dropped, so the callback can never touch a dead reference.
+//    dropped, so the callback can never touch a dead reference. NAT-02
+//    extends this: BridgeHandle::capture->stop() runs BEFORE sc_destroy in
+//    nativeDestroy (see the comment there) — capture must never push into a
+//    session that sc_destroy has begun tearing down.
 //  - nativePushCapture uses GetPrimitiveArrayCritical: sc_push_capture only
-//    memcpys into the lock-free ring, so the critical window is tiny. The
-//    production audio path (NAT-02) will push straight from the Oboe C++
-//    callback and skip JNI entirely; this entry point serves Kotlin-side
-//    tests and bring-up.
+//    memcpys into the lock-free ring, so the critical window is tiny. This
+//    entry point serves Kotlin-side tests and bring-up only; the production
+//    audio path (NAT-02, audio_capture.h/.cpp) pushes straight from the
+//    Oboe C++ callback and skips JNI entirely.
 
 #include <jni.h>
 
 #include <atomic>
 #include <cstring>
+#include <memory>
 
+#include "audio_capture.h"
 #include "synccore/synccore.h"
 
 namespace {
@@ -30,6 +35,11 @@ struct BridgeHandle {
     sc_session_t* session = nullptr;
     jobject target = nullptr;    // global ref to the Kotlin SyncCore
     jmethodID on_event = nullptr;
+    // NAT-02: production audio capture, owned here so its lifetime tracks
+    // the session's. Created (but not started) alongside the session in
+    // nativeCreate; started/stopped explicitly via nativeStartCapture /
+    // nativeStopCapture.
+    std::unique_ptr<synccore_android::OboeCapture> capture;
 };
 
 JNIEnv* attached_env() {
@@ -125,6 +135,7 @@ Java_com_jointheparty_app_core_SyncCore_nativeCreate(
         return 0;
     }
     sc_set_event_callback(session, event_trampoline, h);
+    h->capture = std::make_unique<synccore_android::OboeCapture>(session);
     return reinterpret_cast<jlong>(h);
 }
 
@@ -133,9 +144,35 @@ Java_com_jointheparty_app_core_SyncCore_nativeDestroy(JNIEnv* env, jobject,
                                                       jlong handle) {
     auto* h = handle_of(handle);
     if (!h) return;
+    // NAT-02 destruction-order contract: stop capture BEFORE sc_destroy.
+    // capture->stop() blocks until the Oboe stream is closed and any
+    // in-flight restart thread is joined, so once it returns no
+    // sc_push_capture call can be in flight or start afterwards — exactly
+    // what synccore.h requires ("no sc_push_capture call is in flight or
+    // will be made after sc_destroy begins"). Only then do we run the
+    // existing contract: sc_destroy joins the worker (no further callbacks)
+    // BEFORE the global ref is dropped.
+    if (h->capture) h->capture->stop();
+    h->capture.reset();
     sc_destroy(h->session);  // joins the worker: no callbacks after this
     env->DeleteGlobalRef(h->target);
     delete h;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jointheparty_app_core_SyncCore_nativeStartCapture(JNIEnv*, jobject,
+                                                            jlong handle) {
+    auto* h = handle_of(handle);
+    if (!h || !h->capture) return JNI_FALSE;
+    return h->capture->start() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_jointheparty_app_core_SyncCore_nativeStopCapture(JNIEnv*, jobject,
+                                                           jlong handle) {
+    auto* h = handle_of(handle);
+    if (!h || !h->capture) return;
+    h->capture->stop();
 }
 
 JNIEXPORT void JNICALL

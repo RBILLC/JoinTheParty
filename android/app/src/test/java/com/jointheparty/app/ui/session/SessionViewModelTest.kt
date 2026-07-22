@@ -228,6 +228,17 @@ private class FakeSyncEngine : SyncEngine {
     val routeCalls = mutableListOf<Pair<SyncCore.Route, Int>>()
     var closed = false
         private set
+    var capturing = false
+        private set
+
+    override fun startCapture(): Boolean {
+        capturing = true
+        return true
+    }
+
+    override fun stopCapture() {
+        capturing = false
+    }
 
     suspend fun emit(event: SyncCore.Event) = eventFlow.emit(event)
 

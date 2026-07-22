@@ -23,7 +23,19 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments += listOf("-DSYNCCORE_BUILD_TESTS=OFF")
+                // -DANDROID_STL=c++_shared is required by com.google.oboe's
+                // Prefab package (NAT-02, cpp/CMakeLists.txt find_package
+                // (oboe)): AGP's Prefab integration reads this argument to
+                // select which prebuilt oboe .so variant to expose to CMake
+                // *before* CMake itself runs, so it cannot be supplied from
+                // CMakeLists.txt — every Oboe integration requires it here.
+                // Without it, configureCMakeDebug fails with
+                // "User is using a static STL but library requires a
+                // shared STL".
+                arguments += listOf(
+                    "-DSYNCCORE_BUILD_TESTS=OFF",
+                    "-DANDROID_STL=c++_shared",
+                )
                 cppFlags += "-std=c++17"
             }
         }
@@ -57,6 +69,7 @@ android {
     }
     buildFeatures {
         compose = true
+        prefab = true  // Oboe ships CMake config via Prefab (NAT-02)
     }
 }
 
@@ -71,6 +84,7 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     debugImplementation(libs.androidx.compose.ui.tooling)
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.oboe)
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
 
