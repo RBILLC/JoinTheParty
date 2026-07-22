@@ -112,8 +112,12 @@ BUILD SUCCESSFUL in 13s
 
 Artifacts: `app-debug.apk` (9.6 MB, includes `libsynccore_jni.so` ×3 ABIs), `app-debug-androidTest.apk` (0.4 MB).
 
-## 5. Follow-ups
+## 5. Device run (2026-07-22)
 
-- Run `gradlew :app:connectedDebugAndroidTest` on the first connected device/emulator — the NAT-04 event round-trip acceptance runs there.
+`connectedDebugAndroidTest` executed on the `Pixel_10_Pro` AVD (API 16 preview image, x86_64): **4/4 tests pass** — config rejection, estimate + correction round trip (+50 ms error, seek target = player + latency − error), settle-window rejection, cross-thread capture push.
+
+First run exposed a race in the test itself (not the bridge): `events` is a hot SharedFlow with no replay, and the test subscribed *after* submitting the fix, so the worker's events fired before the collector attached. Fixed by subscribing with `CoroutineStart.UNDISPATCHED` before submission — which is also the documented consumer contract: subscribe at session start, before feeding the engine.
+
+## 6. Follow-ups
 - Amend `technical-requirements.md` §4: NDK pin r27 → **r28.2.13676358** (this doc is the record of the deviation).
 - NAT-02 (Oboe capture) should push from the C++ audio callback directly; retire `nativePushCapture` from any RT path at that point.

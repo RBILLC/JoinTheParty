@@ -1,6 +1,8 @@
 package com.jointheparty.app.core
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -37,6 +39,17 @@ class SyncCoreBridgeTest {
         SyncCore().use { core ->
             assertEquals(250, core.commandLatencyMs())  // default prior
 
+            // events is a hot SharedFlow with no replay: subscribe BEFORE
+            // submitting (UNDISPATCHED runs each collector to its first
+            // suspension point synchronously) or the worker's events race
+            // the collector and are dropped.
+            val estimateJob = async(start = CoroutineStart.UNDISPATCHED) {
+                core.events.filterIsInstance<SyncCore.Event.SyncEstimate>().first()
+            }
+            val correctionJob = async(start = CoroutineStart.UNDISPATCHED) {
+                core.events.filterIsInstance<SyncCore.Event.Correction>().first()
+            }
+
             // Player at 10 000 ms, external source at 9 950 ms → +50 ms.
             assertTrue(core.submitPlayerState(10_000, false, monoNs()))
             assertTrue(
@@ -48,9 +61,7 @@ class SyncCoreBridgeTest {
                 )
             )
 
-            val estimate = withTimeout(5_000) {
-                core.events.filterIsInstance<SyncCore.Event.SyncEstimate>().first()
-            }
+            val estimate = withTimeout(5_000) { estimateJob.await() }
             assertTrue(
                 "expected ~+50 ms, got ${estimate.errorMs}",
                 abs(estimate.errorMs - 50.0) < 1.0,
@@ -58,9 +69,7 @@ class SyncCoreBridgeTest {
 
             // +50 ms is outside the deadband: a correction must follow, and
             // its target must lead by the command latency (250 ms default).
-            val correction = withTimeout(5_000) {
-                core.events.filterIsInstance<SyncCore.Event.Correction>().first()
-            }
+            val correction = withTimeout(5_000) { correctionJob.await() }
             assertTrue(
                 "target ${correction.seekToMs} should be near player+200",
                 abs(correction.seekToMs - 10_200) < 60,
@@ -71,6 +80,9 @@ class SyncCoreBridgeTest {
     @Test
     fun settleWindowRejectsFixes() = runBlocking {
         SyncCore().use { core ->
+            val rejectedJob = async(start = CoroutineStart.UNDISPATCHED) {
+                core.events.filterIsInstance<SyncCore.Event.FixRejected>().first()
+            }
             assertTrue(core.submitPlayerState(10_000, false, monoNs()))
             assertTrue(core.notifySeekIssued(12_000, monoNs()))
             assertTrue(
@@ -81,9 +93,7 @@ class SyncCoreBridgeTest {
                     confidence = 0.9f,
                 )
             )
-            val rejected = withTimeout(5_000) {
-                core.events.filterIsInstance<SyncCore.Event.FixRejected>().first()
-            }
+            val rejected = withTimeout(5_000) { rejectedJob.await() }
             assertEquals(SyncCore.RejectReason.SETTLING, rejected.reason)
         }
     }

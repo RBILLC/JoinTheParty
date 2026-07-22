@@ -15,7 +15,7 @@
 | CORE-04 | ✅ Done | `5c15379` |
 | SCAF-04 | 🟡 Partial (tokens + codegen; shell wiring blocked on SCAF-02) | `702eea3` |
 | SCAF-03 | ✅ Done (NDK 28.2 pinned — r27 unavailable; see docs/android-implementation-review.md) | — |
-| NAT-04 | 🟡 Done pending device run (bridge + tests compile; instrumentation needs a connected device) | — |
+| NAT-04 | ✅ Done — instrumentation suite 4/4 on Pixel_10_Pro AVD (2026-07-22) | — |
 | CORE (extra) | ✅ `sc_get_command_latency_ms` — persisted learned latency (PM decision) | `9f9a84f` |
 | Everything else | ⬜ Not started | — |
 
