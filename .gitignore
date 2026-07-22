@@ -16,6 +16,7 @@ ios/**/DerivedData/
 # Android / Gradle (populated by SCAF-03)
 android/.gradle/
 android/**/build/
+android/**/.cxx/
 android/local.properties
 
 # Node / backend

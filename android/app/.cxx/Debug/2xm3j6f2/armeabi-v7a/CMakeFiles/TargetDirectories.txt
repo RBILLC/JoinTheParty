@@ -1,6 +1,0 @@
-C:/Users/RBILLC/source/repos/JoinTheParty/android/app/.cxx/Debug/2xm3j6f2/armeabi-v7a/CMakeFiles/synccore_jni.dir
-C:/Users/RBILLC/source/repos/JoinTheParty/android/app/.cxx/Debug/2xm3j6f2/armeabi-v7a/CMakeFiles/edit_cache.dir
-C:/Users/RBILLC/source/repos/JoinTheParty/android/app/.cxx/Debug/2xm3j6f2/armeabi-v7a/CMakeFiles/rebuild_cache.dir
-C:/Users/RBILLC/source/repos/JoinTheParty/android/app/.cxx/Debug/2xm3j6f2/armeabi-v7a/synccore_core/CMakeFiles/synccore.dir
-C:/Users/RBILLC/source/repos/JoinTheParty/android/app/.cxx/Debug/2xm3j6f2/armeabi-v7a/synccore_core/CMakeFiles/edit_cache.dir
-C:/Users/RBILLC/source/repos/JoinTheParty/android/app/.cxx/Debug/2xm3j6f2/armeabi-v7a/synccore_core/CMakeFiles/rebuild_cache.dir
