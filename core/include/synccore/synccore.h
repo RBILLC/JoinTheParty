@@ -124,6 +124,13 @@ sc_status_t sc_notify_local_playback(sc_session_t*, int64_t commanded_position_m
 sc_status_t sc_push_reference(sc_session_t*, const float* mono, int32_t frames,
                               int64_t track_position_ms);
 
+/* Reads the session's current Spotify command-latency estimate in ms —
+ * the config prior refined by online learning from post-seek innovations.
+ * Shells persist this per device/route and hand it back as
+ * command_latency_prior_ms at the next sc_create, so learning survives
+ * cold starts instead of resetting to the default. */
+sc_status_t sc_get_command_latency_ms(sc_session_t*, int32_t* out_ms);
+
 /* ---- Calibration ---- */
 
 sc_status_t sc_begin_calibration(sc_session_t*);  /* emits SC_EVT_CALIBRATION_RESULT */

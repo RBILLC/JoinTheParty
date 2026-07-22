@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -63,6 +64,10 @@ struct sc_session {
     synccore::SpscRing ring;
     std::atomic<uint64_t> overrun_blocks{0};
     std::atomic<uint64_t> frames_consumed{0};
+
+    // Worker-maintained mirror of the policy's (learned) command latency so
+    // sc_get_command_latency_ms can read it from any thread.
+    std::atomic<int32_t> command_latency_mirror_ms{kDefaultCommandLatencyMs};
 
     // --- control plane (mutex-guarded) ---
     std::mutex mtx;
@@ -217,6 +222,10 @@ struct sc_session {
                 emit_estimate(est);
                 apply(wk.policy.on_estimate(
                     est, wk.estimator.projected_local_ms(t), t));
+                command_latency_mirror_ms.store(
+                    static_cast<int32_t>(
+                        std::lround(wk.policy.command_latency_ms())),
+                    std::memory_order_relaxed);
                 break;
             }
             case Command::Kind::kPlayerState:
@@ -294,6 +303,8 @@ sc_status_t sc_create(const sc_config_t* cfg, sc_session_t** out) {
             static_cast<double>(cfg->output_latency_prior_ms));
     s->wk.policy.set_command_latency_ms(
         static_cast<double>(s->cfg.command_latency_prior_ms));
+    s->command_latency_mirror_ms.store(s->cfg.command_latency_prior_ms,
+                                       std::memory_order_relaxed);
     s->worker = std::thread([s] { s->worker_loop(); });
     *out = s;
     return SC_OK;
@@ -406,6 +417,12 @@ sc_status_t sc_push_reference(sc_session_t* s, const float* mono, int32_t frames
         return SC_ERR_INVALID_ARG;
     // Consumed by the AEC3 wrapper in CORE-05/06. Accepted and discarded here
     // so shells can wire the call path now.
+    return SC_OK;
+}
+
+sc_status_t sc_get_command_latency_ms(sc_session_t* s, int32_t* out_ms) {
+    if (!s || !out_ms) return SC_ERR_INVALID_ARG;
+    *out_ms = s->command_latency_mirror_ms.load(std::memory_order_relaxed);
     return SC_OK;
 }
 

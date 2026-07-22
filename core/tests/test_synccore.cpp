@@ -199,6 +199,12 @@ void test_setters_clamp_and_validate() {
     CHECK(sc_begin_calibration(s) == SC_OK);
     CHECK(sc_cancel_calibration(s) == SC_OK);
 
+    // Command-latency readback: default prior resolves to 250 ms.
+    int32_t latency = 0;
+    CHECK(sc_get_command_latency_ms(s, &latency) == SC_OK);
+    CHECK(latency == 250);
+    CHECK(sc_get_command_latency_ms(s, nullptr) == SC_ERR_INVALID_ARG);
+
     float ref[64] = {0};
     CHECK(sc_push_reference(s, ref, 64, 0) == SC_OK);
     CHECK(sc_push_reference(s, nullptr, 64, 0) == SC_ERR_INVALID_ARG);
