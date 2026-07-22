@@ -13,7 +13,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Text
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
 import com.jointheparty.app.core.SyncCore
+import com.jointheparty.app.ui.components.NudgeWheel
 import com.jointheparty.app.ui.components.SyncMeter
 import com.jointheparty.app.ui.model.MeterFrame
 import com.jointheparty.app.ui.theme.BilletTheme
@@ -54,6 +58,14 @@ class MainActivity : ComponentActivity() {
                     )
                     Spacer(Modifier.height(DT.Space.sectionGap))
                     SyncMeter(frames = remember { demoFrames() })
+                    Spacer(Modifier.height(DT.Space.sectionGap))
+                    var trim by remember { mutableIntStateOf(-180) }
+                    NudgeWheel(
+                        trimMs = trim,
+                        routeName = "AirPods Pro",
+                        onTrimChange = { trim = it },
+                        onTrimCommit = { engine?.setUserNudgeMs(it) },
+                    )
                 }
             }
         }

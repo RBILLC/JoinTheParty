@@ -57,6 +57,7 @@ class SyncCoreBridgeTest {
                     source = SyncCore.FixSource.SHAZAMKIT,
                     matchOffsetMs = 9_950,
                     captureMonoNs = monoNs(),
+                    frequencySkew = 0.0,
                     confidence = 0.9f,
                 )
             )
@@ -90,6 +91,7 @@ class SyncCoreBridgeTest {
                     source = SyncCore.FixSource.SHAZAMKIT,
                     matchOffsetMs = 9_950,
                     captureMonoNs = monoNs(),
+                    frequencySkew = 0.0,
                     confidence = 0.9f,
                 )
             )

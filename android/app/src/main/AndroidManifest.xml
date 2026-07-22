@@ -4,6 +4,8 @@
     <!-- Recognition + sync need the mic (NAT-02). -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Nudge-wheel detents and the lock thunk (ui-ux §5). -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <!-- Spotify install detection (technical-requirements.md §3.1 step 7). -->
     <queries>

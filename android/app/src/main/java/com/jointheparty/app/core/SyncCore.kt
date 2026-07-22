@@ -34,7 +34,7 @@ class SyncCore(
     initialRoute: Route = Route.SPEAKER,
     outputLatencyPriorMs: Int = -1,
     commandLatencyPriorMs: Int = -1,
-) : AutoCloseable {
+) : AutoCloseable, SyncEngine {
 
     enum class Route { SPEAKER, WIRED, BLUETOOTH }
     enum class AecMode { OFF, PLATFORM_ONLY, FULL }
@@ -67,10 +67,10 @@ class SyncCore(
     )
 
     /** Every engine event, in order, fan-out to any number of collectors. */
-    val events: SharedFlow<Event> = eventFlow.asSharedFlow()
+    override val events: SharedFlow<Event> = eventFlow.asSharedFlow()
 
     /** ≤15 Hz estimate stream for the sync meter; conflated per collector. */
-    val meterFrames: Flow<Event.SyncEstimate> =
+    override val meterFrames: Flow<Event.SyncEstimate> =
         events.filterIsInstance<Event.SyncEstimate>().conflate()
 
     private var handle: Long
@@ -89,31 +89,35 @@ class SyncCore(
     fun pushCapture(samples: FloatArray, frames: Int, captureMonoNs: Long) =
         nativePushCapture(handle, samples, frames, captureMonoNs)
 
-    fun submitRecognitionFix(
+    // NOTE (UI-02): Kotlin forbids default parameter values on overriding
+    // functions, so implementing SyncEngine.submitRecognitionFix required
+    // dropping this method's `frequencySkew = 0.0` default. Call sites that
+    // relied on it (SyncCoreBridgeTest) now pass 0.0 explicitly.
+    override fun submitRecognitionFix(
         source: FixSource,
         matchOffsetMs: Long,
         captureMonoNs: Long,
-        frequencySkew: Double = 0.0,
+        frequencySkew: Double,
         confidence: Float,
     ): Boolean = nativeSubmitRecognitionFix(
         handle, source.ordinal, matchOffsetMs, captureMonoNs, frequencySkew,
         confidence,
     ) == 0
 
-    fun submitPlayerState(positionMs: Long, isPaused: Boolean, receivedMonoNs: Long): Boolean =
+    override fun submitPlayerState(positionMs: Long, isPaused: Boolean, receivedMonoNs: Long): Boolean =
         nativeSubmitPlayerState(handle, positionMs, isPaused, receivedMonoNs) == 0
 
-    fun setUserNudgeMs(nudgeMs: Int): Boolean = nativeSetUserNudgeMs(handle, nudgeMs) == 0
+    override fun setUserNudgeMs(nudgeMs: Int): Boolean = nativeSetUserNudgeMs(handle, nudgeMs) == 0
 
-    fun setOutputRoute(route: Route, latencyPriorMs: Int): Boolean =
+    override fun setOutputRoute(route: Route, latencyPriorMs: Int): Boolean =
         nativeSetOutputRoute(handle, route.ordinal, latencyPriorMs) == 0
 
     fun setAecMode(mode: AecMode): Boolean = nativeSetAecMode(handle, mode.ordinal) == 0
 
-    fun notifySeekIssued(targetMs: Long, issuedMonoNs: Long): Boolean =
+    override fun notifySeekIssued(targetMs: Long, issuedMonoNs: Long): Boolean =
         nativeNotifySeekIssued(handle, targetMs, issuedMonoNs) == 0
 
-    fun notifyLocalPlayback(commandedPositionMs: Long): Boolean =
+    override fun notifyLocalPlayback(commandedPositionMs: Long): Boolean =
         nativeNotifyLocalPlayback(handle, commandedPositionMs) == 0
 
     fun pushReference(samples: FloatArray, frames: Int, trackPositionMs: Long): Boolean =
@@ -128,7 +132,7 @@ class SyncCore(
      * device/route and pass back as [commandLatencyPriorMs] next session —
      * PM decision 2026-07-21: learning survives cold starts.
      */
-    fun commandLatencyMs(): Int = nativeGetCommandLatencyMs(handle)
+    override fun commandLatencyMs(): Int = nativeGetCommandLatencyMs(handle)
 
     override fun close() {
         if (handle != 0L) {
