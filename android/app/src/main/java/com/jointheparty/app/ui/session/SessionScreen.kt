@@ -192,7 +192,10 @@ private fun activePhaseWord(phase: SessionPhase): String = when (phase) {
 @Composable
 private fun ConciergeContent(phase: SessionPhase, onJoinTap: () -> Unit) {
     when (phase) {
-        SessionPhase.NEEDS_SPOTIFY -> QuietMessage("Spotify not installed")
+        // Tap = the §6.4 recognition-only degradation until UI-06's real
+        // concierge lands ("Keep identifying songs").
+        SessionPhase.NEEDS_SPOTIFY ->
+            QuietMessage("Spotify not installed — tap to listen anyway", onTap = onJoinTap)
         SessionPhase.NEEDS_PREMIUM -> QuietMessage("Syncing needs Spotify Premium")
         SessionPhase.ERROR -> QuietMessage("Something broke — tap to retry", onTap = onJoinTap)
         else -> Unit

@@ -85,6 +85,8 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.tooling)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.oboe)
+    implementation(libs.androidx.browser)
+    implementation(libs.androidx.security.crypto)
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
 

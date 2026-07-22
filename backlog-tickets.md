@@ -23,6 +23,9 @@
 | UI-02 | ✅ Done — SessionViewModel + allowlisted state machine, SyncEngine seam, per-route DataStore persistence, 8/8 JVM tests | — |
 | NAT-02 | 🟡 Done — Oboe C++ RT capture + HAL timestamping + route observer, emulator-verified (mic indicator); pending: 30-min drop test + reference-device matrix per AC | — |
 | UI-05 | 🟡 Done — SessionScreen assembled, IDLE→LISTENING emulator-verified; gates are placeholders pending UI-06 | — |
+| AUTH-02 | 🟡 Done — PKCE + EncryptedSharedPreferences + rotation handling, RFC known-answer tested; pending: real client id, live auth run | — |
+| AUTH-05 | 🟡 Done — detector + gate wiring + recognition-only fallback; Premium probe lands with real App Remote | — |
+| NAT-08 | 🟡 Done against signature-faithful stubs (real AAR pending); seek echoes notifySeekIssued (unit-tested) | — |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.

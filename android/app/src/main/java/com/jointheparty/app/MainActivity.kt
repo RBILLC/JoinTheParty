@@ -11,6 +11,8 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.core.content.ContextCompat
 import com.jointheparty.app.audio.AudioRouteObserver
+import com.jointheparty.app.spotify.SpotifyAppDetector
+import com.jointheparty.app.ui.session.SessionPhase
 import com.jointheparty.app.ui.session.SessionScreen
 import com.jointheparty.app.ui.session.SessionViewModel
 import com.jointheparty.app.ui.theme.BilletTheme
@@ -58,6 +60,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun joinTapped() {
+        // AUTH-05 precondition: detect the Spotify app up-front, before the
+        // user is invested in a song (tech-req §3.1 step 7). Tapping the
+        // gate screen itself proceeds recognition-only (§6.4 degradation).
+        val phase = viewModel.syncState.value.phase
+        if (phase != SessionPhase.NEEDS_SPOTIFY &&
+            !SpotifyAppDetector(this).isSpotifyInstalled()
+        ) {
+            viewModel.onSpotifyMissing()
+            return
+        }
         val granted = ContextCompat.checkSelfPermission(
             this, Manifest.permission.RECORD_AUDIO,
         ) == PackageManager.PERMISSION_GRANTED

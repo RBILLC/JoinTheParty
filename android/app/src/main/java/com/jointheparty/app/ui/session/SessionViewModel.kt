@@ -219,9 +219,13 @@ class SessionViewModel(
         if (from == to) return false
         return when (to) {
             // startListening(): idle/lost/error → listening; this is also
-            // the lost-track auto-restart target (lost → listening).
+            // the lost-track auto-restart target (lost → listening), and the
+            // gates may proceed too — the §6.4 "keep identifying songs"
+            // recognition-only degradation (AUTH-05).
             SessionPhase.LISTENING ->
-                from == SessionPhase.IDLE || from == SessionPhase.LOST || from == SessionPhase.ERROR
+                from == SessionPhase.IDLE || from == SessionPhase.LOST ||
+                    from == SessionPhase.ERROR || from == SessionPhase.NEEDS_SPOTIFY ||
+                    from == SessionPhase.NEEDS_PREMIUM
             SessionPhase.MATCHING -> from == SessionPhase.LISTENING
             SessionPhase.AIMING -> from == SessionPhase.MATCHING
             SessionPhase.CONVERGING -> from == SessionPhase.AIMING
