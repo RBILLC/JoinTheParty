@@ -1,0 +1,2 @@
+C:\Users\RBILLC\source\repos\JoinTheParty\android\app\src\main\cpp\CMakeLists.txt
+C:\Users\RBILLC\source\repos\JoinTheParty\core\CMakeLists.txt

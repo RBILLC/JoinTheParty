@@ -1,0 +1,44 @@
+[
+{
+  "directory": "C:/Users/RBILLC/source/repos/JoinTheParty/android/app/.cxx/Debug/2xm3j6f2/armeabi-v7a",
+  "command": "C:\\Users\\RBILLC\\AppData\\Local\\Android\\Sdk\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\clang++.exe --target=armv7-none-linux-androideabi24 --sysroot=C:/Users/RBILLC/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/sysroot -Dsynccore_jni_EXPORTS -IC:/Users/RBILLC/source/repos/JoinTheParty/core/include -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -march=armv7-a -mthumb -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -fPIC -Wall -Wextra -pthread -o CMakeFiles\\synccore_jni.dir\\synccore_jni.cpp.o -c C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\android\\app\\src\\main\\cpp\\synccore_jni.cpp",
+  "file": "C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\android\\app\\src\\main\\cpp\\synccore_jni.cpp",
+  "output": "CMakeFiles\\synccore_jni.dir\\synccore_jni.cpp.o"
+},
+{
+  "directory": "C:/Users/RBILLC/source/repos/JoinTheParty/android/app/.cxx/Debug/2xm3j6f2/armeabi-v7a",
+  "command": "C:\\Users\\RBILLC\\AppData\\Local\\Android\\Sdk\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\clang++.exe --target=armv7-none-linux-androideabi24 --sysroot=C:/Users/RBILLC/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/sysroot -IC:/Users/RBILLC/source/repos/JoinTheParty/core/include -IC:/Users/RBILLC/source/repos/JoinTheParty/core/src -IC:/Users/RBILLC/source/repos/JoinTheParty/core/third_party/kissfft -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -march=armv7-a -mthumb -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -std=c++17 -fPIC -Wall -Wextra -Wpedantic -pthread -o synccore_core\\CMakeFiles\\synccore.dir\\src\\synccore.cpp.o -c C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\core\\src\\synccore.cpp",
+  "file": "C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\core\\src\\synccore.cpp",
+  "output": "synccore_core\\CMakeFiles\\synccore.dir\\src\\synccore.cpp.o"
+},
+{
+  "directory": "C:/Users/RBILLC/source/repos/JoinTheParty/android/app/.cxx/Debug/2xm3j6f2/armeabi-v7a",
+  "command": "C:\\Users\\RBILLC\\AppData\\Local\\Android\\Sdk\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\clang++.exe --target=armv7-none-linux-androideabi24 --sysroot=C:/Users/RBILLC/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/sysroot -IC:/Users/RBILLC/source/repos/JoinTheParty/core/include -IC:/Users/RBILLC/source/repos/JoinTheParty/core/src -IC:/Users/RBILLC/source/repos/JoinTheParty/core/third_party/kissfft -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -march=armv7-a -mthumb -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -std=c++17 -fPIC -Wall -Wextra -Wpedantic -pthread -o synccore_core\\CMakeFiles\\synccore.dir\\src\\estimator\\estimator.cpp.o -c C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\core\\src\\estimator\\estimator.cpp",
+  "file": "C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\core\\src\\estimator\\estimator.cpp",
+  "output": "synccore_core\\CMakeFiles\\synccore.dir\\src\\estimator\\estimator.cpp.o"
+},
+{
+  "directory": "C:/Users/RBILLC/source/repos/JoinTheParty/android/app/.cxx/Debug/2xm3j6f2/armeabi-v7a",
+  "command": "C:\\Users\\RBILLC\\AppData\\Local\\Android\\Sdk\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\clang++.exe --target=armv7-none-linux-androideabi24 --sysroot=C:/Users/RBILLC/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/sysroot -IC:/Users/RBILLC/source/repos/JoinTheParty/core/include -IC:/Users/RBILLC/source/repos/JoinTheParty/core/src -IC:/Users/RBILLC/source/repos/JoinTheParty/core/third_party/kissfft -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -march=armv7-a -mthumb -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -std=c++17 -fPIC -Wall -Wextra -Wpedantic -pthread -o synccore_core\\CMakeFiles\\synccore.dir\\src\\policy\\policy.cpp.o -c C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\core\\src\\policy\\policy.cpp",
+  "file": "C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\core\\src\\policy\\policy.cpp",
+  "output": "synccore_core\\CMakeFiles\\synccore.dir\\src\\policy\\policy.cpp.o"
+},
+{
+  "directory": "C:/Users/RBILLC/source/repos/JoinTheParty/android/app/.cxx/Debug/2xm3j6f2/armeabi-v7a",
+  "command": "C:\\Users\\RBILLC\\AppData\\Local\\Android\\Sdk\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\clang++.exe --target=armv7-none-linux-androideabi24 --sysroot=C:/Users/RBILLC/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/sysroot -IC:/Users/RBILLC/source/repos/JoinTheParty/core/include -IC:/Users/RBILLC/source/repos/JoinTheParty/core/src -IC:/Users/RBILLC/source/repos/JoinTheParty/core/third_party/kissfft -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -march=armv7-a -mthumb -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -std=c++17 -fPIC -Wall -Wextra -Wpedantic -pthread -o synccore_core\\CMakeFiles\\synccore.dir\\src\\correlate\\correlate.cpp.o -c C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\core\\src\\correlate\\correlate.cpp",
+  "file": "C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\core\\src\\correlate\\correlate.cpp",
+  "output": "synccore_core\\CMakeFiles\\synccore.dir\\src\\correlate\\correlate.cpp.o"
+},
+{
+  "directory": "C:/Users/RBILLC/source/repos/JoinTheParty/android/app/.cxx/Debug/2xm3j6f2/armeabi-v7a",
+  "command": "C:\\Users\\RBILLC\\AppData\\Local\\Android\\Sdk\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\clang.exe --target=armv7-none-linux-androideabi24 --sysroot=C:/Users/RBILLC/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/sysroot -IC:/Users/RBILLC/source/repos/JoinTheParty/core/include -IC:/Users/RBILLC/source/repos/JoinTheParty/core/src -IC:/Users/RBILLC/source/repos/JoinTheParty/core/third_party/kissfft -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -march=armv7-a -mthumb -Wformat -Werror=format-security  -fno-limit-debug-info  -std=gnu99 -fPIC -Wall -Wextra -Wpedantic -pthread -w -o synccore_core\\CMakeFiles\\synccore.dir\\third_party\\kissfft\\kiss_fft.c.o -c C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\core\\third_party\\kissfft\\kiss_fft.c",
+  "file": "C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\core\\third_party\\kissfft\\kiss_fft.c",
+  "output": "synccore_core\\CMakeFiles\\synccore.dir\\third_party\\kissfft\\kiss_fft.c.o"
+},
+{
+  "directory": "C:/Users/RBILLC/source/repos/JoinTheParty/android/app/.cxx/Debug/2xm3j6f2/armeabi-v7a",
+  "command": "C:\\Users\\RBILLC\\AppData\\Local\\Android\\Sdk\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\clang.exe --target=armv7-none-linux-androideabi24 --sysroot=C:/Users/RBILLC/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/sysroot -IC:/Users/RBILLC/source/repos/JoinTheParty/core/include -IC:/Users/RBILLC/source/repos/JoinTheParty/core/src -IC:/Users/RBILLC/source/repos/JoinTheParty/core/third_party/kissfft -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -march=armv7-a -mthumb -Wformat -Werror=format-security  -fno-limit-debug-info  -std=gnu99 -fPIC -Wall -Wextra -Wpedantic -pthread -w -o synccore_core\\CMakeFiles\\synccore.dir\\third_party\\kissfft\\kiss_fftr.c.o -c C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\core\\third_party\\kissfft\\kiss_fftr.c",
+  "file": "C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\core\\third_party\\kissfft\\kiss_fftr.c",
+  "output": "synccore_core\\CMakeFiles\\synccore.dir\\third_party\\kissfft\\kiss_fftr.c.o"
+}
+]

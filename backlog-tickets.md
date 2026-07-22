@@ -13,8 +13,13 @@
 | CORE-02 | ✅ Done | `a1b79fe` |
 | CORE-03 | ✅ Done (+ online command-latency learning, added after closed-loop sim findings) | `9d54de9` |
 | CORE-04 | ✅ Done | `5c15379` |
-| SCAF-04 | 🟡 Partial (tokens + codegen; shell wiring blocked on SCAF-02/03) | `702eea3` |
+| SCAF-04 | 🟡 Partial (tokens + codegen; shell wiring blocked on SCAF-02) | `702eea3` |
+| SCAF-03 | ✅ Done (NDK 28.2 pinned — r27 unavailable; see docs/android-implementation-review.md) | — |
+| NAT-04 | 🟡 Done pending device run (bridge + tests compile; instrumentation needs a connected device) | — |
+| CORE (extra) | ✅ `sc_get_command_latency_ms` — persisted learned latency (PM decision) | `9f9a84f` |
 | Everything else | ⬜ Not started | — |
+
+**PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.
 **MVP definition:** one device (iOS first — no token vendor needed for ShazamKit) recognizes a live speaker, plays the same track via Spotify, converges to lock, meter + wheel functional. Android reaches parity in the same epics via its own tickets.
 
 ---

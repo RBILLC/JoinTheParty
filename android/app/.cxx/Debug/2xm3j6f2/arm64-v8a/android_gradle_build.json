@@ -1,0 +1,47 @@
+{
+  "buildFiles": [
+    "C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\android\\app\\src\\main\\cpp\\CMakeLists.txt",
+    "C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\core\\CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "C:\\Users\\RBILLC\\AppData\\Local\\Android\\Sdk\\cmake\\3.31.4\\bin\\ninja.exe",
+      "-C",
+      "C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\android\\app\\.cxx\\Debug\\2xm3j6f2\\arm64-v8a",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "C:\\Users\\RBILLC\\AppData\\Local\\Android\\Sdk\\cmake\\3.31.4\\bin\\ninja.exe",
+    "-C",
+    "C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\android\\app\\.cxx\\Debug\\2xm3j6f2\\arm64-v8a",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "synccore::@f46d69fe4fa0f8f3647f": {
+      "toolchain": "toolchain",
+      "abi": "arm64-v8a",
+      "artifactName": "synccore",
+      "output": "C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\android\\app\\.cxx\\Debug\\2xm3j6f2\\arm64-v8a\\synccore_core\\libsynccore.a"
+    },
+    "synccore_jni::@6890427a1f51a3e7e1df": {
+      "toolchain": "toolchain",
+      "abi": "arm64-v8a",
+      "artifactName": "synccore_jni",
+      "output": "C:\\Users\\RBILLC\\source\\repos\\JoinTheParty\\android\\app\\build\\intermediates\\cxx\\Debug\\2xm3j6f2\\obj\\arm64-v8a\\libsynccore_jni.so",
+      "runtimeFiles": []
+    }
+  },
+  "toolchains": {
+    "toolchain": {
+      "cCompilerExecutable": "C:\\Users\\RBILLC\\AppData\\Local\\Android\\Sdk\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\clang.exe",
+      "cppCompilerExecutable": "C:\\Users\\RBILLC\\AppData\\Local\\Android\\Sdk\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\clang++.exe"
+    }
+  },
+  "cFileExtensions": [
+    "c"
+  ],
+  "cppFileExtensions": [
+    "cpp"
+  ]
+}

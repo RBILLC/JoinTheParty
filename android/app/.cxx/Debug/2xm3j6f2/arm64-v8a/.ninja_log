@@ -1,0 +1,10 @@
+# ninja log v5
+46	163	8063954441031408	synccore_core/CMakeFiles/synccore.dir/third_party/kissfft/kiss_fftr.c.o	cf2261b58c1ff286
+38	173	8063954441116408	synccore_core/CMakeFiles/synccore.dir/third_party/kissfft/kiss_fft.c.o	f7e6fcfd3fdfeff7
+1	376	8063954443151419	CMakeFiles/synccore_jni.dir/synccore_jni.cpp.o	c0f70f06a5fdc32a
+32	808	8063954447467106	synccore_core/CMakeFiles/synccore.dir/src/policy/policy.cpp.o	5ade65ff07246495
+18	811	8063954447497109	synccore_core/CMakeFiles/synccore.dir/src/estimator/estimator.cpp.o	67ac43715f21abb7
+25	1051	8063954449857805	synccore_core/CMakeFiles/synccore.dir/src/correlate/correlate.cpp.o	eac778dc7006d92c
+10	1272	8063954452038123	synccore_core/CMakeFiles/synccore.dir/src/synccore.cpp.o	70297dbe2d3fba4e
+1273	1348	8063954452703168	synccore_core/libsynccore.a	fd7f590be24d8fcc
+1348	1427	8063954453588363	C:/Users/RBILLC/source/repos/JoinTheParty/android/app/build/intermediates/cxx/Debug/2xm3j6f2/obj/arm64-v8a/libsynccore_jni.so	54e93b75ee108450

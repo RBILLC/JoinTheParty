@@ -1,0 +1,14 @@
+{
+	"backtraceGraph" : 
+	{
+		"commands" : [],
+		"files" : [],
+		"nodes" : []
+	},
+	"installers" : [],
+	"paths" : 
+	{
+		"build" : "synccore_core",
+		"source" : "C:/Users/RBILLC/source/repos/JoinTheParty/core"
+	}
+}
