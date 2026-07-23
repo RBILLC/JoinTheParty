@@ -19,9 +19,10 @@ import javax.crypto.spec.SecretKeySpec
  * signature over "POST\n/v1/identify\n<key>\naudio\n1\n<ts>" (signature
  * version 1). A successful match carries `play_offset_ms` (position in the
  * catalog track at the END of the sample), `external_ids.isrc`, and a
- * 0–100 `score` mapped to confidence. ACRCloud reports no frequency skew —
- * drift identification falls back to the estimator's observation-only path
- * (see core estimator tests).
+ * 0–100 `score` mapped to confidence (the documented floor is 70, so a
+ * match never maps below 0.7). ACRCloud's schema documents
+ * `frequency_skew` (see docs/recognition-audit-2026.md §1) — read when
+ * present; when absent the estimator's observation-only drift path covers.
  *
  * Credentials: [Config] carries the console keys. A null config (today's
  * default until keys are injected — see docs/real-world-handoff.md) makes
@@ -125,7 +126,9 @@ class ACRCloudProvider(
             // exactly that instant on our clock — the pairing SyncCore wants.
             matchOffsetMs = offsetMs,
             captureMonoNs = endMonoNs,
-            frequencySkew = 0.0,
+            // Documented in ACRCloud's metadata schema (audit 2026-07-22);
+            // 0.0 when the response omits it.
+            frequencySkew = music.optDouble("frequency_skew", 0.0),
             confidence = (music.optDouble("score", 80.0) / 100.0)
                 .coerceIn(0.0, 1.0).toFloat(),
             title = music.optString("title").ifEmpty { null },
