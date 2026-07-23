@@ -453,16 +453,24 @@ class SessionViewModel(
                 // class doc for the swap procedure once one exists.
                 val backendClient = HttpBackendClient(baseUrl = null)
                 val engine = SyncCore()
+                // ══════════════════════════════════════════════════════════
+                // PASTE YOUR ACRCLOUD TRIAL CREDENTIALS HERE (from
+                // console.acrcloud.com → your project → Access). Until all
+                // three placeholders are replaced, recognition stays
+                // safely inert (the guard below passes config = null).
+                // Debug-build convenience only — production proxies these
+                // through the backend (see ACRCloudProvider's KDoc).
+                // ══════════════════════════════════════════════════════════
+                val acrConfig = ACRCloudProvider.Config(
+                    host = "YOUR_ACR_HOST",        // e.g. identify-eu-west-1.acrcloud.com
+                    accessKey = "YOUR_ACR_KEY",
+                    accessSecret = "YOUR_ACR_SECRET",
+                )
                 return SessionViewModel(
                     engine = engine,
                     nudgeStore = DataStoreNudgeStore(context.applicationContext),
-                    // ACRCloud pivot (PM 2026-07-22): config = null until
-                    // console keys are injected — see
-                    // docs/real-world-handoff.md for the exact steps. The
-                    // PCM tee (NAT-06b) is live: recognition hears the
-                    // engine's post-AEC capture as soon as keys exist.
                     recognition = ACRCloudProvider(
-                        config = null,
+                        config = acrConfig.takeIf { it.accessKey != "YOUR_ACR_KEY" },
                         source = EnginePcmWindowSource(engine),
                     ),
                     backend = backendClient,
