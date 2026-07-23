@@ -26,6 +26,10 @@
 | AUTH-02 | 🟡 Done — PKCE + EncryptedSharedPreferences + rotation handling, RFC known-answer tested; pending: real client id, live auth run | — |
 | AUTH-05 | 🟡 Done — detector + gate wiring + recognition-only fallback; Premium probe lands with real App Remote | — |
 | NAT-08 | 🟡 Done against signature-faithful stubs (real AAR pending); seek echoes notifySeekIssued (unit-tested) | — |
+| RES-01 | ✅ Passed (PM decision 2026-07-22) — ShazamKit for Android is a go | — |
+| NAT-06 | 🟡 Done against ShazamKit stubs — predictedCurrentMatchOffset/skew mapping, RequestFix-driven cadence + bootstrap; real AAR + audio feed pending | — |
+| AUTH-03/04 | 🟡 Client seams done (mocked responses behind production-shaped HttpBackendClient); server deployment pending | — |
+| UI-06 | 🟡 Done — onboarding + concierge gates emulator-verified; pending: once-per-session gate memory, Spotify brand attribution | — |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.

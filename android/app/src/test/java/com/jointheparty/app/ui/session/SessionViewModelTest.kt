@@ -1,8 +1,12 @@
 package com.jointheparty.app.ui.session
 
+import com.jointheparty.app.backend.BackendClient
+import com.jointheparty.app.backend.ShazamTokenResult
+import com.jointheparty.app.backend.TrackResolution
 import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.core.SyncEngine
 import com.jointheparty.app.data.NudgeStore
+import com.jointheparty.app.recognition.RecognitionProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
@@ -190,6 +194,41 @@ class SessionViewModelTest {
         assertEquals("AirPods Pro", vm.syncState.value.routeName)
     }
 
+    @Test
+    fun startListeningBootstrapsRecognitionSubmitsFixAndResolvesTrack() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val fix = RecognitionProvider.RecognitionFixResult(
+            matchOffsetMs = 12_345L,
+            captureMonoNs = 999L,
+            frequencySkew = 0.0,
+            confidence = 0.9f,
+            title = "Song",
+            artist = "Artist",
+            isrc = "USABC1234567",
+        )
+        val recognition = FakeRecognitionProvider(fix)
+        val backend = FakeBackendClient(
+            TrackResolution.Resolved(spotifyUri = "spotify:track:xyz", looseSync = false),
+        )
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, recognition, backend)
+
+        vm.startListening()
+        // The bootstrap transition (listening -> matching) and the
+        // dispatch of the recognition pass both happen synchronously
+        // inside startListening(); the pass's own body only actually runs
+        // once the test dispatcher is advanced below.
+        assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
+
+        advanceUntilIdle()
+
+        assertEquals(1, recognition.callCount)
+        assertEquals(1, engine.submittedFixes.size)
+        assertEquals(12_345L, engine.submittedFixes[0].matchOffsetMs)
+        assertEquals(SessionPhase.AIMING, vm.syncState.value.phase)
+        assertEquals("spotify:track:xyz", vm.syncState.value.track?.spotifyUri)
+        assertEquals("USABC1234567", vm.syncState.value.track?.isrc)
+    }
+
     private suspend fun TestScope.driveToLocked(vm: SessionViewModel, engine: FakeSyncEngine) {
         vm.startListening()
         vm.onMatchInFlight()
@@ -226,6 +265,7 @@ private class FakeSyncEngine : SyncEngine {
 
     val nudgeCalls = mutableListOf<Int>()
     val routeCalls = mutableListOf<Pair<SyncCore.Route, Int>>()
+    val submittedFixes = mutableListOf<SubmittedFix>()
     var closed = false
         private set
     var capturing = false
@@ -264,7 +304,10 @@ private class FakeSyncEngine : SyncEngine {
         captureMonoNs: Long,
         frequencySkew: Double,
         confidence: Float,
-    ) = true
+    ): Boolean {
+        submittedFixes += SubmittedFix(source, matchOffsetMs, captureMonoNs, frequencySkew, confidence)
+        return true
+    }
 
     override fun commandLatencyMs(): Int = 250
 
@@ -272,6 +315,14 @@ private class FakeSyncEngine : SyncEngine {
         closed = true
     }
 }
+
+private data class SubmittedFix(
+    val source: SyncCore.FixSource,
+    val matchOffsetMs: Long,
+    val captureMonoNs: Long,
+    val frequencySkew: Double,
+    val confidence: Float,
+)
 
 /** In-memory stand-in for the real DataStore-backed [NudgeStore] — no Context needed. */
 private class FakeNudgeStore : NudgeStore {
@@ -289,4 +340,29 @@ private class FakeNudgeStore : NudgeStore {
     override suspend fun saveCommandLatency(routeId: String, ms: Int) {
         latencies[routeId] = ms
     }
+}
+
+/** NAT-06: records calls; returns a fixed fix (or null) without touching ShazamKit. */
+private class FakeRecognitionProvider(
+    private val result: RecognitionProvider.RecognitionFixResult?,
+) : RecognitionProvider {
+    var callCount = 0
+        private set
+
+    override suspend fun recognizeOnce(): RecognitionProvider.RecognitionFixResult? {
+        callCount++
+        return result
+    }
+
+    override fun close() = Unit
+}
+
+/** AUTH-03/04: records calls; returns a fixed resolution without touching HTTP. */
+private class FakeBackendClient(
+    private val resolution: TrackResolution,
+) : BackendClient {
+    override suspend fun fetchShazamToken(): ShazamTokenResult =
+        ShazamTokenResult.Success(token = "fake-token", expiresAtEpochMs = Long.MAX_VALUE)
+
+    override suspend fun resolveIsrcToSpotifyUri(isrc: String): TrackResolution = resolution
 }

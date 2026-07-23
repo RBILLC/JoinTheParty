@@ -3,6 +3,7 @@ package com.jointheparty.app.ui.session
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -58,6 +60,8 @@ fun SessionScreen(
     onJoinTap: () -> Unit,
     onTrimChange: (Int) -> Unit,
     onTrimCommit: (Int) -> Unit,
+    onGetSpotify: () -> Unit,
+    onSeePremiumPlans: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(
@@ -86,7 +90,12 @@ fun SessionScreen(
                     onTrimCommit = onTrimCommit,
                 )
                 PhaseGroup.LOST -> QuietMessage("Lost the room — listening again…")
-                PhaseGroup.CONCIERGE -> ConciergeContent(phase = state.phase, onJoinTap = onJoinTap)
+                PhaseGroup.CONCIERGE -> ConciergeContent(
+                    phase = state.phase,
+                    onJoinTap = onJoinTap,
+                    onGetSpotify = onGetSpotify,
+                    onSeePremiumPlans = onSeePremiumPlans,
+                )
             }
         }
     }
@@ -182,27 +191,123 @@ private fun activePhaseWord(phase: SessionPhase): String = when (phase) {
 }
 
 /**
- * NEEDS_SPOTIFY / NEEDS_PREMIUM / ERROR: quiet-text placeholders standing in
- * for the real concierge screens (ui-ux-design-system.md §6.4).
+ * NEEDS_SPOTIFY / NEEDS_PREMIUM: the graceful concierge moment (§6.4) — never
+ * a dead end, never a dark pattern. Explains what happened and why, offers
+ * one primary action that clearly leaves the app (Spotify's install page or
+ * its Premium plans page — both opened by the Activity), and one honest
+ * secondary action that keeps the recognition-only experience already
+ * running. This composable is purely a renderer of whatever phase it's
+ * given; it holds no dismissal memory itself.
  *
- * TODO(UI-06): replace with the full concierge treatment — title/body copy,
- * "See Premium plans" / "Get Spotify" primary actions, and the "Keep
- * identifying songs" graceful-degradation path.
+ * TODO(UI-06 follow-up): §6.4 point 4 ("never repeat the gate more than once
+ * per session after dismissal") is NOT yet enforced — [SessionViewModel]'s
+ * transition table currently allows any phase → NEEDS_SPOTIFY/NEEDS_PREMIUM
+ * unconditionally (see its `isLegalTransition`), so the gate can currently
+ * reappear more than once in a session. That's state-machine-owned and out
+ * of this ticket's file list (a concurrent change owns SessionViewModel.kt).
+ *
+ * ERROR keeps UI-05's quiet-text/tap-to-retry treatment; it isn't part of
+ * the §6.4 gate copy.
  */
 @Composable
-private fun ConciergeContent(phase: SessionPhase, onJoinTap: () -> Unit) {
+private fun ConciergeContent(
+    phase: SessionPhase,
+    onJoinTap: () -> Unit,
+    onGetSpotify: () -> Unit,
+    onSeePremiumPlans: () -> Unit,
+) {
     when (phase) {
-        // Tap = the §6.4 recognition-only degradation until UI-06's real
-        // concierge lands ("Keep identifying songs").
-        SessionPhase.NEEDS_SPOTIFY ->
-            QuietMessage("Spotify not installed — tap to listen anyway", onTap = onJoinTap)
-        SessionPhase.NEEDS_PREMIUM -> QuietMessage("Syncing needs Spotify Premium")
+        SessionPhase.NEEDS_SPOTIFY -> ConciergeGate(
+            title = "Spotify isn't installed",
+            body = "JoinTheParty drives your Spotify app to play the room in sync — " +
+                "you'll need Spotify installed on this device for that.",
+            primaryLabel = "Get Spotify",
+            onPrimary = onGetSpotify,
+            onSecondary = onJoinTap,
+        )
+        SessionPhase.NEEDS_PREMIUM -> ConciergeGate(
+            title = "Syncing needs Spotify Premium",
+            body = "JoinTheParty drives your Spotify app and seeks to the exact beat — " +
+                "Spotify only allows seeking on Premium accounts.",
+            primaryLabel = "See Premium plans",
+            onPrimary = onSeePremiumPlans,
+            onSecondary = onJoinTap,
+        )
         SessionPhase.ERROR -> QuietMessage("Something broke — tap to retry", onTap = onJoinTap)
         else -> Unit
     }
 }
 
-/** Shared quiet-text centerpiece used by LOST, WAITING, and the concierge placeholders. */
+/**
+ * Shared concierge layout: title ([BilletType.title]/`ink`), body
+ * ([BilletType.body]/`ink2`, capped near 65 characters per line via
+ * [widthIn]), a `brass`-fill primary pill (§6.3 — the screen's only warm
+ * accent, fine here since no meter is visible in this phase), and an
+ * outlined secondary pill for the "Keep identifying songs" degradation path
+ * both gates share.
+ */
+@Composable
+private fun ConciergeGate(
+    title: String,
+    body: String,
+    primaryLabel: String,
+    onPrimary: () -> Unit,
+    onSecondary: () -> Unit,
+) {
+    Box(modifier = Modifier.fillMaxSize().padding(DT.Space.gutter), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(text = title, style = BilletType.title, color = DT.Colors.ink, textAlign = TextAlign.Center)
+            Spacer(modifier = Modifier.height(DT.Space.grid))
+            Text(
+                text = body,
+                style = BilletType.body,
+                color = DT.Colors.ink2,
+                textAlign = TextAlign.Center,
+                // ~65ch at BilletType.body's 15sp.
+                modifier = Modifier.widthIn(max = 300.dp),
+            )
+            // TODO(UI-06b): Spotify brand attribution (their logo, their
+            // green, untouched, per Spotify's brand guidelines) — assets
+            // aren't available yet, so these stay text-only pills for now.
+            Spacer(modifier = Modifier.height(DT.Space.sectionGap))
+            PrimaryPill(label = primaryLabel, onClick = onPrimary)
+            Spacer(modifier = Modifier.height(DT.Space.grid))
+            SecondaryPill(label = "Keep identifying songs", onClick = onSecondary)
+        }
+    }
+}
+
+/** Primary pill (§6.3): `brass` fill, `void` text, [BilletType.label]. */
+@Composable
+private fun PrimaryPill(label: String, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(percent = 50))
+            .background(DT.Colors.brass)
+            .clickable(onClick = onClick)
+            .padding(horizontal = DT.Space.gutter, vertical = 14.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(text = label, style = BilletType.label, color = DT.Colors.void)
+    }
+}
+
+/** Secondary pill (§6.3): no fill, 1px `hairline` outline, `ink` text. */
+@Composable
+private fun SecondaryPill(label: String, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(percent = 50))
+            .border(width = 1.dp, color = DT.Colors.hairline, shape = RoundedCornerShape(percent = 50))
+            .clickable(onClick = onClick)
+            .padding(horizontal = DT.Space.gutter, vertical = 14.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(text = label, style = BilletType.label, color = DT.Colors.ink)
+    }
+}
+
+/** Shared quiet-text centerpiece used by LOST, WAITING, and the ERROR concierge phase. */
 @Composable
 private fun QuietMessage(
     text: String,
@@ -249,6 +354,8 @@ private fun SessionScreenIdlePreview() {
             onJoinTap = {},
             onTrimChange = {},
             onTrimCommit = {},
+            onGetSpotify = {},
+            onSeePremiumPlans = {},
         )
     }
 }
@@ -263,6 +370,8 @@ private fun SessionScreenListeningPreview() {
             onJoinTap = {},
             onTrimChange = {},
             onTrimCommit = {},
+            onGetSpotify = {},
+            onSeePremiumPlans = {},
         )
     }
 }
@@ -291,6 +400,40 @@ private fun SessionScreenLockedPreview() {
             onJoinTap = {},
             onTrimChange = {},
             onTrimCommit = {},
+            onGetSpotify = {},
+            onSeePremiumPlans = {},
+        )
+    }
+}
+
+@Preview(name = "Concierge — needs Spotify", showBackground = true, backgroundColor = 0xFF131110)
+@Composable
+private fun SessionScreenNeedsSpotifyPreview() {
+    BilletTheme {
+        SessionScreen(
+            state = SyncState(phase = SessionPhase.NEEDS_SPOTIFY),
+            meterFrames = MutableStateFlow(MeterFrame.Initial),
+            onJoinTap = {},
+            onTrimChange = {},
+            onTrimCommit = {},
+            onGetSpotify = {},
+            onSeePremiumPlans = {},
+        )
+    }
+}
+
+@Preview(name = "Concierge — needs Premium", showBackground = true, backgroundColor = 0xFF131110)
+@Composable
+private fun SessionScreenNeedsPremiumPreview() {
+    BilletTheme {
+        SessionScreen(
+            state = SyncState(phase = SessionPhase.NEEDS_PREMIUM),
+            meterFrames = MutableStateFlow(MeterFrame.Initial),
+            onJoinTap = {},
+            onTrimChange = {},
+            onTrimCommit = {},
+            onGetSpotify = {},
+            onSeePremiumPlans = {},
         )
     }
 }

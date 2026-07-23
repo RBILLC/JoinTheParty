@@ -4,12 +4,18 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.jointheparty.app.backend.BackendClient
+import com.jointheparty.app.backend.HttpBackendClient
+import com.jointheparty.app.backend.TrackResolution
 import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.core.SyncEngine
 import com.jointheparty.app.data.DataStoreNudgeStore
 import com.jointheparty.app.data.NudgeStore
+import com.jointheparty.app.recognition.RecognitionProvider
+import com.jointheparty.app.recognition.ShazamKitProvider
 import com.jointheparty.app.ui.model.MeterFrame
 import com.jointheparty.app.ui.model.toMeterFrame
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -60,6 +66,12 @@ class SessionViewModel(
     private val engine: SyncEngine,
     private val nudgeStore: NudgeStore,
     private val dispatcher: CoroutineDispatcher = Dispatchers.Default,
+    // NAT-06: both default null so every existing call site (and every
+    // existing test's FakeSyncEngine-only construction) compiles and
+    // behaves unchanged — runRecognitionPass() and the startListening()
+    // bootstrap both no-op when recognition is null.
+    private val recognition: RecognitionProvider? = null,
+    private val backend: BackendClient? = null,
 ) : ViewModel() {
 
     private val _syncState = MutableStateFlow(SyncState())
@@ -73,6 +85,15 @@ class SessionViewModel(
 
     /** Consecutive SC_EVT_TRACK_LOST count; reset whenever LOCKED is reached. */
     private var consecutiveLosses = 0
+
+    /**
+     * NAT-06: guards [runRecognitionPass] against overlapping passes —
+     * ShazamKit quota discipline (technical-requirements.md §3.2) requires
+     * one session, one pass at a time. Two triggers can race to start a
+     * pass (the startListening() bootstrap and every SC_EVT_REQUEST_FIX
+     * after it); this flag is what keeps them from overlapping.
+     */
+    private val recognitionInFlight = AtomicBoolean(false)
 
     init {
         // UNDISPATCHED: SyncCore.events is a hot SharedFlow with no replay
@@ -97,6 +118,19 @@ class SessionViewModel(
     fun startListening() {
         if (!engine.startCapture()) return
         transition(SessionPhase.LISTENING)
+
+        // NAT-06 bootstrap: SC_EVT_REQUEST_FIX is the only *recurring*
+        // recognition trigger (technical-requirements.md §3.2 — no
+        // free-running recognition loops), but SyncCore can't request a fix
+        // before it has ever received one, so nothing would ever kick off
+        // the first pass. Fire it manually, once, right after capture
+        // starts. Guarded on `recognition` so ViewModels built without
+        // NAT-06 wiring (every existing unit test's FakeSyncEngine-only
+        // construction) see no behavior change.
+        if (recognition != null) {
+            onMatchInFlight()
+            runRecognitionPass()
+        }
     }
 
     /** listening → matching: first audio buffered to the recognizer. */
@@ -166,10 +200,72 @@ class SessionViewModel(
             is SyncCore.Event.FixRejected ->
                 _syncState.update { it.copy(lastRejectReason = event.reason) }
             SyncCore.Event.TrackLost -> onTrackLost()
+            // NAT-06: the ONLY recurring recognition trigger, per the
+            // no-free-running-recognition-loops rule (technical-
+            // requirements.md §3.2). runRecognitionPass() itself no-ops
+            // when `recognition` is null.
+            SyncCore.Event.RequestFix -> runRecognitionPass()
             is SyncCore.Event.Correction,
-            SyncCore.Event.RequestFix,
             is SyncCore.Event.CalibrationResult,
             -> Unit // not phase-relevant to the session state machine
+        }
+    }
+
+    /**
+     * NAT-06: runs one recognition pass end-to-end — [RecognitionProvider
+     * .recognizeOnce], submit the resulting fix to [SyncEngine
+     * .submitRecognitionFix], and — only while still in MATCHING — resolve
+     * the fix's ISRC to a Spotify URI via [BackendClient
+     * .resolveIsrcToSpotifyUri] and advance to AIMING via [onTrackResolved].
+     * A fix with no ISRC, or a resolution that comes back NotFound/Failure,
+     * simply leaves the session in MATCHING for the next pass to try again
+     * — never a phase change, never an exception.
+     *
+     * [recognitionInFlight] rejects a second concurrent call outright (see
+     * its declaration for why two triggers can race here).
+     */
+    private fun runRecognitionPass() {
+        val recognizer = recognition ?: return
+        val backendClient = backend ?: return
+        if (!recognitionInFlight.compareAndSet(false, true)) return
+
+        viewModelScope.launch(dispatcher) {
+            try {
+                val fix = recognizer.recognizeOnce() ?: return@launch
+                engine.submitRecognitionFix(
+                    SyncCore.FixSource.SHAZAMKIT,
+                    fix.matchOffsetMs,
+                    fix.captureMonoNs,
+                    fix.frequencySkew,
+                    fix.confidence,
+                )
+
+                // ISRC→URI resolution only matters while we're still aiming
+                // to lock the track (matching → aiming, §2.4); a fix that
+                // arrives after AIMING is still a useful sync-error
+                // observation for SyncCore (submitted above) but shouldn't
+                // re-resolve or re-transition.
+                if (_syncState.value.phase != SessionPhase.MATCHING) return@launch
+                val isrc = fix.isrc ?: return@launch
+
+                when (val resolution = backendClient.resolveIsrcToSpotifyUri(isrc)) {
+                    is TrackResolution.Resolved ->
+                        onTrackResolved(
+                            TrackInfo(
+                                spotifyUri = resolution.spotifyUri,
+                                isrc = isrc,
+                                title = fix.title ?: "Unknown",
+                                artist = fix.artist ?: "",
+                                durationMs = 0L,
+                            ),
+                        )
+                    TrackResolution.NotFound,
+                    is TrackResolution.Failure,
+                    -> Unit // stay in MATCHING; the next pass may resolve
+                }
+            } finally {
+                recognitionInFlight.set(false)
+            }
         }
     }
 
@@ -255,9 +351,15 @@ class SessionViewModel(
         class Factory(private val context: Context) : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                // AUTH-03/04: no backend is deployed yet, so this is the
+                // mock-mode HttpBackendClient(baseUrl = null) — see its
+                // class doc for the swap procedure once one exists.
+                val backendClient = HttpBackendClient(baseUrl = null)
                 return SessionViewModel(
                     engine = SyncCore(),
                     nudgeStore = DataStoreNudgeStore(context.applicationContext),
+                    recognition = ShazamKitProvider(backendClient),
+                    backend = backendClient,
                 ) as T
             }
         }
