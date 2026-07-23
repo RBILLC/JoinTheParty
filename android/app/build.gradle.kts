@@ -21,6 +21,12 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
+        // Required by the vendored spotify-auth AAR's manifest (its
+        // LoginActivity intent-filter is placeholder-parameterized). Same
+        // redirect our own PKCE flow registers (tech-req §3.1).
+        manifestPlaceholders["redirectSchemeName"] = "jointheparty"
+        manifestPlaceholders["redirectHostName"] = "callback"
+
         externalNativeBuild {
             cmake {
                 // -DANDROID_STL=c++_shared is required by com.google.oboe's
@@ -84,6 +90,12 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     debugImplementation(libs.androidx.compose.ui.tooling)
     implementation(libs.kotlinx.coroutines.android)
+    // Real Spotify SDKs, vendored from the public GitHub release
+    // v0.8.0-appremote_v2.1.0-auth (replaces the com.spotify.* stubs).
+    // gson is App Remote's documented transitive requirement.
+    implementation(files("libs/spotify-app-remote-release-0.8.0.aar"))
+    implementation(files("libs/spotify-auth-release-2.1.0.aar"))
+    implementation(libs.gson)
     implementation(libs.oboe)
     implementation(libs.androidx.browser)
     implementation(libs.androidx.security.crypto)

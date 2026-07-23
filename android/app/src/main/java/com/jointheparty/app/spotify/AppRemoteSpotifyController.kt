@@ -8,7 +8,7 @@ import com.spotify.android.appremote.api.SpotifyAppRemote
 import com.spotify.android.appremote.api.error.CouldNotFindSpotifyApp
 import com.spotify.android.appremote.api.error.NotLoggedInException
 import com.spotify.android.appremote.api.error.UserNotAuthorizedException
-import com.spotify.protocol.client.EventCallback
+import com.spotify.protocol.client.Subscription
 import com.spotify.protocol.types.PlayerState
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.Flow
@@ -18,11 +18,11 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 
 /**
- * NAT-08: [SpotifyController] implemented against Spotify App Remote (the
- * `com.spotify.*` classes are, for now, the compile-faithful STUBS under
- * android/app/src/main/java/com/spotify/ — see their headers for the
- * stub-to-real swap procedure). Every call site below is written exactly
- * as it will be against the real AAR.
+ * NAT-08: [SpotifyController] implemented against the REAL Spotify App
+ * Remote AAR (android/app/libs/, vendored from the public GitHub release —
+ * tools/fetch_spotify_sdks.sh records provenance). The former com.spotify.*
+ * stubs are deleted; the swap required exactly one adjustment (nested
+ * Subscription.EventCallback).
  *
  * [context] is nullable to keep this class JVM-unit-testable without
  * Robolectric (see AppRemoteControllerTest): [connect] treats a null
@@ -128,9 +128,11 @@ class AppRemoteSpotifyController(
     }
 
     private fun subscribeToPlayerState(spotifyAppRemote: SpotifyAppRemote) {
+        // Real-SDK note (vendor swap): EventCallback is nested in
+        // Subscription, and PlayerState/Track expose public Java fields.
         spotifyAppRemote.playerApi.subscribeToPlayerState()
             .setEventCallback(
-                EventCallback<PlayerState> { data ->
+                Subscription.EventCallback<PlayerState> { data ->
                     val receivedMonoNs = System.nanoTime()
                     playerStatesFlow.tryEmit(
                         SpotifyController.RemotePlayerState(

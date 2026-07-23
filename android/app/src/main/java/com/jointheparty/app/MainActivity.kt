@@ -130,9 +130,9 @@ class MainActivity : ComponentActivity() {
         // gate screen itself proceeds recognition-only (§6.4 degradation).
         val phase = viewModel.syncState.value.phase
         if (phase != SessionPhase.NEEDS_SPOTIFY &&
-            !SpotifyAppDetector(this).isSpotifyInstalled()
+            !SpotifyAppDetector(this).isSpotifyInstalled() &&
+            viewModel.onSpotifyMissing()  // false once dismissed → proceed
         ) {
-            viewModel.onSpotifyMissing()
             return
         }
         val granted = ContextCompat.checkSelfPermission(

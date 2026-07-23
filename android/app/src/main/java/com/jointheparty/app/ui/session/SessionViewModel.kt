@@ -10,9 +10,11 @@ import com.jointheparty.app.backend.TrackResolution
 import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.core.SyncEngine
 import com.jointheparty.app.data.DataStoreNudgeStore
+import com.jointheparty.app.audio.AudioTrackChirpPlayer
+import com.jointheparty.app.audio.ChirpPlayer
 import com.jointheparty.app.data.NudgeStore
+import com.jointheparty.app.recognition.ACRCloudProvider
 import com.jointheparty.app.recognition.RecognitionProvider
-import com.jointheparty.app.recognition.ShazamKitProvider
 import com.jointheparty.app.ui.model.MeterFrame
 import com.jointheparty.app.ui.model.toMeterFrame
 import java.util.concurrent.atomic.AtomicBoolean
@@ -81,6 +83,7 @@ class SessionViewModel(
     // bootstrap both no-op when recognition is null.
     private val recognition: RecognitionProvider? = null,
     private val backend: BackendClient? = null,
+    private val chirp: ChirpPlayer? = null,
 ) : ViewModel() {
 
     private val _syncState = MutableStateFlow(SyncState())
@@ -125,6 +128,11 @@ class SessionViewModel(
      * be a lie. Caller must hold RECORD_AUDIO before invoking.
      */
     fun startListening() {
+        val from = _syncState.value.phase
+        if (from == SessionPhase.NEEDS_SPOTIFY || from == SessionPhase.NEEDS_PREMIUM) {
+            // Proceeding past a gate IS its dismissal (once per session).
+            gateDismissedThisSession = true
+        }
         if (!engine.startCapture()) return
         transition(SessionPhase.LISTENING)
 
@@ -159,14 +167,27 @@ class SessionViewModel(
         transition(SessionPhase.CONVERGING)
     }
 
-    /** any → needsSpotify (App Remote couldn't find the Spotify app). */
-    fun onSpotifyMissing() {
-        transition(SessionPhase.NEEDS_SPOTIFY)
+    /**
+     * UI-06 once-per-session rule (ui-ux §6.4): after the user dismisses a
+     * concierge gate (by proceeding recognition-only), it must not re-raise
+     * within the session. Cleared by [reset].
+     */
+    private var gateDismissedThisSession = false
+
+    /**
+     * any → needsSpotify (App Remote couldn't find the Spotify app).
+     * Returns whether the gate was raised — false once dismissed this
+     * session, so callers proceed (recognition-only) instead.
+     */
+    fun onSpotifyMissing(): Boolean {
+        if (gateDismissedThisSession) return false
+        return transition(SessionPhase.NEEDS_SPOTIFY)
     }
 
     /** any → needsPremium (seek rejected for a non-Premium account). */
-    fun onPremiumRequired() {
-        transition(SessionPhase.NEEDS_PREMIUM)
+    fun onPremiumRequired(): Boolean {
+        if (gateDismissedThisSession) return false
+        return transition(SessionPhase.NEEDS_PREMIUM)
     }
 
     /** any → idle: user-initiated escape hatch, e.g. leaving the session. */
@@ -174,6 +195,7 @@ class SessionViewModel(
         if (transition(SessionPhase.IDLE)) {
             engine.stopCapture()
             consecutiveLosses = 0
+            gateDismissedThisSession = false
             _syncState.update {
                 SyncState(routeId = it.routeId, routeName = it.routeName, nudgeMs = it.nudgeMs)
             }
@@ -222,6 +244,10 @@ class SessionViewModel(
     fun startCalibration() {
         if (_syncState.value.calibration == CalibrationState.Running) return
         if (!engine.beginCalibration()) return
+        // INT-03b: begin arms the detector (t0 = capture-now), THEN the
+        // chirp is rendered through the active output route — the measured
+        // delta is exactly the route's output-chain latency.
+        chirp?.play()
         _syncState.update { it.copy(calibration = CalibrationState.Running) }
     }
 
@@ -428,8 +454,12 @@ class SessionViewModel(
                 return SessionViewModel(
                     engine = SyncCore(),
                     nudgeStore = DataStoreNudgeStore(context.applicationContext),
-                    recognition = ShazamKitProvider(backendClient),
+                    // ACRCloud pivot (PM 2026-07-22): config = null until
+                    // console keys are injected — see
+                    // docs/real-world-handoff.md for the exact steps.
+                    recognition = ACRCloudProvider(config = null),
                     backend = backendClient,
+                    chirp = AudioTrackChirpPlayer(),
                 ) as T
             }
         }

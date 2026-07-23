@@ -10,6 +10,7 @@ coroutines = "1.10.1"
 datastore = "1.1.2"
 oboe = "1.9.3"
 browser = "1.8.0"
+gson = "2.11.0"
 securityCrypto = "1.1.0-alpha06"
 lifecycleViewmodelCompose = "2.8.7"
 junit = "4.13.2"
@@ -30,6 +31,7 @@ kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 androidx-datastore-preferences = { group = "androidx.datastore", name = "datastore-preferences", version.ref = "datastore" }
 oboe = { group = "com.google.oboe", name = "oboe", version.ref = "oboe" }
 androidx-browser = { group = "androidx.browser", name = "browser", version.ref = "browser" }
+gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }
 androidx-security-crypto = { group = "androidx.security", name = "security-crypto", version.ref = "securityCrypto" }
 androidx-lifecycle-viewmodel-compose = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-compose", version.ref = "lifecycleViewmodelCompose" }
 kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
