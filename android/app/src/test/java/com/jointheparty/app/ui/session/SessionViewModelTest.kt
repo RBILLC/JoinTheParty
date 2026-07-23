@@ -176,6 +176,23 @@ class SessionViewModelTest {
     }
 
     @Test
+    fun routeChangeTogglesAecMode() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val vm = viewModel(engine)
+
+        vm.onRouteChanged("speaker", null, SyncCore.Route.SPEAKER)
+        advanceUntilIdle()
+        assertEquals(listOf(SyncCore.AecMode.FULL), engine.aecCalls)
+
+        vm.onRouteChanged("bluetooth:AirPods Pro", "AirPods Pro", SyncCore.Route.BLUETOOTH)
+        advanceUntilIdle()
+        assertEquals(
+            listOf(SyncCore.AecMode.FULL, SyncCore.AecMode.OFF),
+            engine.aecCalls,
+        )
+    }
+
+    @Test
     fun routeChangeLoadsPersistedTrimAndLatency() = runTest(testDispatcher) {
         val engine = FakeSyncEngine()
         val nudgeStore = FakeNudgeStore().apply {
@@ -265,6 +282,12 @@ private class FakeSyncEngine : SyncEngine {
 
     val nudgeCalls = mutableListOf<Int>()
     val routeCalls = mutableListOf<Pair<SyncCore.Route, Int>>()
+    val aecCalls = mutableListOf<SyncCore.AecMode>()
+
+    override fun setAecMode(mode: SyncCore.AecMode): Boolean {
+        aecCalls += mode
+        return true
+    }
     val submittedFixes = mutableListOf<SubmittedFix>()
     var closed = false
         private set

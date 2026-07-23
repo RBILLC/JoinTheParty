@@ -24,6 +24,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.ui.components.NudgeWheel
 import com.jointheparty.app.ui.components.SyncMeter
 import com.jointheparty.app.ui.model.MeterFrame
@@ -150,6 +151,18 @@ private fun ActiveContent(
         TrackIdentity(track = state.track, phase = state.phase)
         Spacer(modifier = Modifier.height(DT.Space.sectionGap))
         SyncMeter(frames = meterFrames)
+        // INT-04: transient self-hearing hint (speaker mode heard our own
+        // playback; the guard discarded the fix). Cleared by the ViewModel
+        // on the next accepted estimate. Quiet fine print, never a warning
+        // color — this is expected behavior, not an error.
+        if (state.lastRejectReason == SyncCore.RejectReason.SELF_HEARING) {
+            Text(
+                text = "Hearing our own speaker — listening past it…",
+                style = BilletType.fine,
+                color = DT.Colors.ink3,
+                modifier = Modifier.padding(top = DT.Space.grid),
+            )
+        }
         // Flexible gap, floored at sectionGap, pushes the wheel to the
         // bottom third of the screen without a fixed offset.
         Spacer(modifier = Modifier.weight(1f).heightIn(min = DT.Space.sectionGap))

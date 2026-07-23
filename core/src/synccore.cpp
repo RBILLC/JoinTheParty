@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -19,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "aec/aec.h"
 #include "correlate/correlate.h"
 #include "estimator/estimator.h"
 #include "policy/policy.h"
@@ -33,6 +35,10 @@ constexpr int32_t kDefaultCommandLatencyMs = 250;
 constexpr int32_t kNudgeClampMs = 750;
 constexpr int32_t kMaxFramesPerPush = 1 << 16;
 constexpr uint64_t kEstimateEmitPeriodNs = 66'666'667ull;  // ≤ 15 Hz
+// CORE-06 (PM-confirmed 2026-07-22): a fix matching our own commanded
+// playback position within this window, while in speaker mode, is
+// self-hearing — the mic locked onto our own output.
+constexpr int64_t kSelfHearingWindowMs = 30;
 // ~12 s of 48 kHz mono float + headers, rounded up to 4 MiB by the ring.
 constexpr size_t kRingBytes = static_cast<size_t>(kSupportedRateHz) * sizeof(float) * 12;
 
@@ -44,6 +50,8 @@ struct Command {
         kLocalPlayback,
         kSetNudge,
         kSetOutputLatency,
+        kSetAecMode,
+        kPushReference,
         kBeginCalibration,
         kCancelCalibration
     } kind;
@@ -51,6 +59,7 @@ struct Command {
     sc_player_state_t player{};
     int64_t value_ms = 0;
     uint64_t mono_ns = 0;
+    std::vector<float> audio;  // kPushReference payload (control-plane copy)
 };
 
 }  // namespace
@@ -89,6 +98,7 @@ struct sc_session {
         synccore::SyncEstimator estimator;
         synccore::CorrectionPolicy policy;
         synccore::ChirpDetector detector{kSupportedRateHz};
+        synccore::SyncCoreAec aec{kSupportedRateHz};
         uint64_t now_ns = 0;        // latest input timestamp seen
         uint64_t last_emit_ns = 0;  // last SC_EVT_SYNC_ESTIMATE emission
         int64_t last_commanded_position_ms = -1;  // self-hearing guard, CORE-06
@@ -136,6 +146,9 @@ struct sc_session {
                     static_cast<uint64_t>(hdr.frames) * 1'000'000'000ull /
                         kSupportedRateHz;
                 wk.now_ns = std::max(wk.now_ns, block_end);
+                // CORE-05: speaker-mode capture runs through AEC before any
+                // downstream consumer (no-op unless SC_AEC_FULL).
+                wk.aec.process_capture(&wk.scratch);
                 if (wk.detector.armed())
                     wk.detector.push(wk.scratch.data(), wk.scratch.size(),
                                      hdr.capture_mono_ns);
@@ -209,6 +222,23 @@ struct sc_session {
                     dispatch(SC_EVT_FIX_REJECTED, &rej);
                     return;
                 }
+                // CORE-06 self-hearing guard (architecture-spec §7.3,
+                // ±30 ms PM-confirmed): in speaker mode a fix that matches
+                // our own commanded playback position is the mic hearing
+                // us, not the room — accepting it would report perfect
+                // sync forever. Known v1 limitation: near true lock the
+                // external source legitimately sits inside this window
+                // too; the energy-dominance condition that disambiguates
+                // arrives with the real APM (post-stub).
+                if (wk.aec.mode() == SC_AEC_FULL &&
+                    wk.last_commanded_position_ms >= 0 &&
+                    std::abs(cmd.fix.match_offset_ms -
+                             wk.last_commanded_position_ms) <=
+                        kSelfHearingWindowMs) {
+                    sc_evt_fix_rejected_t rej{SC_REJECT_SELF_HEARING};
+                    dispatch(SC_EVT_FIX_REJECTED, &rej);
+                    return;
+                }
                 if (!wk.estimator.on_fix(cmd.fix.match_offset_ms, t,
                                          cmd.fix.frequency_skew,
                                          cmd.fix.confidence)) {
@@ -239,6 +269,9 @@ struct sc_session {
                 wk.estimator.on_local_seek(cmd.value_ms, cmd.mono_ns,
                                            wk.policy.command_latency_ms());
                 wk.policy.on_seek_issued(cmd.mono_ns);
+                // A seek re-commands our own playback position — keep the
+                // self-hearing guard's reference fresh.
+                wk.last_commanded_position_ms = cmd.value_ms;
                 break;
             case Command::Kind::kLocalPlayback:
                 wk.last_commanded_position_ms = cmd.value_ms;
@@ -249,6 +282,12 @@ struct sc_session {
             case Command::Kind::kSetOutputLatency:
                 wk.estimator.set_output_latency_ms(
                     static_cast<double>(cmd.value_ms));
+                break;
+            case Command::Kind::kSetAecMode:
+                wk.aec.set_mode(static_cast<sc_aec_mode_t>(cmd.value_ms));
+                break;
+            case Command::Kind::kPushReference:
+                wk.aec.push_reference(cmd.audio.data(), cmd.audio.size());
                 break;
             case Command::Kind::kBeginCalibration: {
                 // t0 = current capture time. Contract: the shell calls
@@ -386,8 +425,14 @@ sc_status_t sc_set_output_route(sc_session_t* s, sc_route_t route,
 sc_status_t sc_set_aec_mode(sc_session_t* s, sc_aec_mode_t mode) {
     if (!s) return SC_ERR_INVALID_ARG;
     if (mode < SC_AEC_OFF || mode > SC_AEC_FULL) return SC_ERR_INVALID_ARG;
-    std::lock_guard<std::mutex> lock(s->mtx);
-    s->aec_mode = mode;
+    {
+        std::lock_guard<std::mutex> lock(s->mtx);
+        s->aec_mode = mode;
+    }
+    Command cmd;
+    cmd.kind = Command::Kind::kSetAecMode;
+    cmd.value_ms = static_cast<int64_t>(mode);
+    s->enqueue(std::move(cmd));
     return SC_OK;
 }
 
@@ -415,8 +460,11 @@ sc_status_t sc_push_reference(sc_session_t* s, const float* mono, int32_t frames
                               int64_t track_position_ms) {
     if (!s || !mono || frames <= 0 || track_position_ms < 0)
         return SC_ERR_INVALID_ARG;
-    // Consumed by the AEC3 wrapper in CORE-05/06. Accepted and discarded here
-    // so shells can wire the call path now.
+    Command cmd;
+    cmd.kind = Command::Kind::kPushReference;
+    cmd.value_ms = track_position_ms;
+    cmd.audio.assign(mono, mono + frames);  // control-plane copy (non-RT)
+    s->enqueue(std::move(cmd));
     return SC_OK;
 }
 

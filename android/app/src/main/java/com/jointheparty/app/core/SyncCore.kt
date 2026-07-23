@@ -125,7 +125,7 @@ class SyncCore(
     override fun setOutputRoute(route: Route, latencyPriorMs: Int): Boolean =
         nativeSetOutputRoute(handle, route.ordinal, latencyPriorMs) == 0
 
-    fun setAecMode(mode: AecMode): Boolean = nativeSetAecMode(handle, mode.ordinal) == 0
+    override fun setAecMode(mode: AecMode): Boolean = nativeSetAecMode(handle, mode.ordinal) == 0
 
     override fun notifySeekIssued(targetMs: Long, issuedMonoNs: Long): Boolean =
         nativeNotifySeekIssued(handle, targetMs, issuedMonoNs) == 0

@@ -89,6 +89,8 @@ private class FakeSyncEngine : SyncEngine {
 
     override fun setOutputRoute(route: SyncCore.Route, latencyPriorMs: Int): Boolean = true
 
+    override fun setAecMode(mode: SyncCore.AecMode): Boolean = true
+
     override fun notifySeekIssued(targetMs: Long, issuedMonoNs: Long): Boolean {
         notifySeekIssuedCalls += targetMs to issuedMonoNs
         return true

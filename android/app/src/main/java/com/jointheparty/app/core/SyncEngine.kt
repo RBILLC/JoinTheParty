@@ -45,6 +45,9 @@ interface SyncEngine {
 
     fun setOutputRoute(route: SyncCore.Route, latencyPriorMs: Int): Boolean
 
+    /** INT-04: speaker route → FULL, headphone routes → OFF (arch §7). */
+    fun setAecMode(mode: SyncCore.AecMode): Boolean
+
     fun notifySeekIssued(targetMs: Long, issuedMonoNs: Long): Boolean
 
     fun notifyLocalPlayback(commandedPositionMs: Long): Boolean

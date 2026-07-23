@@ -109,6 +109,7 @@ void test_create_destroy_cycles() {
 struct EventLog {
     std::atomic<int> estimates{0};
     std::atomic<int> rejects{0};
+    std::atomic<int> last_reject_reason{-1};
     std::atomic<double> last_error_ms{0.0};
     std::atomic<uint64_t> callback_thread_hash{0};
 };
@@ -122,6 +123,8 @@ void event_cb(sc_event_type_t type, const void* payload, void* user) {
         log->last_error_ms.store(est->error_ms);
         log->estimates.fetch_add(1);
     } else if (type == SC_EVT_FIX_REJECTED) {
+        auto* rej = static_cast<const sc_evt_fix_rejected_t*>(payload);
+        log->last_reject_reason.store(rej->reason);
         log->rejects.fetch_add(1);
     }
 }
@@ -212,6 +215,64 @@ void test_setters_clamp_and_validate() {
     sc_destroy(s);
 }
 
+// CORE-06: in speaker mode (SC_AEC_FULL), a fix matching our own commanded
+// playback position within ±30 ms is self-hearing and must be rejected;
+// outside the window — or with AEC off — fixes flow normally.
+void test_self_hearing_guard() {
+    sc_config_t cfg = valid_config();
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    EventLog log;
+    sc_set_event_callback(s, event_cb, &log);
+
+    sc_player_state_t ps{};
+    ps.position_ms = 10000;
+    ps.received_mono_ns = mono_ns();
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+    CHECK(sc_set_aec_mode(s, SC_AEC_FULL) == SC_OK);
+    CHECK(sc_notify_local_playback(s, 10000) == SC_OK);
+
+    // Fix at our own commanded position + 20 ms → inside the guard window.
+    sc_recognition_fix_t fix{};
+    fix.source = SC_FIX_SHAZAMKIT;
+    fix.match_offset_ms = 10020;
+    fix.capture_mono_ns = mono_ns();
+    fix.confidence = 0.9f;
+    CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    for (int i = 0; i < 200 && log.rejects.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.rejects.load() == 1);
+    CHECK(log.last_reject_reason.load() == SC_REJECT_SELF_HEARING);
+    CHECK(log.estimates.load() == 0);
+
+    // 200 ms away → genuinely the external speaker → accepted.
+    fix.match_offset_ms = 10200;
+    fix.capture_mono_ns = mono_ns();
+    CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    for (int i = 0; i < 200 && log.estimates.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.estimates.load() == 1);
+
+    sc_destroy(s);
+
+    // Same self-match with AEC off (headphones) → accepted: the mic cannot
+    // hear our own playback, so a matching offset is real sync.
+    s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    EventLog log2;
+    sc_set_event_callback(s, event_cb, &log2);
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+    CHECK(sc_notify_local_playback(s, 10000) == SC_OK);
+    fix.match_offset_ms = 10020;
+    fix.capture_mono_ns = mono_ns();
+    CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    for (int i = 0; i < 200 && log2.estimates.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log2.estimates.load() == 1);
+    CHECK(log2.rejects.load() == 0);
+    sc_destroy(s);
+}
+
 void test_concurrent_capture_and_control() {
     sc_config_t cfg = valid_config();
     sc_session_t* s = nullptr;
@@ -277,6 +338,7 @@ int main() {
     test_create_destroy_cycles();
     test_events_and_payloads();
     test_setters_clamp_and_validate();
+    test_self_hearing_guard();
     test_concurrent_capture_and_control();
 
     if (g_failures == 0) {

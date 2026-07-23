@@ -17,14 +17,17 @@ add_library(synccore STATIC
     src/estimator/estimator.cpp
     src/policy/policy.cpp
     src/correlate/correlate.cpp
+    src/aec/aec.cpp
     third_party/kissfft/kiss_fft.c
     third_party/kissfft/kiss_fftr.c
+    third_party/webrtc_stub/webrtc_apm.cpp
 )
 
 target_include_directories(synccore
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/webrtc_stub
 )
 
 # Vendored code builds with warnings suppressed — ours does not.

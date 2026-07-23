@@ -188,6 +188,13 @@ class SessionViewModel(
             val latencyPrior = nudgeStore.commandLatencyFor(routeId)
             engine.setUserNudgeMs(trim)
             engine.setOutputRoute(route, latencyPrior)
+            // INT-04 (arch §7): phone-speaker playback means the mic hears
+            // us — full AEC + self-hearing guard. Headphone routes are the
+            // clean case: AEC off entirely.
+            engine.setAecMode(
+                if (route == SyncCore.Route.SPEAKER) SyncCore.AecMode.FULL
+                else SyncCore.AecMode.OFF,
+            )
             _syncState.update { it.copy(routeId = routeId, routeName = routeName, nudgeMs = trim) }
         }
     }
@@ -270,6 +277,10 @@ class SessionViewModel(
     }
 
     private fun onSyncEstimate(event: SyncCore.Event.SyncEstimate) {
+        // An accepted estimate clears any transient reject hint (INT-04:
+        // the self-hearing banner disappears once real fixes flow again).
+        if (_syncState.value.lastRejectReason != null)
+            _syncState.update { it.copy(lastRejectReason = null) }
         val phase = _syncState.value.phase
         when {
             // converging/drifting → locked
