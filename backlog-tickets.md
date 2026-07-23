@@ -30,6 +30,9 @@
 | NAT-06 | 🟡 Done against ShazamKit stubs — predictedCurrentMatchOffset/skew mapping, RequestFix-driven cadence + bootstrap; real AAR + audio feed pending | — |
 | AUTH-03/04 | 🟡 Client seams done (mocked responses behind production-shaped HttpBackendClient); server deployment pending | — |
 | UI-06 | 🟡 Done — onboarding + concierge gates emulator-verified; pending: once-per-session gate memory, Spotify brand attribution | — |
+| CORE-05 | 🟡 Pipeline done against stub APM (PM decision); un-stub + ≥15dB attenuation AC pending real webrtc-audio-processing | `b344da8` |
+| CORE-06 | ✅ Done — ±30ms guard (PM-confirmed), seek-refreshed reference, headphone bypass, C-API tested; energy condition deferred to real APM | `b344da8` |
+| INT-04 | 🟡 Route→AEC wiring + UI hint done (unit-tested); 10/10 speaker-mode field trials AC needs real APM + device | `b344da8` |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.
