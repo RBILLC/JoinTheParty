@@ -136,9 +136,9 @@ class SyncCore(
     fun pushReference(samples: FloatArray, frames: Int, trackPositionMs: Long): Boolean =
         nativePushReference(handle, samples, frames, trackPositionMs) == 0
 
-    fun beginCalibration(): Boolean = nativeBeginCalibration(handle) == 0
+    override fun beginCalibration(): Boolean = nativeBeginCalibration(handle) == 0
 
-    fun cancelCalibration(): Boolean = nativeCancelCalibration(handle) == 0
+    override fun cancelCalibration(): Boolean = nativeCancelCalibration(handle) == 0
 
     /**
      * Current (possibly learned) Spotify command latency. Persist per

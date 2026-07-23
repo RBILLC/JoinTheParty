@@ -27,6 +27,14 @@ interface NudgeStore {
     suspend fun saveTrim(routeId: String, trimMs: Int)
     suspend fun commandLatencyFor(routeId: String): Int
     suspend fun saveCommandLatency(routeId: String, ms: Int)
+
+    // INT-03: chirp-calibrated output-chain latency per route (arch §6.4).
+    // Distinct from the *command* latency above: output latency is how long
+    // sound takes to become audible on this route (DAC/BT buffering) and
+    // feeds sc_set_output_route's prior; command latency is Spotify's
+    // seek-in-flight time and seeds sc_create. -1 = never calibrated.
+    suspend fun outputLatencyFor(routeId: String): Int
+    suspend fun saveOutputLatency(routeId: String, ms: Int)
 }
 
 class DataStoreNudgeStore(private val context: Context) : NudgeStore {
@@ -45,6 +53,14 @@ class DataStoreNudgeStore(private val context: Context) : NudgeStore {
         context.nudgeDataStore.edit { it[latencyKey(routeId)] = ms }
     }
 
+    override suspend fun outputLatencyFor(routeId: String): Int =
+        context.nudgeDataStore.data.map { it[outputLatencyKey(routeId)] ?: -1 }.first()
+
+    override suspend fun saveOutputLatency(routeId: String, ms: Int) {
+        context.nudgeDataStore.edit { it[outputLatencyKey(routeId)] = ms }
+    }
+
     private fun trimKey(routeId: String) = intPreferencesKey("trim:$routeId")
     private fun latencyKey(routeId: String) = intPreferencesKey("latency:$routeId")
+    private fun outputLatencyKey(routeId: String) = intPreferencesKey("outlatency:$routeId")
 }

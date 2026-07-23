@@ -91,6 +91,10 @@ private class FakeSyncEngine : SyncEngine {
 
     override fun setAecMode(mode: SyncCore.AecMode): Boolean = true
 
+    override fun beginCalibration(): Boolean = true
+
+    override fun cancelCalibration(): Boolean = true
+
     override fun notifySeekIssued(targetMs: Long, issuedMonoNs: Long): Boolean {
         notifySeekIssuedCalls += targetMs to issuedMonoNs
         return true

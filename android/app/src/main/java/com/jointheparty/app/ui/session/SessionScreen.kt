@@ -16,6 +16,10 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -25,6 +29,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.jointheparty.app.core.SyncCore
+import com.jointheparty.app.ui.components.CalibrationSheet
 import com.jointheparty.app.ui.components.NudgeWheel
 import com.jointheparty.app.ui.components.SyncMeter
 import com.jointheparty.app.ui.model.MeterFrame
@@ -64,7 +69,12 @@ fun SessionScreen(
     onGetSpotify: () -> Unit,
     onSeePremiumPlans: () -> Unit,
     modifier: Modifier = Modifier,
+    // INT-03: calibration intents (defaults keep previews/simple hosts terse).
+    onStartCalibration: () -> Unit = {},
+    onCancelCalibration: () -> Unit = {},
+    onDismissCalibration: () -> Unit = {},
 ) {
+    var showCalibration by remember { mutableStateOf(false) }
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -89,6 +99,7 @@ fun SessionScreen(
                     meterFrames = meterFrames,
                     onTrimChange = onTrimChange,
                     onTrimCommit = onTrimCommit,
+                    onOpenCalibration = { showCalibration = true },
                 )
                 PhaseGroup.LOST -> QuietMessage("Lost the room — listening again…")
                 PhaseGroup.CONCIERGE -> ConciergeContent(
@@ -98,6 +109,19 @@ fun SessionScreen(
                     onSeePremiumPlans = onSeePremiumPlans,
                 )
             }
+        }
+
+        if (showCalibration) {
+            CalibrationSheet(
+                routeName = state.routeName,
+                calibration = state.calibration,
+                onStart = onStartCalibration,
+                onCancel = onCancelCalibration,
+                onDismiss = {
+                    showCalibration = false
+                    onDismissCalibration()
+                },
+            )
         }
     }
 }
@@ -146,6 +170,7 @@ private fun ActiveContent(
     meterFrames: Flow<MeterFrame>,
     onTrimChange: (Int) -> Unit,
     onTrimCommit: (Int) -> Unit,
+    onOpenCalibration: () -> Unit = {},
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         TrackIdentity(track = state.track, phase = state.phase)
@@ -171,6 +196,17 @@ private fun ActiveContent(
             routeName = state.routeName,
             onTrimChange = onTrimChange,
             onTrimCommit = onTrimCommit,
+        )
+        // INT-03: the quiet calibration entry point — a label, not a button
+        // chrome (§4: settings-tier actions stay whisper-quiet).
+        Text(
+            text = "Calibrate",
+            style = BilletType.label,
+            color = DT.Colors.ink3,
+            modifier = Modifier
+                .align(Alignment.End)
+                .padding(top = DT.Space.grid)
+                .clickable(onClick = onOpenCalibration),
         )
     }
 }

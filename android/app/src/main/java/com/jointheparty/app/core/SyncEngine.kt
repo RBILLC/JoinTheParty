@@ -48,6 +48,14 @@ interface SyncEngine {
     /** INT-04: speaker route → FULL, headphone routes → OFF (arch §7). */
     fun setAecMode(mode: SyncCore.AecMode): Boolean
 
+    /**
+     * INT-03: chirp calibration (arch §6.4). Call at the instant chirp
+     * playback is commanded, with capture running; the engine answers with
+     * [SyncCore.Event.CalibrationResult] (valid=false on the 8 s timeout).
+     */
+    fun beginCalibration(): Boolean
+    fun cancelCalibration(): Boolean
+
     fun notifySeekIssued(targetMs: Long, issuedMonoNs: Long): Boolean
 
     fun notifyLocalPlayback(commandedPositionMs: Long): Boolean

@@ -94,6 +94,9 @@ class MainActivity : ComponentActivity() {
                             onTrimCommit = viewModel::onNudgeCommitted,
                             onGetSpotify = ::openGetSpotify,
                             onSeePremiumPlans = ::openSeePremiumPlans,
+                            onStartCalibration = viewModel::startCalibration,
+                            onCancelCalibration = viewModel::cancelCalibration,
+                            onDismissCalibration = viewModel::acknowledgeCalibration,
                         )
                     }
                 }

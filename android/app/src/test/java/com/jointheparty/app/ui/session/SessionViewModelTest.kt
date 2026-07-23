@@ -176,6 +176,35 @@ class SessionViewModelTest {
     }
 
     @Test
+    fun calibrationLifecyclePersistsMeasuredOutputLatency() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore()
+        val vm = viewModel(engine, nudgeStore)
+        vm.onRouteChanged("bluetooth:AirPods Pro", "AirPods Pro", SyncCore.Route.BLUETOOTH)
+        advanceUntilIdle()
+
+        vm.startCalibration()
+        assertEquals(1, engine.calibrationBegun)
+        assertEquals(CalibrationState.Running, vm.syncState.value.calibration)
+
+        engine.emit(SyncCore.Event.CalibrationResult(latencyMs = 182, valid = true))
+        advanceUntilIdle()
+        assertEquals(CalibrationState.Success(182), vm.syncState.value.calibration)
+        assertEquals(182, nudgeStore.outputLatencies["bluetooth:AirPods Pro"])
+        // Applied to the engine immediately, not just persisted.
+        assertEquals(SyncCore.Route.BLUETOOTH to 182, engine.routeCalls.last())
+
+        vm.acknowledgeCalibration()
+        assertEquals(CalibrationState.Idle, vm.syncState.value.calibration)
+
+        // Timeout path → Failed.
+        vm.startCalibration()
+        engine.emit(SyncCore.Event.CalibrationResult(latencyMs = 0, valid = false))
+        advanceUntilIdle()
+        assertEquals(CalibrationState.Failed, vm.syncState.value.calibration)
+    }
+
+    @Test
     fun routeChangeTogglesAecMode() = runTest(testDispatcher) {
         val engine = FakeSyncEngine()
         val vm = viewModel(engine)
@@ -197,7 +226,9 @@ class SessionViewModelTest {
         val engine = FakeSyncEngine()
         val nudgeStore = FakeNudgeStore().apply {
             trims["bluetooth:AirPods Pro"] = -60
-            latencies["bluetooth:AirPods Pro"] = 310
+            // INT-03: setOutputRoute's prior is the calibrated OUTPUT
+            // latency, not the Spotify command latency.
+            outputLatencies["bluetooth:AirPods Pro"] = 310
         }
         val vm = viewModel(engine, nudgeStore)
 
@@ -334,6 +365,21 @@ private class FakeSyncEngine : SyncEngine {
 
     override fun commandLatencyMs(): Int = 250
 
+    var calibrationBegun = 0
+        private set
+    var calibrationCancelled = 0
+        private set
+
+    override fun beginCalibration(): Boolean {
+        calibrationBegun += 1
+        return true
+    }
+
+    override fun cancelCalibration(): Boolean {
+        calibrationCancelled += 1
+        return true
+    }
+
     override fun close() {
         closed = true
     }
@@ -362,6 +408,15 @@ private class FakeNudgeStore : NudgeStore {
 
     override suspend fun saveCommandLatency(routeId: String, ms: Int) {
         latencies[routeId] = ms
+    }
+
+    val outputLatencies = mutableMapOf<String, Int>()
+
+    override suspend fun outputLatencyFor(routeId: String): Int =
+        outputLatencies[routeId] ?: -1
+
+    override suspend fun saveOutputLatency(routeId: String, ms: Int) {
+        outputLatencies[routeId] = ms
     }
 }
 

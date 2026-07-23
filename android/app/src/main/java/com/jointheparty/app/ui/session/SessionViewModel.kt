@@ -39,7 +39,16 @@ data class SyncState(
     val routeId: String = "speaker",
     val routeName: String? = null,
     val lastRejectReason: SyncCore.RejectReason? = null,
+    val calibration: CalibrationState = CalibrationState.Idle,
 )
+
+/** INT-03: chirp-calibration lifecycle for the active route (arch §6.4). */
+sealed interface CalibrationState {
+    data object Idle : CalibrationState
+    data object Running : CalibrationState
+    data class Success(val latencyMs: Int) : CalibrationState
+    data object Failed : CalibrationState
+}
 
 data class TrackInfo(
     val spotifyUri: String,
@@ -185,9 +194,12 @@ class SessionViewModel(
     fun onRouteChanged(routeId: String, routeName: String?, route: SyncCore.Route) {
         viewModelScope.launch(dispatcher) {
             val trim = nudgeStore.trimFor(routeId)
-            val latencyPrior = nudgeStore.commandLatencyFor(routeId)
+            // INT-03 fix: setOutputRoute's prior is the chirp-calibrated
+            // OUTPUT-chain latency, not Spotify's command latency (which
+            // seeds sc_create instead — see NudgeStore's doc note).
+            val outputLatencyPrior = nudgeStore.outputLatencyFor(routeId)
             engine.setUserNudgeMs(trim)
-            engine.setOutputRoute(route, latencyPrior)
+            engine.setOutputRoute(route, outputLatencyPrior)
             // INT-04 (arch §7): phone-speaker playback means the mic hears
             // us — full AEC + self-hearing guard. Headphone routes are the
             // clean case: AEC off entirely.
@@ -197,6 +209,53 @@ class SessionViewModel(
             )
             _syncState.update { it.copy(routeId = routeId, routeName = routeName, nudgeMs = trim) }
         }
+    }
+
+    // ---- Calibration (INT-03) ---------------------------------------------
+
+    /**
+     * Arms the engine's chirp detector. The shell-side chirp *playback*
+     * (through the active output route) is TODO(INT-03b) — until it exists,
+     * a run with nothing audible ends in the engine's 8 s timeout →
+     * [CalibrationState.Failed], which is the honest outcome.
+     */
+    fun startCalibration() {
+        if (_syncState.value.calibration == CalibrationState.Running) return
+        if (!engine.beginCalibration()) return
+        _syncState.update { it.copy(calibration = CalibrationState.Running) }
+    }
+
+    fun cancelCalibration() {
+        engine.cancelCalibration()
+        _syncState.update { it.copy(calibration = CalibrationState.Idle) }
+    }
+
+    /** Sheet dismissed: clear any terminal result so reopening starts fresh. */
+    fun acknowledgeCalibration() {
+        _syncState.update { it.copy(calibration = CalibrationState.Idle) }
+    }
+
+    private fun onCalibrationResult(event: SyncCore.Event.CalibrationResult) {
+        if (event.valid) {
+            val routeId = _syncState.value.routeId
+            _syncState.update {
+                it.copy(calibration = CalibrationState.Success(event.latencyMs))
+            }
+            viewModelScope.launch(dispatcher) {
+                // Persisted beside the route's trim; replayed into
+                // sc_set_output_route on every reconnect (onRouteChanged).
+                nudgeStore.saveOutputLatency(routeId, event.latencyMs)
+            }
+            engine.setOutputRoute(currentRoute(), event.latencyMs)
+        } else {
+            _syncState.update { it.copy(calibration = CalibrationState.Failed) }
+        }
+    }
+
+    private fun currentRoute(): SyncCore.Route = when {
+        _syncState.value.routeId.startsWith("bluetooth") -> SyncCore.Route.BLUETOOTH
+        _syncState.value.routeId == "wired" -> SyncCore.Route.WIRED
+        else -> SyncCore.Route.SPEAKER
     }
 
     // ---- Engine-driven transitions -----------------------------------------
@@ -212,8 +271,8 @@ class SessionViewModel(
             // requirements.md §3.2). runRecognitionPass() itself no-ops
             // when `recognition` is null.
             SyncCore.Event.RequestFix -> runRecognitionPass()
+            is SyncCore.Event.CalibrationResult -> onCalibrationResult(event)
             is SyncCore.Event.Correction,
-            is SyncCore.Event.CalibrationResult,
             -> Unit // not phase-relevant to the session state machine
         }
     }
