@@ -41,7 +41,7 @@ class AppRemoteSpotifyController(
     // TODO(AUTH-02): source the real Spotify client ID from configured app
     // credentials once the PKCE flow ticket lands; App Remote's
     // ConnectionParams requires one to attempt a connection at all.
-    private val clientId: String = "PENDING_AUTH-02_CLIENT_ID"
+    private val clientId: String = com.jointheparty.app.BuildConfig.SPOTIFY_CLIENT_ID
 
     private val playerStatesFlow = MutableSharedFlow<SpotifyController.RemotePlayerState>(
         extraBufferCapacity = 16,

@@ -27,6 +27,12 @@ android {
         manifestPlaceholders["redirectSchemeName"] = "jointheparty"
         manifestPlaceholders["redirectHostName"] = "callback"
 
+        // User-provided app registration (developer.spotify.com dashboard).
+        buildConfigField(
+            "String", "SPOTIFY_CLIENT_ID",
+            "\"e010515b16e34b86b77a2a0798126ede\"",
+        )
+
         externalNativeBuild {
             cmake {
                 // -DANDROID_STL=c++_shared is required by com.google.oboe's
@@ -76,6 +82,7 @@ android {
     buildFeatures {
         compose = true
         prefab = true  // Oboe ships CMake config via Prefab (NAT-02)
+        buildConfig = true
     }
 }
 

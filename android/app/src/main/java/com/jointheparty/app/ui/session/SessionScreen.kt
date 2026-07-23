@@ -73,6 +73,7 @@ fun SessionScreen(
     onStartCalibration: () -> Unit = {},
     onCancelCalibration: () -> Unit = {},
     onDismissCalibration: () -> Unit = {},
+    onConnectSpotify: () -> Unit = {},
 ) {
     var showCalibration by remember { mutableStateOf(false) }
     Box(
@@ -92,7 +93,10 @@ fun SessionScreen(
             label = "session-phase",
         ) { group ->
             when (group) {
-                PhaseGroup.IDLE -> IdleContent(onJoinTap = onJoinTap)
+                PhaseGroup.IDLE -> IdleContent(
+                    onJoinTap = onJoinTap,
+                    onConnectSpotify = onConnectSpotify,
+                )
                 PhaseGroup.WAITING -> WaitingContent(phase = state.phase)
                 PhaseGroup.ACTIVE -> ActiveContent(
                     state = state,
@@ -137,11 +141,25 @@ private fun SessionPhase.toPhaseGroup(): PhaseGroup = when (this) {
     SessionPhase.NEEDS_SPOTIFY, SessionPhase.NEEDS_PREMIUM, SessionPhase.ERROR -> PhaseGroup.CONCIERGE
 }
 
-/** IDLE (§4): the invitation IS the screen — nothing else renders. */
+/**
+ * IDLE (§4): the invitation IS the screen. One whisper-quiet secondary
+ * action beneath it — the PKCE account link (AUTH-02), needed before the
+ * Web API can be called on the user's behalf.
+ */
 @Composable
-private fun IdleContent(onJoinTap: () -> Unit) {
+private fun IdleContent(onJoinTap: () -> Unit, onConnectSpotify: () -> Unit = {}) {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        JoinButton(onClick = onJoinTap)
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            JoinButton(onClick = onJoinTap)
+            Text(
+                text = "Connect Spotify",
+                style = BilletType.label,
+                color = DT.Colors.ink3,
+                modifier = Modifier
+                    .padding(top = DT.Space.sectionGap)
+                    .clickable(onClick = onConnectSpotify),
+            )
+        }
     }
 }
 

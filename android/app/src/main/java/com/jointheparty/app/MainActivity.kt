@@ -22,9 +22,12 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.jointheparty.app.audio.AudioRouteObserver
 import com.jointheparty.app.data.DataStoreAppPrefs
 import com.jointheparty.app.spotify.SpotifyAppDetector
+import com.jointheparty.app.spotify.auth.EncryptedTokenStore
+import com.jointheparty.app.spotify.auth.SpotifyAuthManager
 import com.jointheparty.app.ui.onboarding.OnboardingScreen
 import com.jointheparty.app.ui.session.SessionPhase
 import com.jointheparty.app.ui.session.SessionScreen
@@ -49,6 +52,15 @@ class MainActivity : ComponentActivity() {
 
     private val appPrefs by lazy { DataStoreAppPrefs(applicationContext) }
 
+    /** AUTH-02, live: PKCE flow with the registered client id. */
+    private val authManager by lazy {
+        SpotifyAuthManager(
+            context = this,
+            tokenStore = EncryptedTokenStore(applicationContext),
+            clientId = BuildConfig.SPOTIFY_CLIENT_ID,
+        )
+    }
+
     private val micPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
@@ -62,6 +74,17 @@ class MainActivity : ComponentActivity() {
         routeObserver = AudioRouteObserver(this) { route, routeId, routeName ->
             viewModel.onRouteChanged(routeId, routeName, route)
         }.also { it.start() }
+
+        // AUTH-02: complete the PKCE exchange when the Custom Tab redirects
+        // back through AuthCallbackActivity → PendingCallback.
+        lifecycleScope.launch {
+            SpotifyAuthManager.PendingCallback.redirect.collect { uri ->
+                if (uri != null) {
+                    authManager.handleCallback(uri)
+                    SpotifyAuthManager.PendingCallback.consume()
+                }
+            }
+        }
 
         setContent {
             BilletTheme {
@@ -97,6 +120,7 @@ class MainActivity : ComponentActivity() {
                             onStartCalibration = viewModel::startCalibration,
                             onCancelCalibration = viewModel::cancelCalibration,
                             onDismissCalibration = viewModel::acknowledgeCalibration,
+                            onConnectSpotify = { authManager.beginAuth() },
                         )
                     }
                 }

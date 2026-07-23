@@ -147,6 +147,12 @@ class SyncCore(
      */
     override fun commandLatencyMs(): Int = nativeGetCommandLatencyMs(handle)
 
+    override fun copyRecentCapture(out: FloatArray): SyncEngine.CaptureWindow? {
+        val endNs = LongArray(1)
+        val frames = nativeCopyRecentCapture(handle, out, out.size, endNs)
+        return if (frames > 0) SyncEngine.CaptureWindow(frames, endNs[0]) else null
+    }
+
     override fun close() {
         if (handle != 0L) {
             nativeDestroy(handle)
@@ -204,6 +210,9 @@ class SyncCore(
     private external fun nativeBeginCalibration(handle: Long): Int
     private external fun nativeCancelCalibration(handle: Long): Int
     private external fun nativeGetCommandLatencyMs(handle: Long): Int
+    private external fun nativeCopyRecentCapture(
+        handle: Long, out: FloatArray, maxFrames: Int, outEndNs: LongArray,
+    ): Int
 
     companion object {
         init {

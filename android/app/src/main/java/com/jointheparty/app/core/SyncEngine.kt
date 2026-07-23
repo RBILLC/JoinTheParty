@@ -72,5 +72,15 @@ interface SyncEngine {
 
     fun commandLatencyMs(): Int
 
+    /**
+     * NAT-06b: copies the newest post-AEC capture (mono 48 kHz float,
+     * chronological) into [out]; null until any audio has been captured.
+     * [CaptureWindow.endMonoNs] timestamps the LAST copied frame — the
+     * pairing recognition needs (a match offset references sample end).
+     */
+    fun copyRecentCapture(out: FloatArray): CaptureWindow?
+
+    data class CaptureWindow(val frames: Int, val endMonoNs: Long)
+
     fun close()
 }

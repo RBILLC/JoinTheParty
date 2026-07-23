@@ -41,6 +41,8 @@ constexpr uint64_t kEstimateEmitPeriodNs = 66'666'667ull;  // ≤ 15 Hz
 constexpr int64_t kSelfHearingWindowMs = 30;
 // ~12 s of 48 kHz mono float + headers, rounded up to 4 MiB by the ring.
 constexpr size_t kRingBytes = static_cast<size_t>(kSupportedRateHz) * sizeof(float) * 12;
+// NAT-06b: post-AEC capture history retained for recognition sampling.
+constexpr size_t kHistoryFrames = static_cast<size_t>(kSupportedRateHz) * 12;
 
 struct Command {
     enum class Kind {
@@ -77,6 +79,16 @@ struct sc_session {
     // Worker-maintained mirror of the policy's (learned) command latency so
     // sc_get_command_latency_ms can read it from any thread.
     std::atomic<int32_t> command_latency_mirror_ms{kDefaultCommandLatencyMs};
+
+    // NAT-06b capture-history tee: circular buffer of the last ~12 s of
+    // post-AEC capture, written by the worker during drain, read by
+    // sc_copy_recent_capture from any thread. Guarded by history_mtx (both
+    // sides are non-RT).
+    std::mutex history_mtx;
+    std::vector<float> history = std::vector<float>(kHistoryFrames, 0.0f);
+    size_t history_write = 0;
+    bool history_wrapped = false;
+    std::atomic<uint64_t> history_end_ns{0};
 
     // --- control plane (mutex-guarded) ---
     std::mutex mtx;
@@ -152,6 +164,7 @@ struct sc_session {
                 if (wk.detector.armed())
                     wk.detector.push(wk.scratch.data(), wk.scratch.size(),
                                      hdr.capture_mono_ns);
+                append_history(wk.scratch.data(), wk.scratch.size(), block_end);
             }
 
             for (const Command& cmd : pending) process(cmd);
@@ -305,6 +318,17 @@ struct sc_session {
                 break;
             }
         }
+    }
+
+    void append_history(const float* data, size_t frames, uint64_t end_ns) {
+        if (frames == 0) return;
+        std::lock_guard<std::mutex> lock(history_mtx);
+        for (size_t i = 0; i < frames; ++i) {
+            history[history_write] = data[i];
+            history_write = (history_write + 1) % kHistoryFrames;
+            if (history_write == 0) history_wrapped = true;
+        }
+        history_end_ns.store(end_ns, std::memory_order_relaxed);
     }
 
     void enqueue(Command cmd) {
@@ -466,6 +490,25 @@ sc_status_t sc_push_reference(sc_session_t* s, const float* mono, int32_t frames
     cmd.audio.assign(mono, mono + frames);  // control-plane copy (non-RT)
     s->enqueue(std::move(cmd));
     return SC_OK;
+}
+
+int32_t sc_copy_recent_capture(sc_session_t* s, float* out, int32_t max_frames,
+                               uint64_t* out_end_mono_ns) {
+    if (!s || !out || max_frames <= 0) return 0;
+    std::lock_guard<std::mutex> lock(s->history_mtx);
+    const size_t available =
+        s->history_wrapped ? kHistoryFrames : s->history_write;
+    const size_t n = std::min(static_cast<size_t>(max_frames), available);
+    if (n == 0) return 0;
+    // Chronological copy of the newest n frames ending at history_write.
+    size_t start = (s->history_write + kHistoryFrames - n) % kHistoryFrames;
+    for (size_t i = 0; i < n; ++i) {
+        out[i] = s->history[start];
+        start = (start + 1) % kHistoryFrames;
+    }
+    if (out_end_mono_ns)
+        *out_end_mono_ns = s->history_end_ns.load(std::memory_order_relaxed);
+    return static_cast<int32_t>(n);
 }
 
 sc_status_t sc_get_command_latency_ms(sc_session_t* s, int32_t* out_ms) {

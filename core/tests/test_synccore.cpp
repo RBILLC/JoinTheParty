@@ -273,6 +273,44 @@ void test_self_hearing_guard() {
     sc_destroy(s);
 }
 
+// NAT-06b: the capture-history tee returns the newest frames in order with
+// the end timestamp of the last frame.
+void test_copy_recent_capture() {
+    sc_config_t cfg = valid_config();
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+
+    // Push 3 blocks of 480 frames with recognizable ramps.
+    std::vector<float> block(480);
+    uint64_t ts = 1'000'000'000ull;
+    for (int b = 0; b < 3; ++b) {
+        for (int i = 0; i < 480; ++i)
+            block[static_cast<size_t>(i)] = static_cast<float>(b) + i * 1e-4f;
+        sc_push_capture(s, block.data(), 480, ts);
+        ts += 10'000'000ull;  // 10 ms cadence
+    }
+    // Wait for the worker to drain into history.
+    std::vector<float> out(2048, -99.0f);
+    uint64_t end_ns = 0;
+    int32_t n = 0;
+    for (int i = 0; i < 200; ++i) {
+        n = sc_copy_recent_capture(s, out.data(),
+                                   static_cast<int32_t>(out.size()), &end_ns);
+        if (n >= 3 * 480) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(n == 3 * 480);
+    // Chronological: first copied frame is block 0's first sample, last is
+    // block 2's last sample.
+    CHECK(std::abs(out[0] - 0.0f) < 1e-6f);
+    CHECK(std::abs(out[static_cast<size_t>(n - 1)] - (2.0f + 479 * 1e-4f)) < 1e-5f);
+    // End timestamp = last block start + 480 frames at 48 kHz = +10 ms.
+    CHECK(end_ns == 1'000'000'000ull + 2 * 10'000'000ull + 10'000'000ull);
+
+    CHECK(sc_copy_recent_capture(nullptr, out.data(), 100, nullptr) == 0);
+    sc_destroy(s);
+}
+
 void test_concurrent_capture_and_control() {
     sc_config_t cfg = valid_config();
     sc_session_t* s = nullptr;
@@ -339,6 +377,7 @@ int main() {
     test_events_and_payloads();
     test_setters_clamp_and_validate();
     test_self_hearing_guard();
+    test_copy_recent_capture();
     test_concurrent_capture_and_control();
 
     if (g_failures == 0) {

@@ -290,6 +290,24 @@ Java_com_jointheparty_app_core_SyncCore_nativeCancelCalibration(
 }
 
 JNIEXPORT jint JNICALL
+Java_com_jointheparty_app_core_SyncCore_nativeCopyRecentCapture(
+    JNIEnv* env, jobject, jlong handle, jfloatArray out, jint max_frames,
+    jlongArray out_end_ns) {
+    auto* h = handle_of(handle);
+    if (!h || !out) return 0;
+    jfloat* buf = env->GetFloatArrayElements(out, nullptr);
+    if (!buf) return 0;
+    uint64_t end_ns = 0;
+    const jint n = sc_copy_recent_capture(h->session, buf, max_frames, &end_ns);
+    env->ReleaseFloatArrayElements(out, buf, 0);  // commit copied frames
+    if (out_end_ns) {
+        jlong end = static_cast<jlong>(end_ns);
+        env->SetLongArrayRegion(out_end_ns, 0, 1, &end);
+    }
+    return n;
+}
+
+JNIEXPORT jint JNICALL
 Java_com_jointheparty_app_core_SyncCore_nativeGetCommandLatencyMs(
     JNIEnv*, jobject, jlong handle) {
     auto* h = handle_of(handle);

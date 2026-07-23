@@ -14,6 +14,7 @@ import com.jointheparty.app.audio.AudioTrackChirpPlayer
 import com.jointheparty.app.audio.ChirpPlayer
 import com.jointheparty.app.data.NudgeStore
 import com.jointheparty.app.recognition.ACRCloudProvider
+import com.jointheparty.app.recognition.EnginePcmWindowSource
 import com.jointheparty.app.recognition.RecognitionProvider
 import com.jointheparty.app.ui.model.MeterFrame
 import com.jointheparty.app.ui.model.toMeterFrame
@@ -451,13 +452,19 @@ class SessionViewModel(
                 // mock-mode HttpBackendClient(baseUrl = null) — see its
                 // class doc for the swap procedure once one exists.
                 val backendClient = HttpBackendClient(baseUrl = null)
+                val engine = SyncCore()
                 return SessionViewModel(
-                    engine = SyncCore(),
+                    engine = engine,
                     nudgeStore = DataStoreNudgeStore(context.applicationContext),
                     // ACRCloud pivot (PM 2026-07-22): config = null until
                     // console keys are injected — see
-                    // docs/real-world-handoff.md for the exact steps.
-                    recognition = ACRCloudProvider(config = null),
+                    // docs/real-world-handoff.md for the exact steps. The
+                    // PCM tee (NAT-06b) is live: recognition hears the
+                    // engine's post-AEC capture as soon as keys exist.
+                    recognition = ACRCloudProvider(
+                        config = null,
+                        source = EnginePcmWindowSource(engine),
+                    ),
                     backend = backendClient,
                     chirp = AudioTrackChirpPlayer(),
                 ) as T

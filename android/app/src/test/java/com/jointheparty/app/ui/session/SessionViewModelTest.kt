@@ -365,6 +365,8 @@ private class FakeSyncEngine : SyncEngine {
 
     override fun commandLatencyMs(): Int = 250
 
+    override fun copyRecentCapture(out: FloatArray): SyncEngine.CaptureWindow? = null
+
     var calibrationBegun = 0
         private set
     var calibrationCancelled = 0

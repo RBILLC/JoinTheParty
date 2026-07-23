@@ -119,6 +119,16 @@ sc_status_t sc_notify_seek_issued(sc_session_t*, int64_t target_ms,
 /* Arms the self-hearing guard (architecture-spec.md §7.3). */
 sc_status_t sc_notify_local_playback(sc_session_t*, int64_t commanded_position_ms);
 
+/* Copies up to max_frames of the MOST RECENT capture audio (post-AEC, mono
+ * float, chronological order) into out. Returns the number of frames
+ * copied (0 if none yet). If out_end_mono_ns is non-NULL it receives the
+ * capture timestamp of the last copied frame — the pairing recognition
+ * providers need (a match offset references the sample's end). Thread-safe,
+ * non-RT (brief mutex against the worker's history writer; never touches
+ * the RT ring). The engine retains ~12 s of history. */
+int32_t sc_copy_recent_capture(sc_session_t*, float* out, int32_t max_frames,
+                               uint64_t* out_end_mono_ns);
+
 /* ---- AEC reference (synthesized; non-RT thread, chunked) ---- */
 
 sc_status_t sc_push_reference(sc_session_t*, const float* mono, int32_t frames,
