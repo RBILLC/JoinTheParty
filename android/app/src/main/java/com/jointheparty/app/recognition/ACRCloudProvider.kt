@@ -58,10 +58,32 @@ class ACRCloudProvider(
     }
 
     override suspend fun recognizeOnce(): RecognitionProvider.RecognitionFixResult? {
-        val cfg = config ?: return null
-        val window = source?.latestWindow() ?: return null
+        val cfg = config
+        if (cfg == null) {
+            android.util.Log.w(TAG, "recognizeOnce: no ACR config — recognition inert")
+            return null
+        }
+        val window = source?.latestWindow()
+        if (window == null) {
+            android.util.Log.d(TAG, "recognizeOnce: capture window not ready yet")
+            return null
+        }
         return withContext(Dispatchers.IO) {
-            runCatching { identify(cfg, window) }.getOrNull()
+            try {
+                identify(cfg, window).also {
+                    if (it != null) {
+                        android.util.Log.i(
+                            TAG,
+                            "match: '${it.title}' by '${it.artist}' " +
+                                "offset=${it.matchOffsetMs}ms conf=${it.confidence} " +
+                                "uri=${it.spotifyUri ?: "none"}",
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "identify failed: ${e.javaClass.simpleName}: ${e.message}")
+                null
+            }
         }
     }
 
@@ -104,8 +126,21 @@ class ACRCloudProvider(
                 "Content-Type", "multipart/form-data; boundary=$boundary",
             )
             conn.outputStream.use { it.write(body) }
-            if (conn.responseCode !in 200..299) return null
+            if (conn.responseCode !in 200..299) {
+                android.util.Log.w(TAG, "identify HTTP ${conn.responseCode}")
+                return null
+            }
             val json = JSONObject(conn.inputStream.bufferedReader().readText())
+            val status = json.optJSONObject("status")
+            if (status?.optInt("code", -1) != 0) {
+                // 1001 = no result (normal in silence); anything else is
+                // config/auth/quota and worth seeing in logcat.
+                android.util.Log.i(
+                    TAG,
+                    "identify status ${status?.optInt("code")} " +
+                        "'${status?.optString("msg")}'",
+                )
+            }
             parseMatch(json, window.endMonoNs)
         } finally {
             conn.disconnect()
@@ -136,10 +171,18 @@ class ACRCloudProvider(
                 ?.optString("name")?.ifEmpty { null },
             isrc = music.optJSONObject("external_ids")
                 ?.optString("isrc")?.ifEmpty { null },
+            // Requires "3rd Party Integration" enabled on the ACR console
+            // project; absent otherwise.
+            spotifyUri = music.optJSONObject("external_metadata")
+                ?.optJSONObject("spotify")?.optJSONObject("track")
+                ?.optString("id")?.ifEmpty { null }
+                ?.let { "spotify:track:$it" },
         )
     }
 
     companion object {
+        private const val TAG = "JTP"
+
         /** ACRCloud signature-version-1 string; internal for unit testing. */
         internal fun stringToSign(
             method: String,

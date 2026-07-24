@@ -25,6 +25,12 @@ interface RecognitionProvider {
         val title: String?,
         val artist: String?,
         val isrc: String?,
+        /**
+         * Directly playable URI when the provider knows it (ACRCloud
+         * external_metadata → spotify track id). Preferred over backend
+         * ISRC resolution while the backend is mocked.
+         */
+        val spotifyUri: String? = null,
     )
 
     /**

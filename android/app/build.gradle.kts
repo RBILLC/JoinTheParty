@@ -33,6 +33,18 @@ android {
             "\"e010515b16e34b86b77a2a0798126ede\"",
         )
 
+        // ACRCloud trial credentials live in the GITIGNORED
+        // android/local.properties (acr.host / acr.key / acr.secret) so the
+        // secret never enters git history. Empty values keep recognition
+        // safely inert.
+        val localProps = java.util.Properties().apply {
+            val f = rootProject.file("local.properties")
+            if (f.exists()) f.inputStream().use { load(it) }
+        }
+        buildConfigField("String", "ACR_HOST", "\"${localProps.getProperty("acr.host", "")}\"")
+        buildConfigField("String", "ACR_KEY", "\"${localProps.getProperty("acr.key", "")}\"")
+        buildConfigField("String", "ACR_SECRET", "\"${localProps.getProperty("acr.secret", "")}\"")
+
         externalNativeBuild {
             cmake {
                 // -DANDROID_STL=c++_shared is required by com.google.oboe's

@@ -16,6 +16,9 @@ import com.jointheparty.app.data.NudgeStore
 import com.jointheparty.app.recognition.ACRCloudProvider
 import com.jointheparty.app.recognition.EnginePcmWindowSource
 import com.jointheparty.app.recognition.RecognitionProvider
+import com.jointheparty.app.spotify.AppRemoteSpotifyController
+import com.jointheparty.app.spotify.SpotifyController
+import kotlinx.coroutines.delay
 import com.jointheparty.app.ui.model.MeterFrame
 import com.jointheparty.app.ui.model.toMeterFrame
 import java.util.concurrent.atomic.AtomicBoolean
@@ -44,6 +47,12 @@ data class SyncState(
     val lastRejectReason: SyncCore.RejectReason? = null,
     val calibration: CalibrationState = CalibrationState.Idle,
 )
+
+/** First pass waits for the PCM window to fill (source needs ≥3 s). */
+private const val INITIAL_CAPTURE_FILL_MS = 4_000L
+
+/** Pre-first-fix retry cadence while MATCHING (post-fix cadence is engine-driven). */
+private const val RECOGNITION_RETRY_MS = 6_000L
 
 /** INT-03: chirp-calibration lifecycle for the active route (arch §6.4). */
 sealed interface CalibrationState {
@@ -85,6 +94,8 @@ class SessionViewModel(
     private val recognition: RecognitionProvider? = null,
     private val backend: BackendClient? = null,
     private val chirp: ChirpPlayer? = null,
+    // INT-02: the playback half of the loop. Null in unit tests.
+    private val spotify: SpotifyController? = null,
 ) : ViewModel() {
 
     private val _syncState = MutableStateFlow(SyncState())
@@ -147,7 +158,15 @@ class SessionViewModel(
         // construction) see no behavior change.
         if (recognition != null) {
             onMatchInFlight()
-            runRecognitionPass()
+            // FIELD FIX (2026-07-24): the first pass must WAIT for the
+            // capture window to fill (EnginePcmWindowSource needs ≥3 s of
+            // audio); firing instantly returned null and nothing retried —
+            // the app sat in MATCHING forever. First pass at +4 s; misses
+            // retry on a 6 s cadence while MATCHING (see runRecognitionPass).
+            viewModelScope.launch(dispatcher) {
+                delay(INITIAL_CAPTURE_FILL_MS)
+                runRecognitionPass()
+            }
         }
     }
 
@@ -160,6 +179,78 @@ class SessionViewModel(
     fun onTrackResolved(track: TrackInfo) {
         if (transition(SessionPhase.AIMING)) {
             _syncState.update { it.copy(track = track) }
+            startPlayback(track.spotifyUri)
+        }
+    }
+
+    /**
+     * INT-02: connect App Remote and start the matched track. SyncCore's
+     * first recognition fix is already in; once player states flow
+     * (subscription inside the controller feeds submitPlayerState), the
+     * estimator has both timelines and corrections begin.
+     */
+    private fun startPlayback(uri: String) {
+        val controller = spotify ?: return
+        viewModelScope.launch(dispatcher) {
+            when (controller.connect()) {
+                SpotifyController.ConnectionResult.Connected -> {
+                    controller.play(uri)
+                    // AIMING → CONVERGING on the first player state.
+                    playerStateWatcher()
+                }
+                SpotifyController.ConnectionResult.SpotifyMissing -> onSpotifyMissing()
+                SpotifyController.ConnectionResult.AuthFailed -> onPremiumRequired()
+                is SpotifyController.ConnectionResult.Failed -> Unit // stay AIMING; user can retry
+            }
+        }
+    }
+
+    private fun playerStateWatcher() {
+        val controller = spotify ?: return
+        viewModelScope.launch(dispatcher) {
+            controller.playerStates.collect {
+                if (_syncState.value.phase == SessionPhase.AIMING) {
+                    onPlaybackStarted()
+                }
+            }
+        }
+    }
+
+    /**
+     * Prefers the provider-supplied Spotify URI (ACRCloud external_metadata
+     * — real, playable) over the backend ISRC resolver (which is MOCKED
+     * until AUTH-03's server deploys and would hand playback a fake URI).
+     */
+    private suspend fun resolveTrack(fix: RecognitionProvider.RecognitionFixResult) {
+        val direct = fix.spotifyUri
+        if (direct != null) {
+            onTrackResolved(
+                TrackInfo(
+                    spotifyUri = direct,
+                    isrc = fix.isrc,
+                    title = fix.title ?: "Unknown",
+                    artist = fix.artist ?: "",
+                    durationMs = 0L,
+                ),
+            )
+            return
+        }
+        val backendClient = backend ?: return
+        val isrc = fix.isrc ?: return
+        when (val resolution = backendClient.resolveIsrcToSpotifyUri(isrc)) {
+            is TrackResolution.Resolved ->
+                onTrackResolved(
+                    TrackInfo(
+                        spotifyUri = resolution.spotifyUri,
+                        isrc = isrc,
+                        title = fix.title ?: "Unknown",
+                        artist = fix.artist ?: "",
+                        durationMs = 0L,
+                    ),
+                )
+            TrackResolution.NotFound,
+            is TrackResolution.Failure,
+            -> Unit // stay in MATCHING; the next pass may resolve
         }
     }
 
@@ -299,8 +390,9 @@ class SessionViewModel(
             // when `recognition` is null.
             SyncCore.Event.RequestFix -> runRecognitionPass()
             is SyncCore.Event.CalibrationResult -> onCalibrationResult(event)
-            is SyncCore.Event.Correction,
-            -> Unit // not phase-relevant to the session state machine
+            // INT-02: execute the engine's micro-seek; the controller echoes
+            // notifySeekIssued (settle window + latency learning).
+            is SyncCore.Event.Correction -> spotify?.seekTo(event.seekToMs)
         }
     }
 
@@ -319,12 +411,18 @@ class SessionViewModel(
      */
     private fun runRecognitionPass() {
         val recognizer = recognition ?: return
-        val backendClient = backend ?: return
         if (!recognitionInFlight.compareAndSet(false, true)) return
 
         viewModelScope.launch(dispatcher) {
+            var retry = false
             try {
-                val fix = recognizer.recognizeOnce() ?: return@launch
+                val fix = recognizer.recognizeOnce()
+                if (fix == null) {
+                    // No window yet / no match / provider error: keep trying
+                    // while the user is still waiting in MATCHING.
+                    retry = _syncState.value.phase == SessionPhase.MATCHING
+                    return@launch
+                }
                 engine.submitRecognitionFix(
                     SyncCore.FixSource.SHAZAMKIT,
                     fix.matchOffsetMs,
@@ -333,31 +431,24 @@ class SessionViewModel(
                     fix.confidence,
                 )
 
-                // ISRC→URI resolution only matters while we're still aiming
-                // to lock the track (matching → aiming, §2.4); a fix that
+                // Track resolution only matters while we're still aiming to
+                // lock the track (matching → aiming, §2.4); a fix that
                 // arrives after AIMING is still a useful sync-error
                 // observation for SyncCore (submitted above) but shouldn't
                 // re-resolve or re-transition.
                 if (_syncState.value.phase != SessionPhase.MATCHING) return@launch
-                val isrc = fix.isrc ?: return@launch
-
-                when (val resolution = backendClient.resolveIsrcToSpotifyUri(isrc)) {
-                    is TrackResolution.Resolved ->
-                        onTrackResolved(
-                            TrackInfo(
-                                spotifyUri = resolution.spotifyUri,
-                                isrc = isrc,
-                                title = fix.title ?: "Unknown",
-                                artist = fix.artist ?: "",
-                                durationMs = 0L,
-                            ),
-                        )
-                    TrackResolution.NotFound,
-                    is TrackResolution.Failure,
-                    -> Unit // stay in MATCHING; the next pass may resolve
-                }
+                resolveTrack(fix)
+                retry = _syncState.value.phase == SessionPhase.MATCHING
             } finally {
                 recognitionInFlight.set(false)
+                if (retry) {
+                    viewModelScope.launch(dispatcher) {
+                        delay(RECOGNITION_RETRY_MS)
+                        if (_syncState.value.phase == SessionPhase.MATCHING) {
+                            runRecognitionPass()
+                        }
+                    }
+                }
             }
         }
     }
@@ -453,28 +544,28 @@ class SessionViewModel(
                 // class doc for the swap procedure once one exists.
                 val backendClient = HttpBackendClient(baseUrl = null)
                 val engine = SyncCore()
-                // ══════════════════════════════════════════════════════════
-                // PASTE YOUR ACRCLOUD TRIAL CREDENTIALS HERE (from
-                // console.acrcloud.com → your project → Access). Until all
-                // three placeholders are replaced, recognition stays
-                // safely inert (the guard below passes config = null).
-                // Debug-build convenience only — production proxies these
-                // through the backend (see ACRCloudProvider's KDoc).
-                // ══════════════════════════════════════════════════════════
+                // ACRCloud credentials come from the gitignored
+                // android/local.properties via BuildConfig (acr.host /
+                // acr.key / acr.secret) — see app/build.gradle.kts. Empty
+                // (unconfigured) keeps recognition safely inert.
                 val acrConfig = ACRCloudProvider.Config(
-                    host = "YOUR_ACR_HOST",        // e.g. identify-eu-west-1.acrcloud.com
-                    accessKey = "YOUR_ACR_KEY",
-                    accessSecret = "YOUR_ACR_SECRET",
+                    host = com.jointheparty.app.BuildConfig.ACR_HOST,
+                    accessKey = com.jointheparty.app.BuildConfig.ACR_KEY,
+                    accessSecret = com.jointheparty.app.BuildConfig.ACR_SECRET,
                 )
                 return SessionViewModel(
                     engine = engine,
                     nudgeStore = DataStoreNudgeStore(context.applicationContext),
                     recognition = ACRCloudProvider(
-                        config = acrConfig.takeIf { it.accessKey != "YOUR_ACR_KEY" },
+                        config = acrConfig.takeIf { it.accessKey.isNotEmpty() },
                         source = EnginePcmWindowSource(engine),
                     ),
                     backend = backendClient,
                     chirp = AudioTrackChirpPlayer(),
+                    spotify = AppRemoteSpotifyController(
+                        context = context.applicationContext,
+                        engine = engine,
+                    ),
                 ) as T
             }
         }
