@@ -21,9 +21,18 @@ class EnginePcmWindowSource(
     private val floatBuffer = FloatArray(WINDOW_SECONDS * ENGINE_RATE_HZ)
 
     override fun latestWindow(): ACRCloudProvider.PcmWindowSource.PcmWindow? {
-        val window = engine.copyRecentCapture(floatBuffer) ?: return null
+        val window = engine.copyRecentCapture(floatBuffer)
+        if (window == null) {
+            com.jointheparty.app.debug.DebugLog.log("capture: no audio in ring yet")
+            return null
+        }
         // A too-short sample can't fingerprint; wait for more audio.
-        if (window.frames < MIN_SECONDS * ENGINE_RATE_HZ) return null
+        if (window.frames < MIN_SECONDS * ENGINE_RATE_HZ) {
+            com.jointheparty.app.debug.DebugLog.log(
+                "capture: filling ${window.frames * 1000 / ENGINE_RATE_HZ}ms / need ${MIN_SECONDS * 1000}ms",
+            )
+            return null
+        }
 
         val decimated = window.frames / DECIMATION
         val pcm = ByteArray(decimated * 2)
@@ -36,6 +45,15 @@ class EnginePcmWindowSource(
             pcm[i * 2] = (sample and 0xFF).toByte()
             pcm[i * 2 + 1] = ((sample shr 8) and 0xFF).toByte()
         }
+        // Peak level tells us the mic is actually hearing something (vs a
+        // dead/muted stream that would fingerprint to nothing).
+        var peak = 0f
+        for (i in 0 until window.frames) {
+            val a = kotlin.math.abs(floatBuffer[i]); if (a > peak) peak = a
+        }
+        com.jointheparty.app.debug.DebugLog.log(
+            "capture: ${window.frames * 1000 / ENGINE_RATE_HZ}ms window, peak=${"%.2f".format(peak)} → uploading",
+        )
         return ACRCloudProvider.PcmWindowSource.PcmWindow(
             pcm = pcm,
             sampleRateHz = ENGINE_RATE_HZ / DECIMATION,

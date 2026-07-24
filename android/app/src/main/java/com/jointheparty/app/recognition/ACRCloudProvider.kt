@@ -1,5 +1,6 @@
 package com.jointheparty.app.recognition
 
+import com.jointheparty.app.debug.DebugLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -60,28 +61,22 @@ class ACRCloudProvider(
     override suspend fun recognizeOnce(): RecognitionProvider.RecognitionFixResult? {
         val cfg = config
         if (cfg == null) {
-            android.util.Log.w(TAG, "recognizeOnce: no ACR config — recognition inert")
+            DebugLog.log("ACR: no keys configured — recognition inert")
             return null
         }
-        val window = source?.latestWindow()
-        if (window == null) {
-            android.util.Log.d(TAG, "recognizeOnce: capture window not ready yet")
-            return null
-        }
+        val window = source?.latestWindow() ?: return null
         return withContext(Dispatchers.IO) {
             try {
                 identify(cfg, window).also {
                     if (it != null) {
-                        android.util.Log.i(
-                            TAG,
-                            "match: '${it.title}' by '${it.artist}' " +
-                                "offset=${it.matchOffsetMs}ms conf=${it.confidence} " +
-                                "uri=${it.spotifyUri ?: "none"}",
+                        DebugLog.log(
+                            "MATCH ✓ '${it.title}' offset=${it.matchOffsetMs}ms " +
+                                "uri=${it.spotifyUri ?: "none(enable 3rd-party integ.)"}",
                         )
                     }
                 }
             } catch (e: Exception) {
-                android.util.Log.w(TAG, "identify failed: ${e.javaClass.simpleName}: ${e.message}")
+                DebugLog.log("ACR request failed: ${e.javaClass.simpleName}: ${e.message}")
                 null
             }
         }
@@ -127,19 +122,16 @@ class ACRCloudProvider(
             )
             conn.outputStream.use { it.write(body) }
             if (conn.responseCode !in 200..299) {
-                android.util.Log.w(TAG, "identify HTTP ${conn.responseCode}")
+                DebugLog.log("ACR HTTP ${conn.responseCode} (check host/keys/network)")
                 return null
             }
             val json = JSONObject(conn.inputStream.bufferedReader().readText())
             val status = json.optJSONObject("status")
-            if (status?.optInt("code", -1) != 0) {
-                // 1001 = no result (normal in silence); anything else is
-                // config/auth/quota and worth seeing in logcat.
-                android.util.Log.i(
-                    TAG,
-                    "identify status ${status?.optInt("code")} " +
-                        "'${status?.optString("msg")}'",
-                )
+            val code = status?.optInt("code", -1)
+            if (code != 0) {
+                // 1001 = no result (too quiet / not in catalog); 3xxx =
+                // key/quota/signature problems worth surfacing verbatim.
+                DebugLog.log("ACR status $code '${status?.optString("msg")}'")
             }
             parseMatch(json, window.endMonoNs)
         } finally {

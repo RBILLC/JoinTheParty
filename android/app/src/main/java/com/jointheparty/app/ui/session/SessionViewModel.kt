@@ -145,7 +145,12 @@ class SessionViewModel(
             // Proceeding past a gate IS its dismissal (once per session).
             gateDismissedThisSession = true
         }
-        if (!engine.startCapture()) return
+        val capStarted = engine.startCapture()
+        com.jointheparty.app.debug.DebugLog.log(
+            "join → startCapture=${if (capStarted) "ok" else "FAILED (mic/format)"}; " +
+                "recognizer=${if (recognition != null) "ACRCloud" else "none"}",
+        )
+        if (!capStarted) return
         transition(SessionPhase.LISTENING)
 
         // NAT-06 bootstrap: SC_EVT_REQUEST_FIX is the only *recurring*
@@ -192,15 +197,26 @@ class SessionViewModel(
     private fun startPlayback(uri: String) {
         val controller = spotify ?: return
         viewModelScope.launch(dispatcher) {
-            when (controller.connect()) {
+            when (val r = controller.connect()) {
                 SpotifyController.ConnectionResult.Connected -> {
+                    com.jointheparty.app.debug.DebugLog.log("Spotify connected → play $uri")
                     controller.play(uri)
                     // AIMING → CONVERGING on the first player state.
                     playerStateWatcher()
                 }
-                SpotifyController.ConnectionResult.SpotifyMissing -> onSpotifyMissing()
-                SpotifyController.ConnectionResult.AuthFailed -> onPremiumRequired()
-                is SpotifyController.ConnectionResult.Failed -> Unit // stay AIMING; user can retry
+                SpotifyController.ConnectionResult.SpotifyMissing -> {
+                    com.jointheparty.app.debug.DebugLog.log("Spotify: app not found / not running")
+                    onSpotifyMissing()
+                }
+                SpotifyController.ConnectionResult.AuthFailed -> {
+                    com.jointheparty.app.debug.DebugLog.log("Spotify: auth/premium required")
+                    onPremiumRequired()
+                }
+                is SpotifyController.ConnectionResult.Failed -> {
+                    com.jointheparty.app.debug.DebugLog.log(
+                        "Spotify connect failed: ${r.cause.message}",
+                    )
+                }
             }
         }
     }
@@ -496,6 +512,7 @@ class SessionViewModel(
         if (!isLegalTransition(from, to)) return false
         if (to == SessionPhase.LOCKED) consecutiveLosses = 0
         _syncState.update { it.copy(phase = to) }
+        com.jointheparty.app.debug.DebugLog.log("phase: $from → $to")
         return true
     }
 

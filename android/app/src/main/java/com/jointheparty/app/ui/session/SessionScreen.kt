@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -16,10 +17,13 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -115,6 +119,10 @@ fun SessionScreen(
             }
         }
 
+        // FIELD DEBUG (2026-07-24): live diagnostic overlay — remove before
+        // release. Shows why recognition/playback is (not) progressing.
+        DebugOverlay(modifier = Modifier.align(Alignment.TopStart))
+
         if (showCalibration) {
             CalibrationSheet(
                 routeName = state.routeName,
@@ -125,6 +133,29 @@ fun SessionScreen(
                     showCalibration = false
                     onDismissCalibration()
                 },
+            )
+        }
+    }
+}
+
+/** FIELD DEBUG overlay — reads [DebugLog]; recomposition-cost irrelevant here. */
+@Composable
+private fun DebugOverlay(modifier: Modifier = Modifier) {
+    val lines by com.jointheparty.app.debug.DebugLog.lines.collectAsState()
+    if (lines.isEmpty()) return
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(Color(0xCC000000))
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+    ) {
+        lines.forEach {
+            Text(
+                text = it,
+                color = DT.Colors.ink2,
+                fontSize = 9.sp,
+                lineHeight = 11.sp,
+                fontFamily = FontFamily.Monospace,
             )
         }
     }
