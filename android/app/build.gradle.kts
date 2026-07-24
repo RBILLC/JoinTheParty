@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -37,7 +39,9 @@ android {
         // android/local.properties (acr.host / acr.key / acr.secret) so the
         // secret never enters git history. Empty values keep recognition
         // safely inert.
-        val localProps = java.util.Properties().apply {
+        // (Top-level import: inside android{} the bare name `java` resolves
+        // to Gradle's JavaPluginExtension accessor, shadowing the package.)
+        val localProps = Properties().apply {
             val f = rootProject.file("local.properties")
             if (f.exists()) f.inputStream().use { load(it) }
         }
