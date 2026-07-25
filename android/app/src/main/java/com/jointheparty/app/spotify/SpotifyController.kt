@@ -39,6 +39,9 @@ interface SpotifyController {
     /** Every player-state event App Remote delivers, in order. */
     val playerStates: Flow<RemotePlayerState>
 
+    /** Most recent player state, for aim-verification (null before any). */
+    val lastKnownPlayerState: RemotePlayerState?
+
     /** Connects to the Spotify app via App Remote. Safe to call again after a [Failed]/[SpotifyMissing] result. */
     suspend fun connect(): ConnectionResult
 

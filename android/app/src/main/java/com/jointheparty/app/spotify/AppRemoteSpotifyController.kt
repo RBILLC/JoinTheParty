@@ -61,6 +61,10 @@ class AppRemoteSpotifyController(
      */
     var activityContext: Context? = null
 
+    @Volatile
+    override var lastKnownPlayerState: SpotifyController.RemotePlayerState? = null
+        private set
+
     private val playerStatesFlow = MutableSharedFlow<SpotifyController.RemotePlayerState>(
         extraBufferCapacity = 16,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
@@ -165,6 +169,10 @@ class AppRemoteSpotifyController(
         // notifyLocalPlayback-adjacent bookkeeping, to learn command
         // latency online (CORE-03 extra: sc_get_command_latency_ms).
         val issuedMonoNs = System.nanoTime()
+        com.jointheparty.app.debug.DebugLog.log(
+            "seekTo ${positionMs}ms (player was " +
+                "${lastKnownPlayerState?.positionMs ?: "?"}ms)",
+        )
         mainHandler.post { playerApi.seekTo(positionMs) }
         engine.notifySeekIssued(positionMs, issuedMonoNs)
         return true
@@ -177,14 +185,20 @@ class AppRemoteSpotifyController(
             .setEventCallback(
                 Subscription.EventCallback<PlayerState> { data ->
                     val receivedMonoNs = System.nanoTime()
-                    playerStatesFlow.tryEmit(
-                        SpotifyController.RemotePlayerState(
-                            trackUri = data.track?.uri,
-                            positionMs = data.playbackPosition,
-                            isPaused = data.isPaused,
-                            receivedMonoNs = receivedMonoNs,
-                        ),
+                    val state = SpotifyController.RemotePlayerState(
+                        trackUri = data.track?.uri,
+                        positionMs = data.playbackPosition,
+                        isPaused = data.isPaused,
+                        receivedMonoNs = receivedMonoNs,
                     )
+                    lastKnownPlayerState = state
+                    // Player states are event-driven (play/pause/seek), not
+                    // periodic — logging each is cheap and shows exactly
+                    // where corrections land.
+                    com.jointheparty.app.debug.DebugLog.log(
+                        "player: ${data.playbackPosition}ms paused=${data.isPaused}",
+                    )
+                    playerStatesFlow.tryEmit(state)
                     engine.submitPlayerState(data.playbackPosition, data.isPaused, receivedMonoNs)
                 },
             )

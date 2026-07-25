@@ -19,6 +19,8 @@ import com.jointheparty.app.recognition.RecognitionProvider
 import com.jointheparty.app.spotify.AppRemoteSpotifyController
 import com.jointheparty.app.spotify.SpotifyController
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import com.jointheparty.app.ui.model.MeterFrame
 import com.jointheparty.app.ui.model.toMeterFrame
 import java.util.concurrent.atomic.AtomicBoolean
@@ -56,6 +58,18 @@ private const val RECOGNITION_RETRY_MS = 6_000L
 
 /** ~2 minutes of shell-driven sampling before giving up (quota guard). */
 private const val MAX_SAMPLING_ATTEMPTS = 20
+
+/**
+ * Corrections smaller than this are damped at the shell (field feedback:
+ * each seek is an audible skip; sub-400 ms misalignment between separated
+ * sources is far less noticeable than a skip every few seconds).
+ */
+private const val MIN_AUDIBLE_CORRECTION_MS = 400L
+
+/** Aim-verification loop (arch §6.2 coarse aim, made deterministic). */
+private const val MAX_AIM_ATTEMPTS = 4
+private const val AIM_VERIFY_DELAY_MS = 900L
+private const val AIM_TOLERANCE_MS = 3_000L
 
 /** INT-03: chirp-calibration lifecycle for the active route (arch §6.4). */
 sealed interface CalibrationState {
@@ -187,7 +201,7 @@ class SessionViewModel(
     fun onTrackResolved(track: TrackInfo) {
         if (transition(SessionPhase.AIMING)) {
             _syncState.update { it.copy(track = track) }
-            startPlayback(track.spotifyUri)
+            startPlayback(track.spotifyUri, aimOffsetMs = null, aimCaptureMonoNs = null)
         }
     }
 
@@ -197,13 +211,32 @@ class SessionViewModel(
      * (subscription inside the controller feeds submitPlayerState), the
      * estimator has both timelines and corrections begin.
      */
-    private fun startPlayback(uri: String) {
+    private fun startPlayback(
+        uri: String,
+        aimOffsetMs: Long?,
+        aimCaptureMonoNs: Long?,
+    ) {
         val controller = spotify ?: return
         viewModelScope.launch(dispatcher) {
             when (val r = controller.connect()) {
                 SpotifyController.ConnectionResult.Connected -> {
                     com.jointheparty.app.debug.DebugLog.log("Spotify connected → play $uri")
                     controller.play(uri)
+                    // FIELD TEST 2 FIX (round 1): play(uri) starts from 0:00
+                    // — without the arch §6.2 coarse aim the estimator
+                    // immediately measures the full song-position error
+                    // (observed: −17.3 s → track-lost → restart loop).
+                    // FIELD TEST 2 FIX (round 2, superseded): waiting for a
+                    // player state carrying our track URI is NOT enough —
+                    // Spotify reports the new track's metadata within ~10 ms
+                    // while playback is still buffering, and a seek in that
+                    // window is silently dropped (observed twice).
+                    // FIELD TEST 2 FIX (round 3): stop guessing when Spotify
+                    // is seekable — VERIFY each aim landed via the reported
+                    // position and re-issue until it does (bounded).
+                    if (aimOffsetMs != null && aimCaptureMonoNs != null) {
+                        aimUntilLanded(controller, aimOffsetMs, aimCaptureMonoNs)
+                    }
                     // AIMING → CONVERGING on the first player state.
                     playerStateWatcher()
                 }
@@ -230,6 +263,41 @@ class SessionViewModel(
         }
     }
 
+    /**
+     * The coarse aim (arch §6.2 step 1), made deterministic: issue the seek,
+     * wait, compare the reported position against where the room should be,
+     * and re-issue if the seek was swallowed by the track-load transition.
+     * Success within ~3 s of room-time is plenty — the estimator's
+     * micro-corrections own everything below that.
+     */
+    private suspend fun aimUntilLanded(
+        controller: SpotifyController,
+        aimOffsetMs: Long,
+        aimCaptureMonoNs: Long,
+    ) {
+        repeat(MAX_AIM_ATTEMPTS) { attempt ->
+            val elapsedMs = (System.nanoTime() - aimCaptureMonoNs) / 1_000_000
+            val target = aimOffsetMs + elapsedMs + engine.commandLatencyMs()
+            controller.seekTo(target)
+            delay(AIM_VERIFY_DELAY_MS)
+
+            val state = controller.lastKnownPlayerState
+            val roomNowMs =
+                aimOffsetMs + (System.nanoTime() - aimCaptureMonoNs) / 1_000_000
+            val landed = state != null &&
+                kotlin.math.abs(state.positionMs - roomNowMs) < AIM_TOLERANCE_MS
+            com.jointheparty.app.debug.DebugLog.log(
+                "aim #${attempt + 1} → seek ${target}ms; player=" +
+                    "${state?.positionMs ?: "?"}ms room≈${roomNowMs}ms " +
+                    if (landed) "LANDED" else "missed",
+            )
+            if (landed) return
+        }
+        com.jointheparty.app.debug.DebugLog.log(
+            "aim gave up after $MAX_AIM_ATTEMPTS attempts — estimator will report the error",
+        )
+    }
+
     private fun playerStateWatcher() {
         val controller = spotify ?: return
         viewModelScope.launch(dispatcher) {
@@ -249,7 +317,7 @@ class SessionViewModel(
     private suspend fun resolveTrack(fix: RecognitionProvider.RecognitionFixResult) {
         val direct = fix.spotifyUri
         if (direct != null) {
-            onTrackResolved(
+            resolvedWithAim(
                 TrackInfo(
                     spotifyUri = direct,
                     isrc = fix.isrc,
@@ -257,6 +325,7 @@ class SessionViewModel(
                     artist = fix.artist ?: "",
                     durationMs = 0L,
                 ),
+                fix,
             )
             return
         }
@@ -264,7 +333,7 @@ class SessionViewModel(
         val isrc = fix.isrc ?: return
         when (val resolution = backendClient.resolveIsrcToSpotifyUri(isrc)) {
             is TrackResolution.Resolved ->
-                onTrackResolved(
+                resolvedWithAim(
                     TrackInfo(
                         spotifyUri = resolution.spotifyUri,
                         isrc = isrc,
@@ -272,10 +341,26 @@ class SessionViewModel(
                         artist = fix.artist ?: "",
                         durationMs = 0L,
                     ),
+                    fix,
                 )
             TrackResolution.NotFound,
             is TrackResolution.Failure,
             -> Unit // stay in MATCHING; the next pass may resolve
+        }
+    }
+
+    /** Like [onTrackResolved], but carries the fix so playback can aim. */
+    private fun resolvedWithAim(
+        track: TrackInfo,
+        fix: RecognitionProvider.RecognitionFixResult,
+    ) {
+        if (transition(SessionPhase.AIMING)) {
+            _syncState.update { it.copy(track = track) }
+            startPlayback(
+                track.spotifyUri,
+                aimOffsetMs = fix.matchOffsetMs,
+                aimCaptureMonoNs = fix.captureMonoNs,
+            )
         }
     }
 
@@ -431,10 +516,29 @@ class SessionViewModel(
             // INT-02: execute the engine's micro-seek; the controller echoes
             // notifySeekIssued (settle window + latency learning).
             is SyncCore.Event.Correction -> {
-                com.jointheparty.app.debug.DebugLog.log(
-                    "CORRECTION → seek ${event.seekToMs}ms",
-                )
-                spotify?.seekTo(event.seekToMs)
+                // FIELD FEEDBACK (2026-07-24, "fixing itself too much"):
+                // recognition fixes carry ±100–150 ms of noise, so the
+                // engine's 25 ms deadband emits an audible micro-seek on
+                // nearly every fix. Until the deadband is ABI-configurable,
+                // damp at the shell: skip corrections smaller than what a
+                // listener can actually notice as wrong (but large enough
+                // to notice as a skip).
+                val controller = spotify
+                val ps = controller?.lastKnownPlayerState
+                val projectedNow = ps?.let {
+                    it.positionMs + (System.nanoTime() - it.receivedMonoNs) / 1_000_000
+                }
+                val jumpMs = projectedNow?.let { event.seekToMs - it }
+                if (jumpMs != null && kotlin.math.abs(jumpMs) < MIN_AUDIBLE_CORRECTION_MS) {
+                    com.jointheparty.app.debug.DebugLog.log(
+                        "CORRECTION damped (jump ${jumpMs}ms < ${MIN_AUDIBLE_CORRECTION_MS}ms)",
+                    )
+                } else {
+                    com.jointheparty.app.debug.DebugLog.log(
+                        "CORRECTION → seek ${event.seekToMs}ms (jump ${jumpMs ?: "?"}ms)",
+                    )
+                    controller?.seekTo(event.seekToMs)
+                }
             }
         }
     }
@@ -483,6 +587,23 @@ class SessionViewModel(
                 if (fix == null) {
                     retry = shouldKeepSampling()
                     return@launch
+                }
+                // FIELD DEBUG: shell-side replica of the engine's sync
+                // measurement (z = projected_local − match_offset). If this
+                // disagrees with the engine's estimate line, the bias lives
+                // in the engine's inputs/bookkeeping; if they agree, the
+                // bias is real and lives in the audio path (ACR reference
+                // point / window staleness / leakage).
+                val ps = spotify?.lastKnownPlayerState
+                if (ps != null) {
+                    val shellProj =
+                        ps.positionMs + (fix.captureMonoNs - ps.receivedMonoNs) / 1_000_000
+                    com.jointheparty.app.debug.DebugLog.log(
+                        "fixdbg: offset=${fix.matchOffsetMs} " +
+                            "projLocal=$shellProj shellZ=${shellProj - fix.matchOffsetMs} " +
+                            "(ps=${ps.positionMs}@-${(System.nanoTime() - ps.receivedMonoNs) / 1_000_000}ms " +
+                            "capAge=${(System.nanoTime() - fix.captureMonoNs) / 1_000_000}ms)",
+                    )
                 }
                 engine.submitRecognitionFix(
                     SyncCore.FixSource.SHAZAMKIT,

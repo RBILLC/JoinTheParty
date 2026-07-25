@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Billet mark: two timelines (the room, your playback) fusing into
+     one brassBright line — the product's promise as a glyph. Colors are the
+     DT heat scale; geometry sits inside the adaptive-icon safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- reference line (the room), warm grey -->
+    <path
+        android:pathData="M27,49 L52,49"
+        android:strokeColor="#A79E93"
+        android:strokeWidth="4.5"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M52,49 L61,55.5"
+        android:strokeColor="#A79E93"
+        android:strokeWidth="4.5"
+        android:strokeLineCap="round" />
+
+    <!-- local line (your playback), warming bronze -->
+    <path
+        android:pathData="M27,62 L52,62"
+        android:strokeColor="#8A6F4B"
+        android:strokeWidth="4.5"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M52,62 L61,55.5"
+        android:strokeColor="#8A6F4B"
+        android:strokeWidth="4.5"
+        android:strokeLineCap="round" />
+
+    <!-- fused: locked, brassBright -->
+    <path
+        android:pathData="M61,55.5 L82,55.5"
+        android:strokeColor="#EAD3A6"
+        android:strokeWidth="5.5"
+        android:strokeLineCap="round" />
+</vector>
