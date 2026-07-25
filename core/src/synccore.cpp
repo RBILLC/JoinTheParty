@@ -371,6 +371,10 @@ sc_status_t sc_create(const sc_config_t* cfg, sc_session_t** out) {
         static_cast<double>(s->cfg.command_latency_prior_ms));
     s->command_latency_mirror_ms.store(s->cfg.command_latency_prior_ms,
                                        std::memory_order_relaxed);
+    if (cfg->deadband_ms > 0) {
+        s->wk.estimator.set_deadband_ms(static_cast<double>(cfg->deadband_ms));
+        s->wk.policy.set_deadband_ms(static_cast<double>(cfg->deadband_ms));
+    }
     s->worker = std::thread([s] { s->worker_loop(); });
     *out = s;
     return SC_OK;

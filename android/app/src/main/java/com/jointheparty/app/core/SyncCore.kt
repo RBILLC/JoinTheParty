@@ -34,6 +34,7 @@ class SyncCore(
     initialRoute: Route = Route.SPEAKER,
     outputLatencyPriorMs: Int = -1,
     commandLatencyPriorMs: Int = -1,
+    deadbandMs: Int = -1,  // <=0 → engine default (25 ms)
 ) : AutoCloseable, SyncEngine {
 
     enum class Route { SPEAKER, WIRED, BLUETOOTH }
@@ -78,7 +79,7 @@ class SyncCore(
     init {
         handle = nativeCreate(
             sampleRateHz, channels, initialRoute.ordinal,
-            outputLatencyPriorMs, commandLatencyPriorMs,
+            outputLatencyPriorMs, commandLatencyPriorMs, deadbandMs,
         )
         require(handle != 0L) {
             "SyncCore rejected config (rate=$sampleRateHz ch=$channels): " +
@@ -180,6 +181,7 @@ class SyncCore(
     private external fun nativeCreate(
         sampleRate: Int, channels: Int, route: Int,
         outputLatencyPriorMs: Int, commandLatencyPriorMs: Int,
+        deadbandMs: Int,
     ): Long
 
     private external fun nativeDestroy(handle: Long)

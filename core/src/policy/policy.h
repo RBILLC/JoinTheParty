@@ -81,6 +81,7 @@ public:
 
     void set_command_latency_ms(double ms) { cfg_.command_latency_ms = ms; }
     double command_latency_ms() const { return cfg_.command_latency_ms; }
+    void set_deadband_ms(double ms) { cfg_.deadband_ms = ms; }
 
     void reset();
 

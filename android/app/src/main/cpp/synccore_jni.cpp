@@ -111,13 +111,15 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
 JNIEXPORT jlong JNICALL
 Java_com_jointheparty_app_core_SyncCore_nativeCreate(
     JNIEnv* env, jobject thiz, jint sample_rate, jint channels, jint route,
-    jint output_latency_prior_ms, jint command_latency_prior_ms) {
+    jint output_latency_prior_ms, jint command_latency_prior_ms,
+    jint deadband_ms) {
     sc_config_t cfg{};
     cfg.sample_rate_hz = sample_rate;
     cfg.channels = channels;
     cfg.initial_route = static_cast<sc_route_t>(route);
     cfg.output_latency_prior_ms = output_latency_prior_ms;
     cfg.command_latency_prior_ms = command_latency_prior_ms;
+    cfg.deadband_ms = deadband_ms;
 
     sc_session_t* session = nullptr;
     if (sc_create(&cfg, &session) != SC_OK) return 0;

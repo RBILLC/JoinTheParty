@@ -60,11 +60,12 @@ private const val RECOGNITION_RETRY_MS = 6_000L
 private const val MAX_SAMPLING_ATTEMPTS = 20
 
 /**
- * Corrections smaller than this are damped at the shell (field feedback:
- * each seek is an audible skip; sub-400 ms misalignment between separated
- * sources is far less noticeable than a skip every few seconds).
+ * Engine correction deadband for this shell (sc_config_t.deadband_ms):
+ * above ACR's fix noise so corrections fire only on audibly-wrong error;
+ * an audible skip every few seconds annoys more than sub-400 ms offset
+ * between separated sources.
  */
-private const val MIN_AUDIBLE_CORRECTION_MS = 400L
+private const val ENGINE_DEADBAND_MS = 350
 
 /** Aim-verification loop (arch §6.2 coarse aim, made deterministic). */
 private const val MAX_AIM_ATTEMPTS = 4
@@ -532,29 +533,23 @@ class SessionViewModel(
             // INT-02: execute the engine's micro-seek; the controller echoes
             // notifySeekIssued (settle window + latency learning).
             is SyncCore.Event.Correction -> {
-                // FIELD FEEDBACK (2026-07-24, "fixing itself too much"):
-                // recognition fixes carry ±100–150 ms of noise, so the
-                // engine's 25 ms deadband emits an audible micro-seek on
-                // nearly every fix. Until the deadband is ABI-configurable,
-                // damp at the shell: skip corrections smaller than what a
-                // listener can actually notice as wrong (but large enough
-                // to notice as a skip).
-                val controller = spotify
-                val ps = controller?.lastKnownPlayerState
-                val projectedNow = ps?.let {
-                    it.positionMs + (System.nanoTime() - it.receivedMonoNs) / 1_000_000
+                // FIELD FIX (2026-07-25): shell-side damping is BANNED —
+                // silently dropping an emitted correction corrupted the
+                // engine's command-latency learning (each unexecuted seek
+                // read as landing bias → learned latency ballooned →
+                // overshoots → spurious track-lost → song restarts). The
+                // deadband now lives in the engine (sc_config_t.deadband_ms
+                // = 350 from the Factory); every emitted correction MUST be
+                // executed and echoed.
+                val ps = spotify?.lastKnownPlayerState
+                val jumpMs = ps?.let {
+                    event.seekToMs -
+                        (it.positionMs + (System.nanoTime() - it.receivedMonoNs) / 1_000_000)
                 }
-                val jumpMs = projectedNow?.let { event.seekToMs - it }
-                if (jumpMs != null && kotlin.math.abs(jumpMs) < MIN_AUDIBLE_CORRECTION_MS) {
-                    com.jointheparty.app.debug.DebugLog.log(
-                        "CORRECTION damped (jump ${jumpMs}ms < ${MIN_AUDIBLE_CORRECTION_MS}ms)",
-                    )
-                } else {
-                    com.jointheparty.app.debug.DebugLog.log(
-                        "CORRECTION → seek ${event.seekToMs}ms (jump ${jumpMs ?: "?"}ms)",
-                    )
-                    controller?.seekTo(event.seekToMs)
-                }
+                com.jointheparty.app.debug.DebugLog.log(
+                    "CORRECTION → seek ${event.seekToMs}ms (jump ${jumpMs ?: "?"}ms)",
+                )
+                spotify?.seekTo(event.seekToMs)
             }
         }
     }
@@ -578,6 +573,15 @@ class SessionViewModel(
      * AIMING/CONVERGING window where the first fix was discarded for want
      * of a player timeline.
      */
+    /** True when the fix's position is >5 s from our playback — a genuinely
+     * different song, not an alternate release of the current one. */
+    private fun isOffsetWildlyOff(fix: RecognitionProvider.RecognitionFixResult): Boolean {
+        val ps = spotify?.lastKnownPlayerState ?: return true
+        val projected =
+            ps.positionMs + (fix.captureMonoNs - ps.receivedMonoNs) / 1_000_000
+        return kotlin.math.abs(projected - fix.matchOffsetMs) > 5_000
+    }
+
     private fun shouldKeepSampling(): Boolean {
         if (firstEstimateSeen) return false
         // Bounded: every pass is a paid recognition request, so a session
@@ -640,8 +644,15 @@ class SessionViewModel(
                 if (_syncState.value.phase == SessionPhase.MATCHING) {
                     resolveTrack(fix)
                 } else if (fix.spotifyUri != null && currentUri != null &&
-                    fix.spotifyUri != currentUri
+                    fix.spotifyUri != currentUri &&
+                    isOffsetWildlyOff(fix)
                 ) {
+                    // Different URI alone is NOT a song change: ACR maps the
+                    // same recording to different Spotify releases across
+                    // fixes (observed: 'Blinding Lights' under 3 ids in one
+                    // evening). Only switch when the offset ALSO disagrees
+                    // — a real new song has an arbitrary position; an
+                    // alternate release of the current song matches ours.
                     com.jointheparty.app.debug.DebugLog.log(
                         "room changed songs → re-aim '${fix.title}'",
                     )
@@ -804,7 +815,7 @@ class SessionViewModel(
                 // mock-mode HttpBackendClient(baseUrl = null) — see its
                 // class doc for the swap procedure once one exists.
                 val backendClient = HttpBackendClient(baseUrl = null)
-                val engine = SyncCore()
+                val engine = SyncCore(deadbandMs = ENGINE_DEADBAND_MS)
                 // ACRCloud credentials come from the gitignored
                 // android/local.properties via BuildConfig (acr.host /
                 // acr.key / acr.secret) — see app/build.gradle.kts. Empty

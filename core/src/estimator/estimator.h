@@ -48,6 +48,7 @@ public:
 
     void set_output_latency_ms(double ms) { output_latency_ms_ = ms; }
     void set_nudge_ms(double ms) { nudge_ms_ = ms; }
+    void set_deadband_ms(double ms) { cfg_.deadband_ms = ms; }
 
     void on_player_state(int64_t position_ms, bool is_paused, uint64_t mono_ns);
 

@@ -61,6 +61,12 @@ typedef struct {
     sc_route_t initial_route;
     int32_t output_latency_prior_ms;   /* per-route calibrated prior; -1 = default */
     int32_t command_latency_prior_ms;  /* Spotify seek settle prior; -1 = default 250 */
+    /* Correction deadband. <=0 = default 25 ms. Field Test 2: recognition
+     * noise (±100–150 ms) against the default made every fix an audible
+     * micro-seek. MUST live here, not shell-side: a shell that silently
+     * drops emitted corrections corrupts the policy's command-latency
+     * learning (each unexecuted seek reads as landing bias). */
+    int32_t deadband_ms;
 } sc_config_t;
 
 /* ---- Lifecycle ---- */
