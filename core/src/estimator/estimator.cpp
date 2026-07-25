@@ -108,6 +108,8 @@ bool SyncEstimator::on_fix(int64_t match_offset_ms, uint64_t capture_mono_ns,
         p11_ = p11;
     }
 
+    d_ = std::clamp(d_, -cfg_.drift_clamp_ms_per_s, cfg_.drift_clamp_ms_per_s);
+
     last_fix_mono_ns_ = capture_mono_ns;
 
     if (std::abs(e_) <= cfg_.deadband_ms) {

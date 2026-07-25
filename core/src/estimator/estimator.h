@@ -27,6 +27,12 @@ struct EstimatorConfig {
     double init_error_var_ms2 = 1e6;
     double init_drift_var = 1e-2;      // (0.1 ms/s)² = (100 ppm)²
     double seek_exec_var_ms2 = 2500.0;  // execution uncertainty added per seek
+    // Physical sanity bound on the drift state. Consumer clocks differ by
+    // tens of ppm; Field Test 2 saw a bias-corrupted history push the
+    // estimate to 1738 ppm, which made the policy's pre-emptive path
+    // correct on every fix. 800 ppm stays above the sim's stress value
+    // (500 ppm) while killing runaway estimates.
+    double drift_clamp_ms_per_s = 0.8;
     double deadband_ms = 25.0;
     int convergence_fixes = 3;         // consecutive in-deadband fixes → converged
     double conf_var_scale_ms = 25.0;   // posterior-std scale in confidence

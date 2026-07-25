@@ -125,6 +125,26 @@ class SessionViewModel(
      */
     val meterFrames: Flow<MeterFrame> = engine.meterFrames.map { it.toMeterFrame() }
 
+    /**
+     * Field request: the song's current position, 1 Hz, projected between
+     * player-state events. −1 while unknown. Collected only by the small
+     * clock composable (same isolation idea as the meter stream).
+     */
+    val playbackPositionMs: Flow<Long> = kotlinx.coroutines.flow.flow {
+        while (true) {
+            val ps = spotify?.lastKnownPlayerState
+            emit(
+                when {
+                    ps == null -> -1L
+                    ps.isPaused -> ps.positionMs
+                    else -> ps.positionMs +
+                        (System.nanoTime() - ps.receivedMonoNs) / 1_000_000
+                },
+            )
+            delay(1_000)
+        }
+    }
+
     /** Consecutive SC_EVT_TRACK_LOST count; reset whenever LOCKED is reached. */
     private var consecutiveLosses = 0
 

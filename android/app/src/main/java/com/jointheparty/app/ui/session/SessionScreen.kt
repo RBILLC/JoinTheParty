@@ -78,6 +78,8 @@ fun SessionScreen(
     onCancelCalibration: () -> Unit = {},
     onDismissCalibration: () -> Unit = {},
     onConnectSpotify: () -> Unit = {},
+    spotifyLinked: Boolean = false,
+    playbackPositionMs: Flow<Long> = MutableStateFlow(-1L),
 ) {
     var showCalibration by remember { mutableStateOf(false) }
     Box(
@@ -100,6 +102,7 @@ fun SessionScreen(
                 PhaseGroup.IDLE -> IdleContent(
                     onJoinTap = onJoinTap,
                     onConnectSpotify = onConnectSpotify,
+                    spotifyLinked = spotifyLinked,
                 )
                 PhaseGroup.WAITING -> WaitingContent(phase = state.phase)
                 PhaseGroup.ACTIVE -> ActiveContent(
@@ -108,6 +111,7 @@ fun SessionScreen(
                     onTrimChange = onTrimChange,
                     onTrimCommit = onTrimCommit,
                     onOpenCalibration = { showCalibration = true },
+                    playbackPositionMs = playbackPositionMs,
                 )
                 PhaseGroup.LOST -> QuietMessage("Lost the room — listening again…")
                 PhaseGroup.CONCIERGE -> ConciergeContent(
@@ -136,6 +140,23 @@ fun SessionScreen(
             )
         }
     }
+}
+
+/**
+ * Field request: the song's current position, quiet fine print under the
+ * track identity. 1 Hz collection isolated to this leaf (meter-style).
+ */
+@Composable
+private fun PlaybackClock(positionMs: Flow<Long>) {
+    val pos by positionMs.collectAsState(initial = -1L)
+    if (pos < 0) return
+    val totalSec = pos / 1000
+    Text(
+        text = "%d:%02d".format(totalSec / 60, totalSec % 60),
+        style = BilletType.fine,
+        color = DT.Colors.ink3,
+        modifier = Modifier.padding(top = 2.dp),
+    )
 }
 
 /** FIELD DEBUG overlay — reads [DebugLog]; recomposition-cost irrelevant here. */
@@ -178,18 +199,32 @@ private fun SessionPhase.toPhaseGroup(): PhaseGroup = when (this) {
  * Web API can be called on the user's behalf.
  */
 @Composable
-private fun IdleContent(onJoinTap: () -> Unit, onConnectSpotify: () -> Unit = {}) {
+private fun IdleContent(
+    onJoinTap: () -> Unit,
+    onConnectSpotify: () -> Unit = {},
+    spotifyLinked: Boolean = false,
+) {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             JoinButton(onClick = onJoinTap)
-            Text(
-                text = "Connect Spotify",
-                style = BilletType.label,
-                color = DT.Colors.ink3,
-                modifier = Modifier
-                    .padding(top = DT.Space.sectionGap)
-                    .clickable(onClick = onConnectSpotify),
-            )
+            // Field feedback: don't invite a connection that already exists.
+            if (spotifyLinked) {
+                Text(
+                    text = "Spotify linked",
+                    style = BilletType.fine,
+                    color = DT.Colors.ink3,
+                    modifier = Modifier.padding(top = DT.Space.sectionGap),
+                )
+            } else {
+                Text(
+                    text = "Connect Spotify",
+                    style = BilletType.label,
+                    color = DT.Colors.ink3,
+                    modifier = Modifier
+                        .padding(top = DT.Space.sectionGap)
+                        .clickable(onClick = onConnectSpotify),
+                )
+            }
         }
     }
 }
@@ -220,9 +255,11 @@ private fun ActiveContent(
     onTrimChange: (Int) -> Unit,
     onTrimCommit: (Int) -> Unit,
     onOpenCalibration: () -> Unit = {},
+    playbackPositionMs: Flow<Long> = MutableStateFlow(-1L),
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         TrackIdentity(track = state.track, phase = state.phase)
+        PlaybackClock(playbackPositionMs)
         Spacer(modifier = Modifier.height(DT.Space.sectionGap))
         SyncMeter(frames = meterFrames)
         // INT-04: transient self-hearing hint (speaker mode heard our own

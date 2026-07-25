@@ -52,14 +52,19 @@ class MainActivity : ComponentActivity() {
 
     private val appPrefs by lazy { DataStoreAppPrefs(applicationContext) }
 
+    private val tokenStore by lazy { EncryptedTokenStore(applicationContext) }
+
     /** AUTH-02, live: PKCE flow with the registered client id. */
     private val authManager by lazy {
         SpotifyAuthManager(
             context = this,
-            tokenStore = EncryptedTokenStore(applicationContext),
+            tokenStore = tokenStore,
             clientId = BuildConfig.SPOTIFY_CLIENT_ID,
         )
     }
+
+    /** Field feedback: the IDLE screen must know Spotify is already linked. */
+    private val spotifyLinkedState = androidx.compose.runtime.mutableStateOf(false)
 
     private val micPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -81,10 +86,12 @@ class MainActivity : ComponentActivity() {
         // AUTH-02: complete the PKCE exchange when the Custom Tab redirects
         // back through AuthCallbackActivity → PendingCallback.
         lifecycleScope.launch {
+            spotifyLinkedState.value = tokenStore.tokens() != null
             SpotifyAuthManager.PendingCallback.redirect.collect { uri ->
                 if (uri != null) {
                     authManager.handleCallback(uri)
                     SpotifyAuthManager.PendingCallback.consume()
+                    spotifyLinkedState.value = tokenStore.tokens() != null
                 }
             }
         }
@@ -124,6 +131,8 @@ class MainActivity : ComponentActivity() {
                             onCancelCalibration = viewModel::cancelCalibration,
                             onDismissCalibration = viewModel::acknowledgeCalibration,
                             onConnectSpotify = { authManager.beginAuth() },
+                            spotifyLinked = spotifyLinkedState.value,
+                            playbackPositionMs = viewModel.playbackPositionMs,
                         )
                     }
                 }
