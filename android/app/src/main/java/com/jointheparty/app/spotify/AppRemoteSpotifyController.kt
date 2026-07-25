@@ -46,7 +46,9 @@ class AppRemoteSpotifyController(
     // ConnectionParams requires one to attempt a connection at all.
     private val clientId: String = com.jointheparty.app.BuildConfig.SPOTIFY_CLIENT_ID
 
-    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    // Lazy: Looper.getMainLooper() is unavailable under JVM unit tests, and
+    // those exercise only the disconnected paths that never post.
+    private val mainHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
 
     /**
      * FIELD FIX (2026-07-24): App Remote's `showAuthView` renders the

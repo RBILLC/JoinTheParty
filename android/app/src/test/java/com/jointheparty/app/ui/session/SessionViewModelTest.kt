@@ -352,6 +352,11 @@ private class FakeSyncEngine : SyncEngine {
 
     override fun submitPlayerState(positionMs: Long, isPaused: Boolean, receivedMonoNs: Long) = true
 
+    /**
+     * Mirrors the real engine: an accepted fix produces an estimate. Without
+     * this the ViewModel's shell-driven sampling (which stops at the first
+     * estimate) would keep retrying to its cap.
+     */
     override fun submitRecognitionFix(
         source: SyncCore.FixSource,
         matchOffsetMs: Long,
@@ -360,6 +365,15 @@ private class FakeSyncEngine : SyncEngine {
         confidence: Float,
     ): Boolean {
         submittedFixes += SubmittedFix(source, matchOffsetMs, captureMonoNs, frequencySkew, confidence)
+        eventFlow.tryEmit(
+            SyncCore.Event.SyncEstimate(
+                errorMs = 0.0,
+                driftPpm = 0.0,
+                confidence = confidence,
+                converged = false,
+                lastFixMonoNs = captureMonoNs,
+            ),
+        )
         return true
     }
 

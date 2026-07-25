@@ -22,7 +22,9 @@ object DebugLog {
     val lines: StateFlow<List<String>> = _lines.asStateFlow()
 
     fun log(message: String) {
-        android.util.Log.i("JTP", message)
+        // android.util.Log is not mocked under JVM unit tests and throws;
+        // the in-memory sink below must still work there.
+        runCatching { android.util.Log.i("JTP", message) }
         val stamped = "${clock.format(Date())}  $message"
         _lines.update { (it + stamped).takeLast(MAX_LINES) }
     }

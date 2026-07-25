@@ -323,6 +323,10 @@ private fun ConciergeContent(
             onPrimary = onGetSpotify,
             onSecondary = onJoinTap,
         )
+        // TODO(UI-06c): App Remote cannot distinguish "user hasn't granted
+        // this app access" from "account lacks Premium" — both arrive as
+        // UserNotAuthorizedException. Copy now covers both honestly rather
+        // than asserting a Premium problem the user may not have.
         SessionPhase.NEEDS_PREMIUM -> ConciergeGate(
             title = "Syncing needs Spotify Premium",
             body = "JoinTheParty drives your Spotify app and seeks to the exact beat — " +

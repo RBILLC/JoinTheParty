@@ -29,22 +29,25 @@ android {
         manifestPlaceholders["redirectSchemeName"] = "jointheparty"
         manifestPlaceholders["redirectHostName"] = "callback"
 
-        // User-provided app registration (developer.spotify.com dashboard).
-        buildConfigField(
-            "String", "SPOTIFY_CLIENT_ID",
-            "\"e010515b16e34b86b77a2a0798126ede\"",
-        )
-
-        // ACRCloud trial credentials live in the GITIGNORED
-        // android/local.properties (acr.host / acr.key / acr.secret) so the
-        // secret never enters git history. Empty values keep recognition
-        // safely inert.
+        // ALL app credentials live in the GITIGNORED android/local.properties
+        // (spotify.client.id / acr.host / acr.key / acr.secret) so nothing
+        // sensitive enters git history. Empty ACR values keep recognition
+        // safely inert; an empty client id breaks App Remote + PKCE, hence
+        // the loud configure-time warning.
         // (Top-level import: inside android{} the bare name `java` resolves
         // to Gradle's JavaPluginExtension accessor, shadowing the package.)
         val localProps = Properties().apply {
             val f = rootProject.file("local.properties")
             if (f.exists()) f.inputStream().use { load(it) }
         }
+        val spotifyClientId = localProps.getProperty("spotify.client.id", "")
+        if (spotifyClientId.isEmpty()) {
+            logger.warn(
+                "WARNING: spotify.client.id missing from android/local.properties — " +
+                    "App Remote and PKCE auth will fail at runtime.",
+            )
+        }
+        buildConfigField("String", "SPOTIFY_CLIENT_ID", "\"$spotifyClientId\"")
         buildConfigField("String", "ACR_HOST", "\"${localProps.getProperty("acr.host", "")}\"")
         buildConfigField("String", "ACR_KEY", "\"${localProps.getProperty("acr.key", "")}\"")
         buildConfigField("String", "ACR_SECRET", "\"${localProps.getProperty("acr.secret", "")}\"")

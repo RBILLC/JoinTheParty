@@ -54,6 +54,9 @@ private const val INITIAL_CAPTURE_FILL_MS = 4_000L
 /** Pre-first-fix retry cadence while MATCHING (post-fix cadence is engine-driven). */
 private const val RECOGNITION_RETRY_MS = 6_000L
 
+/** ~2 minutes of shell-driven sampling before giving up (quota guard). */
+private const val MAX_SAMPLING_ATTEMPTS = 20
+
 /** INT-03: chirp-calibration lifecycle for the active route (arch §6.4). */
 sealed interface CalibrationState {
     data object Idle : CalibrationState
@@ -209,7 +212,13 @@ class SessionViewModel(
                     onSpotifyMissing()
                 }
                 SpotifyController.ConnectionResult.AuthFailed -> {
-                    com.jointheparty.app.debug.DebugLog.log("Spotify: auth/premium required")
+                    // NOTE: App Remote reports "not authorized" for BOTH a
+                    // missing user grant and a genuine Premium gate. Cost us
+                    // real debugging time on 2026-07-24 (the account simply
+                    // wasn't allowlisted); the copy is now honest about it.
+                    com.jointheparty.app.debug.DebugLog.log(
+                        "Spotify: not authorized (grant needed, or Premium)",
+                    )
                     onPremiumRequired()
                 }
                 is SpotifyController.ConnectionResult.Failed -> {
@@ -304,6 +313,8 @@ class SessionViewModel(
             engine.stopCapture()
             consecutiveLosses = 0
             gateDismissedThisSession = false
+            firstEstimateSeen = false
+            samplingAttempts = 0
             _syncState.update {
                 SyncState(routeId = it.routeId, routeName = it.routeName, nudgeMs = it.nudgeMs)
             }
@@ -406,8 +417,10 @@ class SessionViewModel(
     private fun onEngineEvent(event: SyncCore.Event) {
         when (event) {
             is SyncCore.Event.SyncEstimate -> onSyncEstimate(event)
-            is SyncCore.Event.FixRejected ->
+            is SyncCore.Event.FixRejected -> {
+                com.jointheparty.app.debug.DebugLog.log("fix rejected: ${event.reason}")
                 _syncState.update { it.copy(lastRejectReason = event.reason) }
+            }
             SyncCore.Event.TrackLost -> onTrackLost()
             // NAT-06: the ONLY recurring recognition trigger, per the
             // no-free-running-recognition-loops rule (technical-
@@ -417,7 +430,12 @@ class SessionViewModel(
             is SyncCore.Event.CalibrationResult -> onCalibrationResult(event)
             // INT-02: execute the engine's micro-seek; the controller echoes
             // notifySeekIssued (settle window + latency learning).
-            is SyncCore.Event.Correction -> spotify?.seekTo(event.seekToMs)
+            is SyncCore.Event.Correction -> {
+                com.jointheparty.app.debug.DebugLog.log(
+                    "CORRECTION → seek ${event.seekToMs}ms",
+                )
+                spotify?.seekTo(event.seekToMs)
+            }
         }
     }
 
@@ -434,18 +452,36 @@ class SessionViewModel(
      * [recognitionInFlight] rejects a second concurrent call outright (see
      * its declaration for why two triggers can race here).
      */
+    /**
+     * The shell samples on its own cadence only until SyncCore accepts a
+     * fix and takes over scheduling via SC_EVT_REQUEST_FIX. Covers the
+     * AIMING/CONVERGING window where the first fix was discarded for want
+     * of a player timeline.
+     */
+    private fun shouldKeepSampling(): Boolean {
+        if (firstEstimateSeen) return false
+        // Bounded: every pass is a paid recognition request, so a session
+        // that never converges must not bill forever (caught by the unit
+        // suite as 9.2M virtual-time calls).
+        if (samplingAttempts >= MAX_SAMPLING_ATTEMPTS) return false
+        return _syncState.value.phase in setOf(
+            SessionPhase.MATCHING,
+            SessionPhase.AIMING,
+            SessionPhase.CONVERGING,
+        )
+    }
+
     private fun runRecognitionPass() {
         val recognizer = recognition ?: return
         if (!recognitionInFlight.compareAndSet(false, true)) return
+        samplingAttempts += 1
 
         viewModelScope.launch(dispatcher) {
             var retry = false
             try {
                 val fix = recognizer.recognizeOnce()
                 if (fix == null) {
-                    // No window yet / no match / provider error: keep trying
-                    // while the user is still waiting in MATCHING.
-                    retry = _syncState.value.phase == SessionPhase.MATCHING
+                    retry = shouldKeepSampling()
                     return@launch
                 }
                 engine.submitRecognitionFix(
@@ -461,24 +497,57 @@ class SessionViewModel(
                 // arrives after AIMING is still a useful sync-error
                 // observation for SyncCore (submitted above) but shouldn't
                 // re-resolve or re-transition.
-                if (_syncState.value.phase != SessionPhase.MATCHING) return@launch
-                resolveTrack(fix)
-                retry = _syncState.value.phase == SessionPhase.MATCHING
+                if (_syncState.value.phase == SessionPhase.MATCHING) resolveTrack(fix)
+                retry = shouldKeepSampling()
             } finally {
                 recognitionInFlight.set(false)
                 if (retry) {
                     viewModelScope.launch(dispatcher) {
                         delay(RECOGNITION_RETRY_MS)
-                        if (_syncState.value.phase == SessionPhase.MATCHING) {
-                            runRecognitionPass()
-                        }
+                        if (shouldKeepSampling()) runRecognitionPass()
                     }
                 }
             }
         }
     }
 
+    /** Throttle for the field overlay: estimates arrive at ≤15 Hz. */
+    private var lastEstimateLogMs = 0L
+
+    /**
+     * FIELD FIX (2026-07-24): true once SyncCore has ACCEPTED a fix and
+     * emitted an estimate. Until then the engine has no schedule of its own
+     * (SC_EVT_REQUEST_FIX is only armed by an accepted fix), so the shell
+     * must keep sampling.
+     *
+     * Why the first fix is always discarded: recognition necessarily runs
+     * BEFORE playback starts, so the estimator has no local timeline to
+     * compare against and drops it. Observed in the field as a session
+     * frozen in CONVERGING with no estimates at all.
+     */
+    private var firstEstimateSeen = false
+
+    /** Shell-driven passes taken this session (see [MAX_SAMPLING_ATTEMPTS]). */
+    private var samplingAttempts = 0
+
     private fun onSyncEstimate(event: SyncCore.Event.SyncEstimate) {
+        // INT-02 field instrumentation: without this a real-speaker test
+        // can't show whether the loop actually converges.
+        firstEstimateSeen = true
+        val now = System.currentTimeMillis()
+        if (now - lastEstimateLogMs > 1000) {
+            lastEstimateLogMs = now
+            com.jointheparty.app.debug.DebugLog.log(
+                "sync err=${"%.0f".format(event.errorMs)}ms " +
+                    "drift=${"%.0f".format(event.driftPpm)}ppm " +
+                    "conf=${"%.2f".format(event.confidence)}" +
+                    if (event.converged) " LOCKED" else "",
+            )
+        }
+        onSyncEstimateInternal(event)
+    }
+
+    private fun onSyncEstimateInternal(event: SyncCore.Event.SyncEstimate) {
         // An accepted estimate clears any transient reject hint (INT-04:
         // the self-hearing banner disappears once real fixes flow again).
         if (_syncState.value.lastRejectReason != null)
