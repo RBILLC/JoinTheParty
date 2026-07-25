@@ -205,40 +205,76 @@ fun NudgeWheel(
             Canvas(Modifier.fillMaxSize()) {
                 // All state reads live inside this draw lambda (two-stream
                 // rule): a drag delta re-executes only this block.
+                //
+                // FIELD UI FIX (2026-07-25, "does not look like a wheel"):
+                // uniformly-spaced translating stripes read as a flat plate.
+                // A cylinder viewed edge-on is sold by PROJECTION: each
+                // knurl groove lives at an angle θ on the drum and appears
+                // at x = cx + R·sin(θ) — ticks bunch and dim toward the
+                // edges (foreshortening), stand bold at the crown, and the
+                // drag rotates the phase (angle = arc / R) so motion
+                // accelerates through the middle exactly like a real drum.
                 val offsetPx = dragOffsetPt.value.dp.toPx()
                 val spacingPx = STRIATION_SPACING.toPx()
                 val w = size.width
                 val h = size.height
+                val cx = w / 2f
 
-                // Striations translate 1:1 with the drag; the pattern is
-                // periodic, so only the offset modulo the spacing matters.
-                val shift = offsetPx.mod(spacingPx)
+                // Wide-radius drum: only a gentle arc is visible, so the
+                // bunching is realistic rather than fisheye.
+                val radius = w * 0.72f
+                val angPitch = spacingPx / radius
+                val phase = (offsetPx / radius).mod(angPitch)
+                val maxTheta = kotlin.math.asin((cx / radius).coerceAtMost(1f))
 
-                // Alpha fades toward the top/bottom edges to suggest the
-                // curvature of a drum rather than a flat knurled plate.
-                val grooveBrush = Brush.verticalGradient(
-                    0f to Color.Transparent,
-                    0.18f to GrooveColor,
-                    0.82f to GrooveColor,
-                    1f to Color.Transparent,
-                    startY = 0f,
-                    endY = h,
-                )
-                val ridgeBrush = Brush.verticalGradient(
-                    0f to Color.Transparent,
-                    0.18f to RidgeColor,
-                    0.82f to RidgeColor,
-                    1f to Color.Transparent,
-                    startY = 0f,
-                    endY = h,
-                )
-
-                var x = -spacingPx + shift
-                while (x < w + spacingPx) {
-                    drawLine(brush = grooveBrush, start = Offset(x, 0f), end = Offset(x, h), strokeWidth = 1f)
-                    drawLine(brush = ridgeBrush, start = Offset(x + 1f, 0f), end = Offset(x + 1f, h), strokeWidth = 1f)
-                    x += spacingPx
+                var theta = -maxTheta + phase
+                // Align the first groove onto the pitch grid below −maxTheta.
+                theta -= kotlin.math.ceil((theta + maxTheta) / angPitch) * angPitch
+                while (theta <= maxTheta) {
+                    val facing = kotlin.math.cos(theta)  // 1 at crown → 0 at edge
+                    if (facing > 0.05f) {
+                        val x = cx + radius * kotlin.math.sin(theta)
+                        val inset = h * (0.06f + 0.10f * (1f - facing))
+                        drawLine(
+                            color = GrooveColor,
+                            alpha = 0.85f * facing * facing,
+                            start = Offset(x, inset),
+                            end = Offset(x, h - inset),
+                            strokeWidth = 0.8f + 1.8f * facing,
+                        )
+                        drawLine(
+                            color = RidgeColor,
+                            alpha = 0.5f * facing * facing * facing,
+                            start = Offset(x + 1.2f * facing, inset),
+                            end = Offset(x + 1.2f * facing, h - inset),
+                            strokeWidth = 0.8f + 1.0f * facing,
+                        )
+                    }
+                    theta += angPitch
                 }
+
+                // Cylindrical shading: lit from above — a soft highlight
+                // band near the crown of the curve, falling to shadow at
+                // the bottom lip; plus end-cap vignettes where the drum
+                // recedes.
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        0f to DT.Colors.ink.copy(alpha = 0.10f),
+                        0.22f to Color.Transparent,
+                        0.70f to Color.Transparent,
+                        1f to Color.Black.copy(alpha = 0.38f),
+                        startY = 0f,
+                        endY = h,
+                    ),
+                )
+                drawRect(
+                    brush = Brush.horizontalGradient(
+                        0f to Color.Black.copy(alpha = 0.45f),
+                        0.10f to Color.Transparent,
+                        0.90f to Color.Transparent,
+                        1f to Color.Black.copy(alpha = 0.45f),
+                    ),
+                )
 
                 // brassBright specular line along the drum's top edge (§6.2).
                 drawLine(
@@ -246,6 +282,16 @@ fun NudgeWheel(
                     start = Offset(0f, 0.5f),
                     end = Offset(w, 0.5f),
                     strokeWidth = 1f,
+                )
+
+                // Fixed index mark at the crown: the stationary reference
+                // the knurl visibly rotates past — the strongest "this is a
+                // dial" affordance a static frame can carry.
+                drawLine(
+                    color = DT.Colors.brass,
+                    start = Offset(cx, 0f),
+                    end = Offset(cx, h * 0.22f),
+                    strokeWidth = 2.dp.toPx(),
                 )
             }
         }
@@ -457,7 +503,8 @@ private class BilletHaptics(context: Context) {
     }
 
     private companion object {
-        const val FALLBACK_TICK_MS = 12L
+        // Field Test 2: 12 ms was lost in hand; 20 ms registers as a tick.
+        const val FALLBACK_TICK_MS = 20L
     }
 }
 

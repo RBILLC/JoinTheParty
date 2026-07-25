@@ -63,12 +63,12 @@ enum DT {
     // MARK: Haptics
     struct HapticToken { let intensity: Double; let sharpness: Double }
     enum Haptics {
-        static let wheelDetent = HapticToken(intensity: 0.4, sharpness: 0.9)
-        static let wheelCoarse = HapticToken(intensity: 0.7, sharpness: 0.7)
+        static let wheelDetent = HapticToken(intensity: 0.75, sharpness: 0.9)
+        static let wheelCoarse = HapticToken(intensity: 0.95, sharpness: 0.7)
         static let lockThunk = HapticToken(intensity: 1.0, sharpness: 0.15)
-        static let lockLost = HapticToken(intensity: 0.35, sharpness: 0.4)
-        static let abClick = HapticToken(intensity: 0.6, sharpness: 1.0)
-        static let endStop = HapticToken(intensity: 0.8, sharpness: 0.6)
+        static let lockLost = HapticToken(intensity: 0.5, sharpness: 0.4)
+        static let abClick = HapticToken(intensity: 0.8, sharpness: 1.0)
+        static let endStop = HapticToken(intensity: 1.0, sharpness: 0.6)
     }
 
     // MARK: Controls

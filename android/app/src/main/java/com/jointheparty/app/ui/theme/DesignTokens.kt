@@ -62,12 +62,12 @@ object DT {
 
     data class HapticToken(val intensity: Float, val sharpness: Float)
     object Haptics {
-        val wheelDetent = HapticToken(0.4f, 0.9f)
-        val wheelCoarse = HapticToken(0.7f, 0.7f)
+        val wheelDetent = HapticToken(0.75f, 0.9f)
+        val wheelCoarse = HapticToken(0.95f, 0.7f)
         val lockThunk = HapticToken(1.0f, 0.15f)
-        val lockLost = HapticToken(0.35f, 0.4f)
-        val abClick = HapticToken(0.6f, 1.0f)
-        val endStop = HapticToken(0.8f, 0.6f)
+        val lockLost = HapticToken(0.5f, 0.4f)
+        val abClick = HapticToken(0.8f, 1.0f)
+        val endStop = HapticToken(1.0f, 0.6f)
     }
 
     object Wheel {
