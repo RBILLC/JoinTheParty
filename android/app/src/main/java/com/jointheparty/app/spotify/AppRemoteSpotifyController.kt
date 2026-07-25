@@ -10,11 +10,14 @@ import com.spotify.android.appremote.api.error.NotLoggedInException
 import com.spotify.android.appremote.api.error.UserNotAuthorizedException
 import com.spotify.protocol.client.Subscription
 import com.spotify.protocol.types.PlayerState
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 
 /**
@@ -43,6 +46,8 @@ class AppRemoteSpotifyController(
     // ConnectionParams requires one to attempt a connection at all.
     private val clientId: String = com.jointheparty.app.BuildConfig.SPOTIFY_CLIENT_ID
 
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
     private val playerStatesFlow = MutableSharedFlow<SpotifyController.RemotePlayerState>(
         extraBufferCapacity = 16,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
@@ -64,6 +69,23 @@ class AppRemoteSpotifyController(
             .showAuthView(true)
             .build()
 
+        // FIELD FIX (2026-07-24): App Remote MUST be connected from the main
+        // thread — its Connector posts callbacks to the caller's Looper, so
+        // calling from Dispatchers.Default binds the service but never fires
+        // onConnected/onFailure (observed: session hung in AIMING forever).
+        // The timeout is belt-and-braces: a silent SDK is now a reported
+        // failure rather than an infinite wait.
+        return withTimeoutOrNull(CONNECT_TIMEOUT_MS) {
+            withContext(Dispatchers.Main) { awaitConnection(ctx, params) }
+        } ?: SpotifyController.ConnectionResult.Failed(
+            IllegalStateException("App Remote connect timed out after ${CONNECT_TIMEOUT_MS}ms"),
+        )
+    }
+
+    private suspend fun awaitConnection(
+        ctx: Context,
+        params: ConnectionParams,
+    ): SpotifyController.ConnectionResult {
         return suspendCancellableCoroutine { cont ->
             SpotifyAppRemote.connect(
                 ctx,
@@ -105,7 +127,9 @@ class AppRemoteSpotifyController(
 
     override fun play(spotifyUri: String): Boolean {
         val playerApi = remote?.playerApi ?: return false
-        playerApi.play(spotifyUri)
+        // Same main-thread rule as connect(): App Remote's transport posts
+        // its result callbacks to the caller's Looper.
+        mainHandler.post { playerApi.play(spotifyUri) }
         // Self-hearing guard arm (spec §7.3): position 0 because play(uri)
         // always starts a track from the top.
         engine.notifyLocalPlayback(0)
@@ -122,7 +146,7 @@ class AppRemoteSpotifyController(
         // notifyLocalPlayback-adjacent bookkeeping, to learn command
         // latency online (CORE-03 extra: sc_get_command_latency_ms).
         val issuedMonoNs = System.nanoTime()
-        playerApi.seekTo(positionMs)
+        mainHandler.post { playerApi.seekTo(positionMs) }
         engine.notifySeekIssued(positionMs, issuedMonoNs)
         return true
     }
@@ -145,5 +169,10 @@ class AppRemoteSpotifyController(
                     engine.submitPlayerState(data.playbackPosition, data.isPaused, receivedMonoNs)
                 },
             )
+    }
+
+    private companion object {
+        /** App Remote occasionally never calls back; don't hang the session. */
+        const val CONNECT_TIMEOUT_MS = 20_000L
     }
 }
