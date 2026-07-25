@@ -48,6 +48,17 @@ class AppRemoteSpotifyController(
 
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
+    /**
+     * FIELD FIX (2026-07-24): App Remote's `showAuthView` renders the
+     * consent UI through an **Activity**; handed only an application
+     * context it cannot present anything and fails immediately with
+     * UserNotAuthorizedException (observed on device even after the web
+     * PKCE consent — App Remote authorization is a separate grant).
+     * MainActivity sets this while resumed and clears it on destroy, so no
+     * Activity outlives its lifecycle here.
+     */
+    var activityContext: Context? = null
+
     private val playerStatesFlow = MutableSharedFlow<SpotifyController.RemotePlayerState>(
         extraBufferCapacity = 16,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
@@ -62,7 +73,9 @@ class AppRemoteSpotifyController(
         get() = remote?.isConnected == true
 
     override suspend fun connect(): SpotifyController.ConnectionResult {
-        val ctx = context ?: return SpotifyController.ConnectionResult.SpotifyMissing
+        // Prefer the Activity so the auth view can actually be shown.
+        val ctx = activityContext ?: context
+            ?: return SpotifyController.ConnectionResult.SpotifyMissing
 
         val params = ConnectionParams.Builder(clientId)
             .setRedirectUri(redirectUri)
@@ -106,6 +119,10 @@ class AppRemoteSpotifyController(
                         // AuthFailed to needsPremium once it has also
                         // confirmed the app IS installed via
                         // SpotifyAppDetector (AUTH-05).
+                        com.jointheparty.app.debug.DebugLog.log(
+                            "AppRemote onFailure: ${throwable.javaClass.simpleName}: " +
+                                "${throwable.message}",
+                        )
                         val result = when (throwable) {
                             is CouldNotFindSpotifyApp -> SpotifyController.ConnectionResult.SpotifyMissing
                             is NotLoggedInException,

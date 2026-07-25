@@ -359,6 +359,15 @@ class SessionViewModel(
         _syncState.update { it.copy(calibration = CalibrationState.Running) }
     }
 
+    /**
+     * INT-02: App Remote needs an Activity to present its consent UI (see
+     * AppRemoteSpotifyController.activityContext). MainActivity attaches
+     * itself while alive and detaches in onDestroy.
+     */
+    fun attachActivity(activity: android.app.Activity?) {
+        (spotify as? AppRemoteSpotifyController)?.activityContext = activity
+    }
+
     fun cancelCalibration() {
         engine.cancelCalibration()
         _syncState.update { it.copy(calibration = CalibrationState.Idle) }

@@ -71,6 +71,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // App Remote presents its authorization UI through an Activity.
+        viewModel.attachActivity(this)
+
         routeObserver = AudioRouteObserver(this) { route, routeId, routeName ->
             viewModel.onRouteChanged(routeId, routeName, route)
         }.also { it.start() }
@@ -167,6 +170,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        viewModel.attachActivity(null)  // never outlive this Activity
         routeObserver?.stop()
         routeObserver = null
         super.onDestroy()
