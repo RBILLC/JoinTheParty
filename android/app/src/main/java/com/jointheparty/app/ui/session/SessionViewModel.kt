@@ -409,8 +409,24 @@ class SessionViewModel(
     /** Wheel commit: push to the engine, persist per-route, reflect in state. */
     fun onNudgeCommitted(trimMs: Int) {
         val routeId = _syncState.value.routeId
+        val deltaMs = trimMs - _syncState.value.nudgeMs
         engine.setUserNudgeMs(trimMs)
         _syncState.update { it.copy(nudgeMs = trimMs) }
+        // FIELD FIX (2026-07-25, "the wheel did not work"): routing the
+        // nudge only through the engine setpoint means it has NO audible
+        // effect until the next accepted fix + correction — and none at all
+        // when recognition is degraded. Apply the delta as an immediate
+        // physical seek too; the setpoint still governs future corrections.
+        // Sign: wheel right = positive = play AHEAD (audio arrives earlier).
+        val ps = spotify?.lastKnownPlayerState
+        if (deltaMs != 0 && ps != null) {
+            val projected =
+                ps.positionMs + (System.nanoTime() - ps.receivedMonoNs) / 1_000_000
+            com.jointheparty.app.debug.DebugLog.log(
+                "nudge Δ${deltaMs}ms → immediate seek ${projected + deltaMs}ms",
+            )
+            spotify?.seekTo(projected + deltaMs)
+        }
         viewModelScope.launch(dispatcher) {
             nudgeStore.saveTrim(routeId, trimMs)
         }
@@ -617,8 +633,23 @@ class SessionViewModel(
                 // lock the track (matching → aiming, §2.4); a fix that
                 // arrives after AIMING is still a useful sync-error
                 // observation for SyncCore (submitted above) but shouldn't
-                // re-resolve or re-transition.
-                if (_syncState.value.phase == SessionPhase.MATCHING) resolveTrack(fix)
+                // re-resolve or re-transition — UNLESS it names a different
+                // track: the room moved on. Fast-switch instead of waiting
+                // for the engine's 2 s track-lost threshold.
+                val currentUri = _syncState.value.track?.spotifyUri
+                if (_syncState.value.phase == SessionPhase.MATCHING) {
+                    resolveTrack(fix)
+                } else if (fix.spotifyUri != null && currentUri != null &&
+                    fix.spotifyUri != currentUri
+                ) {
+                    com.jointheparty.app.debug.DebugLog.log(
+                        "room changed songs → re-aim '${fix.title}'",
+                    )
+                    transition(SessionPhase.LOST)
+                    transition(SessionPhase.LISTENING)
+                    onMatchInFlight()
+                    resolveTrack(fix)
+                }
                 retry = shouldKeepSampling()
             } finally {
                 recognitionInFlight.set(false)
@@ -694,6 +725,20 @@ class SessionViewModel(
         consecutiveLosses += 1
         if (consecutiveLosses < 3) {
             transition(SessionPhase.LISTENING)
+            // FIELD FIX (2026-07-25, "does not handle the next song"): the
+            // auto-restart changed phase but never re-armed recognition —
+            // the bootstrap only ran from the Join tap, so after the room
+            // moved to the next track the app sat deaf in LISTENING
+            // forever. Re-bootstrap exactly like a fresh Join.
+            if (recognition != null) {
+                firstEstimateSeen = false
+                samplingAttempts = 0
+                onMatchInFlight()
+                viewModelScope.launch(dispatcher) {
+                    delay(RECOGNITION_RETRY_MS / 2)
+                    runRecognitionPass()
+                }
+            }
         } else {
             transition(SessionPhase.ERROR)
         }

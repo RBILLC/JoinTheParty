@@ -76,7 +76,7 @@ enum DT {
         static let detentMs: Double = 5
         static let detentTravelPt: Double = 9
         static let coarseStepMs: Double = 50
-        static let rangeMs: Double = 750
+        static let rangeMs: Double = 1500
         static let commitDebounceMs: Double = 400
     }
     enum Meter {

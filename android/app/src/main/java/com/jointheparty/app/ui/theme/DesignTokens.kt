@@ -74,7 +74,7 @@ object DT {
         const val detentMs = 5.0f
         const val detentTravelPt = 9.0f
         const val coarseStepMs = 50.0f
-        const val rangeMs = 750.0f
+        const val rangeMs = 1500.0f
         const val commitDebounceMs = 400.0f
     }
     object Meter {
