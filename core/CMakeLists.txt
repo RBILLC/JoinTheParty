@@ -79,6 +79,14 @@ if(SYNCCORE_BUILD_TESTS)
     synccore_add_test(policy_tests tests/test_policy.cpp)
     synccore_add_test(correlate_tests tests/test_correlate.cpp)
 
+    # Field-test ground-truth tool (desktop only): windowed autocorrelation
+    # over a PC-mic recording of two devices playing the same song.
+    add_executable(lag_analyzer tools/lag_analyzer.cpp)
+    target_link_libraries(lag_analyzer PRIVATE synccore)
+    target_include_directories(lag_analyzer
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft)
+    add_test(NAME lag_analyzer_selftest COMMAND lag_analyzer --selftest)
+
     # The public header must stay consumable as plain C99 — compile a pure C
     # translation unit that includes it.
     file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/abi_c_check.c
