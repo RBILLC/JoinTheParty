@@ -133,6 +133,7 @@ class MainActivity : ComponentActivity() {
                             onConnectSpotify = { authManager.beginAuth() },
                             spotifyLinked = spotifyLinkedState.value,
                             playbackPositionMs = viewModel.playbackPositionMs,
+                            onLeaveSession = viewModel::reset,
                         )
                     }
                 }

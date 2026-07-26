@@ -626,6 +626,19 @@ class SessionViewModel(
                 val fix = recognizer.recognizeOnce()
                 if (fix == null) {
                     retry = shouldKeepSampling()
+                    // UX audit #2: hitting the sampling cap used to leave a
+                    // zombie MATCHING screen — alive-looking, permanently
+                    // deaf. Escalate honestly instead.
+                    if (!retry && !firstEstimateSeen &&
+                        samplingAttempts >= MAX_SAMPLING_ATTEMPTS &&
+                        _syncState.value.phase == SessionPhase.MATCHING
+                    ) {
+                        com.jointheparty.app.debug.DebugLog.log(
+                            "sampling cap reached with no match → error state",
+                        )
+                        transition(SessionPhase.LOST)
+                        transition(SessionPhase.ERROR)
+                    }
                     return@launch
                 }
                 // FIELD DEBUG: shell-side replica of the engine's sync

@@ -80,6 +80,8 @@ fun SessionScreen(
     onConnectSpotify: () -> Unit = {},
     spotifyLinked: Boolean = false,
     playbackPositionMs: Flow<Long> = MutableStateFlow(-1L),
+    // UX audit #1: every in-session phase needs an exit back to IDLE.
+    onLeaveSession: () -> Unit = {},
 ) {
     var showCalibration by remember { mutableStateOf(false) }
     Box(
@@ -104,7 +106,10 @@ fun SessionScreen(
                     onConnectSpotify = onConnectSpotify,
                     spotifyLinked = spotifyLinked,
                 )
-                PhaseGroup.WAITING -> WaitingContent(phase = state.phase)
+                PhaseGroup.WAITING -> WaitingContent(
+                    phase = state.phase,
+                    onCancel = onLeaveSession,
+                )
                 PhaseGroup.ACTIVE -> ActiveContent(
                     state = state,
                     meterFrames = meterFrames,
@@ -112,6 +117,7 @@ fun SessionScreen(
                     onTrimCommit = onTrimCommit,
                     onOpenCalibration = { showCalibration = true },
                     playbackPositionMs = playbackPositionMs,
+                    onLeaveSession = onLeaveSession,
                 )
                 PhaseGroup.LOST -> QuietMessage("Lost the room — listening again…")
                 PhaseGroup.CONCIERGE -> ConciergeContent(
@@ -163,12 +169,15 @@ private fun PlaybackClock(positionMs: Flow<Long>) {
 @Composable
 private fun DebugOverlay(modifier: Modifier = Modifier) {
     val lines by com.jointheparty.app.debug.DebugLog.lines.collectAsState()
-    if (lines.isEmpty()) return
+    // UX audit #4: field listeners shouldn't have to watch logs scroll.
+    var dismissed by remember { mutableStateOf(false) }
+    if (lines.isEmpty() || dismissed) return
     Column(
         modifier = modifier
             .fillMaxWidth()
             .background(Color(0xCC000000))
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+            .clickable { dismissed = true },
     ) {
         lines.forEach {
             Text(
@@ -234,13 +243,31 @@ private fun IdleContent(
  * spinner or progress bar (Billet rejects gamified "working…" UI wholesale).
  */
 @Composable
-private fun WaitingContent(phase: SessionPhase) {
+private fun WaitingContent(phase: SessionPhase, onCancel: () -> Unit = {}) {
     val word = when (phase) {
         SessionPhase.LISTENING -> "Listening…"
         SessionPhase.MATCHING -> "Matching…"
         else -> ""
     }
-    QuietMessage(word)
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = word,
+                style = BilletType.title,
+                color = DT.Colors.ink2,
+                textAlign = TextAlign.Center,
+            )
+            // UX audit #1: the waiting states were inescapable.
+            Text(
+                text = "Cancel",
+                style = BilletType.label,
+                color = DT.Colors.ink3,
+                modifier = Modifier
+                    .padding(top = DT.Space.sectionGap)
+                    .clickable(onClick = onCancel),
+            )
+        }
+    }
 }
 
 /**
@@ -256,6 +283,7 @@ private fun ActiveContent(
     onTrimCommit: (Int) -> Unit,
     onOpenCalibration: () -> Unit = {},
     playbackPositionMs: Flow<Long> = MutableStateFlow(-1L),
+    onLeaveSession: () -> Unit = {},
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         TrackIdentity(track = state.track, phase = state.phase)
@@ -283,17 +311,27 @@ private fun ActiveContent(
             onTrimChange = onTrimChange,
             onTrimCommit = onTrimCommit,
         )
-        // INT-03: the quiet calibration entry point — a label, not a button
-        // chrome (§4: settings-tier actions stay whisper-quiet).
-        Text(
-            text = "Calibrate",
-            style = BilletType.label,
-            color = DT.Colors.ink3,
+        // Quiet settings-tier actions (§4): calibration entry and — UX
+        // audit #1 — the session's exit.
+        Row(
             modifier = Modifier
-                .align(Alignment.End)
-                .padding(top = DT.Space.grid)
-                .clickable(onClick = onOpenCalibration),
-        )
+                .fillMaxWidth()
+                .padding(top = DT.Space.grid),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                text = "Leave the party",
+                style = BilletType.label,
+                color = DT.Colors.ink3,
+                modifier = Modifier.clickable(onClick = onLeaveSession),
+            )
+            Text(
+                text = "Calibrate",
+                style = BilletType.label,
+                color = DT.Colors.ink3,
+                modifier = Modifier.clickable(onClick = onOpenCalibration),
+            )
+        }
     }
 }
 
@@ -372,7 +410,10 @@ private fun ConciergeContent(
             onPrimary = onSeePremiumPlans,
             onSecondary = onJoinTap,
         )
-        SessionPhase.ERROR -> QuietMessage("Something broke — tap to retry", onTap = onJoinTap)
+        // Reached via lost-track exhaustion OR the recognition sampling cap
+        // (UX audit #2) — either way the honest message is the same.
+        SessionPhase.ERROR ->
+            QuietMessage("Couldn't find the song — tap to try again", onTap = onJoinTap)
         else -> Unit
     }
 }
