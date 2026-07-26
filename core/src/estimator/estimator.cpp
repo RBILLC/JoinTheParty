@@ -24,6 +24,7 @@ void SyncEstimator::reset() {
     in_deadband_streak_ = 0;
     converged_ = false;
     has_player_ = false;
+    outlier_pending_ = false;
 }
 
 void SyncEstimator::on_player_state(int64_t position_ms, bool is_paused,
@@ -72,6 +73,18 @@ bool SyncEstimator::on_fix(int64_t match_offset_ms, uint64_t capture_mono_ns,
         valid_ = true;
     }
     predict_to(capture_mono_ns);
+
+    // Innovation gate (audit §4.6): a confident filter refuses one wild
+    // fix; two in a row are believed (real jumps repeat, noise doesn't).
+    if (p00_ < cfg_.outlier_gate_max_p00 &&
+        std::abs(z - e_) > cfg_.outlier_gate_ms) {
+        if (!outlier_pending_) {
+            outlier_pending_ = true;
+            return false;
+        }
+        // Second consecutive outlier: fall through and accept.
+    }
+    outlier_pending_ = false;
 
     // Scalar update, H = [1 0].
     const float conf = std::clamp(provider_confidence, 0.05f, 1.0f);

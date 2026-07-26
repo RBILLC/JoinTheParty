@@ -33,6 +33,13 @@ struct EstimatorConfig {
     // correct on every fix. 800 ppm stays above the sim's stress value
     // (500 ppm) while killing runaway estimates.
     double drift_clamp_ms_per_s = 0.8;
+    // Innovation gate (audit §4.6): when the filter is confident, a single
+    // fix whose innovation exceeds this is rejected as an outlier (wild
+    // wrong-segment match); a SECOND consecutive outlier is accepted — a
+    // real jump repeats, noise doesn't. Inactive while uncertain (large
+    // P00), so post-reset first fixes always land.
+    double outlier_gate_ms = 1200.0;
+    double outlier_gate_max_p00 = 10000.0;  // gate only when std(e) < 100 ms
     double deadband_ms = 25.0;
     int convergence_fixes = 3;         // consecutive in-deadband fixes → converged
     double conf_var_scale_ms = 25.0;   // posterior-std scale in confidence
@@ -102,6 +109,7 @@ private:
     uint64_t last_fix_mono_ns_ = 0;
     int in_deadband_streak_ = 0;
     bool converged_ = false;
+    bool outlier_pending_ = false;
 };
 
 }  // namespace synccore

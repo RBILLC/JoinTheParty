@@ -162,6 +162,41 @@ void test_nudge_shifts_setpoint() {
     CHECK_NEAR(w.est.estimate_at(30 * kSec).error_ms, 0.0, 2.0);
 }
 
+// Audit §4.6: a confident filter rejects a single wild fix; a repeated
+// outlier is accepted (real jumps repeat, noise doesn't).
+void test_innovation_gate() {
+    World w(10.0);
+    for (int i = 1; i <= 3; ++i) {
+        const uint64_t t = static_cast<uint64_t>(i) * 10 * kSec;
+        w.push_player(t);
+        CHECK(w.push_fix(t));
+    }
+    const double settled = w.est.estimate_at(30 * kSec).error_ms;
+    CHECK_NEAR(settled, 10.0, 2.0);
+
+    // Single +1500 ms outlier → rejected, state untouched.
+    w.push_player(40 * kSec);
+    CHECK(!w.push_fix(40 * kSec, 0.9f, 1500.0));
+    CHECK_NEAR(w.est.estimate_at(40 * kSec).error_ms, 10.0, 3.0);
+
+    // A normal fix afterwards is accepted and clears the pending flag.
+    w.push_player(50 * kSec);
+    CHECK(w.push_fix(50 * kSec));
+    CHECK_NEAR(w.est.estimate_at(50 * kSec).error_ms, 10.0, 3.0);
+
+    // Two consecutive outliers: first rejected, second believed.
+    w.push_player(60 * kSec);
+    CHECK(!w.push_fix(60 * kSec, 0.9f, 1500.0));
+    w.push_player(70 * kSec);
+    CHECK(w.push_fix(70 * kSec, 0.9f, 1500.0));
+    // Accepted ⇒ the state MOVES toward the repeated observation (a
+    // confident KF steps partway per fix — full convergence follows over
+    // subsequent consistent fixes; what matters here is rejected=frozen
+    // vs accepted=moving).
+    const double after = w.est.estimate_at(70 * kSec).error_ms;
+    CHECK(after < -100.0);
+}
+
 void test_output_latency_enters_model() {
     // 100 ms output latency: reported local position leads what is audible,
     // so with reported error 0 the audible error is −100 ms.
@@ -185,6 +220,7 @@ int main() {
     test_drift_tracking_observation_only();
     test_confidence_decays_with_fix_age();
     test_convergence_flag_semantics();
+    test_innovation_gate();
     test_nudge_shifts_setpoint();
     test_output_latency_enters_model();
 

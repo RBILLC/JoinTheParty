@@ -434,6 +434,14 @@ private class FakeNudgeStore : NudgeStore {
     override suspend fun saveOutputLatency(routeId: String, ms: Int) {
         outputLatencies[routeId] = ms
     }
+
+    val setpoints = mutableMapOf<String, Int>()
+
+    override suspend fun engineSetpointFor(routeId: String): Int? = setpoints[routeId]
+
+    override suspend fun saveEngineSetpoint(routeId: String, ms: Int) {
+        setpoints[routeId] = ms
+    }
 }
 
 /** NAT-06: records calls; returns a fixed fix (or null) without touching ShazamKit. */

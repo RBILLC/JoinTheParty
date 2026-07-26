@@ -67,6 +67,9 @@ private const val MAX_SAMPLING_ATTEMPTS = 20
  */
 private const val ENGINE_DEADBAND_MS = 350
 
+/** Below this confidence a wheel commit skips the error rebase (§4.4). */
+private const val REBASE_MIN_CONFIDENCE = 0.2f
+
 /** Aim-verification loop (arch §6.2 coarse aim, made deterministic). */
 private const val MAX_AIM_ATTEMPTS = 4
 private const val AIM_VERIFY_DELAY_MS = 900L
@@ -437,7 +440,13 @@ class SessionViewModel(
         // error — declaring the user's alignment to be zero. Without the
         // rebase, the engine's residual (biased) measurement survives the
         // commit and the next correction seeks the user's tuning back off.
-        val rebase = lastEstimateErrorMs
+        // Audit §4.4: only absorb the measured error when the estimate is
+        // fresh enough to mean something; a decayed estimate rebases noise.
+        val rebase = if (lastEstimateConfidence >= REBASE_MIN_CONFIDENCE) {
+            lastEstimateErrorMs
+        } else {
+            0.0
+        }
         lastEstimateErrorMs = 0.0
         engineNudgeMs += deltaMs + rebase
         engine.setUserNudgeMs(engineNudgeMs.toInt())
@@ -454,6 +463,9 @@ class SessionViewModel(
         }
         viewModelScope.launch(dispatcher) {
             nudgeStore.saveTrim(routeId, trimMs)
+            // Audit §4.2: the rebased setpoint is what makes the NEXT
+            // session start aligned — persist it beside the wheel value.
+            nudgeStore.saveEngineSetpoint(routeId, engineNudgeMs.toInt())
         }
     }
 
@@ -465,8 +477,12 @@ class SessionViewModel(
             // OUTPUT-chain latency, not Spotify's command latency (which
             // seeds sc_create instead — see NudgeStore's doc note).
             val outputLatencyPrior = nudgeStore.outputLatencyFor(routeId)
-            engineNudgeMs = trim.toDouble()  // fresh route: no rebase history
-            engine.setUserNudgeMs(trim)
+            // Audit §4.2: restore the rebased setpoint when one exists —
+            // the session starts already-aligned; the wheel still displays
+            // the plain trim.
+            val setpoint = nudgeStore.engineSetpointFor(routeId) ?: trim
+            engineNudgeMs = setpoint.toDouble()
+            engine.setUserNudgeMs(setpoint)
             engine.setOutputRoute(route, outputLatencyPrior)
             // INT-04 (arch §7): phone-speaker playback means the mic hears
             // us — full AEC + self-hearing guard. Headphone routes are the
@@ -656,11 +672,18 @@ class SessionViewModel(
                 if (ps != null) {
                     val shellProj =
                         ps.positionMs + (fix.captureMonoNs - ps.receivedMonoNs) / 1_000_000
+                    val capAge = (System.nanoTime() - fix.captureMonoNs) / 1_000_000
+                    // BIAS ISOLATION (audit §4.1): zEnd pairs ACR's offset
+                    // with the sample-END timestamp (current engine
+                    // behavior); zResp pairs it with response time (the
+                    // hypothesis that ACR extrapolates play_offset_ms to
+                    // "now"). Whichever column sits near zero across a
+                    // clean run names the bias source.
+                    val zEnd = shellProj - fix.matchOffsetMs
                     com.jointheparty.app.debug.DebugLog.log(
-                        "fixdbg: offset=${fix.matchOffsetMs} " +
-                            "projLocal=$shellProj shellZ=${shellProj - fix.matchOffsetMs} " +
-                            "(ps=${ps.positionMs}@-${(System.nanoTime() - ps.receivedMonoNs) / 1_000_000}ms " +
-                            "capAge=${(System.nanoTime() - fix.captureMonoNs) / 1_000_000}ms)",
+                        "fixdbg: offset=${fix.matchOffsetMs} zEnd=$zEnd " +
+                            "zResp=${zEnd + capAge} capAge=${capAge}ms " +
+                            "(ps=${ps.positionMs}@-${(System.nanoTime() - ps.receivedMonoNs) / 1_000_000}ms)",
                     )
                 }
                 engine.submitRecognitionFix(
@@ -719,6 +742,11 @@ class SessionViewModel(
     @Volatile
     private var lastEstimateErrorMs: Double = 0.0
 
+    /** Freshness guard for the rebase (audit §4.4): a stale, low-confidence
+     * estimate must not be absorbed into the setpoint. */
+    @Volatile
+    private var lastEstimateConfidence: Float = 0f
+
     /**
      * The engine-side setpoint, which can diverge from the user's wheel
      * value: each wheel commit REBASES it by the engine's own measured
@@ -750,6 +778,7 @@ class SessionViewModel(
         // can't show whether the loop actually converges.
         firstEstimateSeen = true
         lastEstimateErrorMs = event.errorMs
+        lastEstimateConfidence = event.confidence
         val now = System.currentTimeMillis()
         if (now - lastEstimateLogMs > 1000) {
             lastEstimateLogMs = now

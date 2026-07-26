@@ -28,6 +28,13 @@ interface NudgeStore {
     suspend fun commandLatencyFor(routeId: String): Int
     suspend fun saveCommandLatency(routeId: String, ms: Int)
 
+    // Convergence-audit §4.2: the ENGINE setpoint (wheel trim + rebased
+    // measurement bias) persisted separately from the wheel's display
+    // value, so sessions start already-aligned instead of re-fighting the
+    // bias until the first wheel touch. Null = never rebased on this route.
+    suspend fun engineSetpointFor(routeId: String): Int?
+    suspend fun saveEngineSetpoint(routeId: String, ms: Int)
+
     // INT-03: chirp-calibrated output-chain latency per route (arch §6.4).
     // Distinct from the *command* latency above: output latency is how long
     // sound takes to become audible on this route (DAC/BT buffering) and
@@ -53,6 +60,13 @@ class DataStoreNudgeStore(private val context: Context) : NudgeStore {
         context.nudgeDataStore.edit { it[latencyKey(routeId)] = ms }
     }
 
+    override suspend fun engineSetpointFor(routeId: String): Int? =
+        context.nudgeDataStore.data.map { it[setpointKey(routeId)] }.first()
+
+    override suspend fun saveEngineSetpoint(routeId: String, ms: Int) {
+        context.nudgeDataStore.edit { it[setpointKey(routeId)] = ms }
+    }
+
     override suspend fun outputLatencyFor(routeId: String): Int =
         context.nudgeDataStore.data.map { it[outputLatencyKey(routeId)] ?: -1 }.first()
 
@@ -63,4 +77,5 @@ class DataStoreNudgeStore(private val context: Context) : NudgeStore {
     private fun trimKey(routeId: String) = intPreferencesKey("trim:$routeId")
     private fun latencyKey(routeId: String) = intPreferencesKey("latency:$routeId")
     private fun outputLatencyKey(routeId: String) = intPreferencesKey("outlatency:$routeId")
+    private fun setpointKey(routeId: String) = intPreferencesKey("setpoint:$routeId")
 }
