@@ -431,20 +431,24 @@ class SessionViewModel(
     fun onNudgeCommitted(trimMs: Int) {
         val routeId = _syncState.value.routeId
         val deltaMs = trimMs - _syncState.value.nudgeMs
-        engine.setUserNudgeMs(trimMs)
+        // FIELD FIX (2026-07-26, "fighting the auto correction"): the EAR is
+        // ground truth. A commit (1) moves playback by the delta right now,
+        // and (2) REBASES the engine setpoint by its own currently-measured
+        // error — declaring the user's alignment to be zero. Without the
+        // rebase, the engine's residual (biased) measurement survives the
+        // commit and the next correction seeks the user's tuning back off.
+        val rebase = lastEstimateErrorMs
+        lastEstimateErrorMs = 0.0
+        engineNudgeMs += deltaMs + rebase
+        engine.setUserNudgeMs(engineNudgeMs.toInt())
         _syncState.update { it.copy(nudgeMs = trimMs) }
-        // FIELD FIX (2026-07-25, "the wheel did not work"): routing the
-        // nudge only through the engine setpoint means it has NO audible
-        // effect until the next accepted fix + correction — and none at all
-        // when recognition is degraded. Apply the delta as an immediate
-        // physical seek too; the setpoint still governs future corrections.
-        // Sign: wheel right = positive = play AHEAD (audio arrives earlier).
         val ps = spotify?.lastKnownPlayerState
         if (deltaMs != 0 && ps != null) {
             val projected =
                 ps.positionMs + (System.nanoTime() - ps.receivedMonoNs) / 1_000_000
             com.jointheparty.app.debug.DebugLog.log(
-                "nudge Δ${deltaMs}ms → immediate seek ${projected + deltaMs}ms",
+                "nudge Δ${deltaMs}ms rebase=${"%.0f".format(rebase)}ms " +
+                    "engineSetpoint=${engineNudgeMs.toInt()}ms → seek ${projected + deltaMs}ms",
             )
             spotify?.seekTo(projected + deltaMs)
         }
@@ -461,6 +465,7 @@ class SessionViewModel(
             // OUTPUT-chain latency, not Spotify's command latency (which
             // seeds sc_create instead — see NudgeStore's doc note).
             val outputLatencyPrior = nudgeStore.outputLatencyFor(routeId)
+            engineNudgeMs = trim.toDouble()  // fresh route: no rebase history
             engine.setUserNudgeMs(trim)
             engine.setOutputRoute(route, outputLatencyPrior)
             // INT-04 (arch §7): phone-speaker playback means the mic hears
@@ -710,6 +715,20 @@ class SessionViewModel(
     /** Throttle for the field overlay: estimates arrive at ≤15 Hz. */
     private var lastEstimateLogMs = 0L
 
+    /** Latest engine-measured error; consumed by wheel-commit rebasing. */
+    @Volatile
+    private var lastEstimateErrorMs: Double = 0.0
+
+    /**
+     * The engine-side setpoint, which can diverge from the user's wheel
+     * value: each wheel commit REBASES it by the engine's own measured
+     * error, declaring the user's by-ear alignment to be zero. Without this
+     * the wheel and the correction loop fight (field, 2026-07-26): the ear
+     * corrects audible error, the engine still measures its biased error
+     * and seeks the user's tuning right back off.
+     */
+    private var engineNudgeMs: Double = 0.0
+
     /**
      * FIELD FIX (2026-07-24): true once SyncCore has ACCEPTED a fix and
      * emitted an estimate. Until then the engine has no schedule of its own
@@ -730,6 +749,7 @@ class SessionViewModel(
         // INT-02 field instrumentation: without this a real-speaker test
         // can't show whether the loop actually converges.
         firstEstimateSeen = true
+        lastEstimateErrorMs = event.errorMs
         val now = System.currentTimeMillis()
         if (now - lastEstimateLogMs > 1000) {
             lastEstimateLogMs = now

@@ -220,9 +220,11 @@ fun NudgeWheel(
                 val h = size.height
                 val cx = w / 2f
 
-                // Wide-radius drum: only a gentle arc is visible, so the
-                // bunching is realistic rather than fisheye.
-                val radius = w * 0.72f
+                // Field round 2: a wide radius hid all curvature in the
+                // vignetted edges — the visible middle read as flat stripes
+                // again. A tight drum shows the full arc: ticks visibly
+                // converge at the ends and sweep fastest through the crown.
+                val radius = w * 0.45f
                 val angPitch = spacingPx / radius
                 val phase = (offsetPx / radius).mod(angPitch)
                 val maxTheta = kotlin.math.asin((cx / radius).coerceAtMost(1f))
@@ -232,22 +234,25 @@ fun NudgeWheel(
                 theta -= kotlin.math.ceil((theta + maxTheta) / angPitch) * angPitch
                 while (theta <= maxTheta) {
                     val facing = kotlin.math.cos(theta)  // 1 at crown → 0 at edge
-                    if (facing > 0.05f) {
+                    if (facing > 0.02f) {
                         val x = cx + radius * kotlin.math.sin(theta)
-                        val inset = h * (0.06f + 0.10f * (1f - facing))
+                        val inset = h * (0.06f + 0.16f * (1f - facing))
+                        // Linear falloff: edge ticks stay visible so the
+                        // convergence — the cue that says "cylinder" — is
+                        // actually seen.
                         drawLine(
                             color = GrooveColor,
-                            alpha = 0.85f * facing * facing,
+                            alpha = 0.95f * facing,
                             start = Offset(x, inset),
                             end = Offset(x, h - inset),
-                            strokeWidth = 0.8f + 1.8f * facing,
+                            strokeWidth = 0.8f + 2.4f * facing,
                         )
                         drawLine(
                             color = RidgeColor,
-                            alpha = 0.5f * facing * facing * facing,
-                            start = Offset(x + 1.2f * facing, inset),
-                            end = Offset(x + 1.2f * facing, h - inset),
-                            strokeWidth = 0.8f + 1.0f * facing,
+                            alpha = 0.6f * facing * facing,
+                            start = Offset(x + 1.4f * facing, inset),
+                            end = Offset(x + 1.4f * facing, h - inset),
+                            strokeWidth = 0.8f + 1.2f * facing,
                         )
                     }
                     theta += angPitch
@@ -269,10 +274,10 @@ fun NudgeWheel(
                 )
                 drawRect(
                     brush = Brush.horizontalGradient(
-                        0f to Color.Black.copy(alpha = 0.45f),
-                        0.10f to Color.Transparent,
-                        0.90f to Color.Transparent,
-                        1f to Color.Black.copy(alpha = 0.45f),
+                        0f to Color.Black.copy(alpha = 0.40f),
+                        0.05f to Color.Transparent,
+                        0.95f to Color.Transparent,
+                        1f to Color.Black.copy(alpha = 0.40f),
                     ),
                 )
 

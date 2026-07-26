@@ -33,9 +33,10 @@ constexpr int32_t kSupportedRateHz = 48000;
 constexpr int32_t kSupportedChannels = 1;
 constexpr int32_t kDefaultCommandLatencyMs = 250;
 // Field Test 2: ±750 could not span the observed ~1 s residual lag on
-// Bluetooth routes; widened until the lag's constant component is
-// root-caused and absorbed by calibration.
-constexpr int32_t kNudgeClampMs = 1500;
+// Bluetooth routes. Widened again for the ear-rebase semantics (the shell's
+// engine setpoint = wheel trim + absorbed measurement bias, so it can
+// legitimately exceed the wheel's own ±1500 UI range).
+constexpr int32_t kNudgeClampMs = 4000;
 constexpr int32_t kMaxFramesPerPush = 1 << 16;
 constexpr uint64_t kEstimateEmitPeriodNs = 66'666'667ull;  // ≤ 15 Hz
 // CORE-06 (PM-confirmed 2026-07-22): a fix matching our own commanded
