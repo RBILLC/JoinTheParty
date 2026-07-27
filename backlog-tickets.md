@@ -36,10 +36,10 @@
 | INT-06 | 🟡 06a/06b/06c implemented; **field test 7 passed** FGS start, notification text, Stop action, screen-off + adb-loss survival. Pending: 10-min soak (only ~104 s of music), task-swipe. See docs/field-test-7-int06.md | `729052a` `c29c517` `2f113a9` `1161065` |
 | CAL-01 | 🟡 Code done — chirp now takes Spotify's deep-buffer transport; **headline AC needs the two-phone mic rig** (chirp-reported vs mic-measured) | `5cea89f` |
 | CAL-02 | ✅ Done — shared `dsp/fft` helper, `dsp/lag_window` ported, `lag_analyzer` consumes it (selftest green), new DSP tests | `77144c2` |
-| CAL-03 | ⬜ Not started | — |
+| CAL-03 | ✅ Done — `sc_sample_latency_residual` + `SC_EVT_LATENCY_RESIDUAL`, autocorrelation over the 12 s history, converged-gated, AEC restored on every path, no write to control state | `20ff81e` |
 | CAL-04 | ⬜ Not started | — |
 | CAL-05 | ✅ Done — `sc_get_input_level` + JNI + `SyncEngine.inputLevel()`; idle release measures elapsed time (the assumed 2 ms poll period decayed ~7x too slowly under Windows timer granularity) | `77144c2` |
-| CAL-06 | ⬜ Not started | — |
+| CAL-06 | ✅ Done — phase-word opacity tracks the mic level in LISTENING/MATCHING; draw-phase read so the screen root never recomposes; closes ux-audit gap #8 | `9d2cd48` |
 | CAL-07 | ⬜ Not started | — |
 | CAL-08 | ⬜ Not started | — |
 | CAL-09 | ⬜ Not started | — |
