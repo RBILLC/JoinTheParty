@@ -33,7 +33,7 @@
 | CORE-05 | 🟡 Pipeline done against stub APM (PM decision); un-stub + ≥15dB attenuation AC pending real webrtc-audio-processing | `b344da8` |
 | CORE-06 | ✅ Done — ±30ms guard (PM-confirmed), seek-refreshed reference, headphone bypass, C-API tested; energy condition deferred to real APM | `b344da8` |
 | INT-04 | 🟡 Route→AEC wiring + UI hint done (unit-tested); 10/10 speaker-mode field trials AC needs real APM + device | `b344da8` |
-| INT-06 | 🟡 06a/06b/06c implemented + unit-tested (21/21 JVM); field verification pending (screen-off survival, notification, Stop action) | `729052a` `c29c517` `2f113a9` |
+| INT-06 | 🟡 06a/06b/06c implemented; **field test 7 passed** FGS start, notification text, Stop action, screen-off + adb-loss survival. Pending: 10-min soak (only ~104 s of music), task-swipe. See docs/field-test-7-int06.md | `729052a` `c29c517` `2f113a9` `1161065` |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.

@@ -170,20 +170,25 @@ Read this section before quoting the headline number.
 
 ## Still open
 
-- ~~No foreground service (INT-06)~~ — **implemented, not yet field-verified**
-  (`729052a`/`c29c517`/`2f113a9`). A process-scoped `SessionGraph` now owns the
-  session and a mic-type `SessionForegroundService` holds it up while
-  backgrounded, with a phase/track notification and a Stop action. Needs a
-  device pass: screen-off survival ≥10 min, notification text through the
-  phases, Stop ends the session, task-swipe does not.
+- ~~No foreground service (INT-06)~~ — **implemented and largely field-verified**
+  in [field test 7](field-test-7-int06.md) (`729052a`/`c29c517`/`2f113a9`).
+  Screen-off survival, notification text, and the Stop action all confirmed on
+  device; the session even survived losing adb entirely. Still open: a full
+  10-minute soak (only ~104 s of music before the source ended) and the
+  task-swipe case.
+- **A 205 ms acoustic bias appeared in field test 7 while the engine reported
+  3 ms.** Stable to ±2 ms, output on Android's deep-buffer path. This is the
+  uncalibrated output chain (INT-03 below), now the headline sync defect.
 - ~~`play(uri)` has no same-track guard~~ — **fixed, not yet field-verified.**
   `startPlayback` now compares the resolved URI against what Spotify already
   has loaded; if they match it resumes and aims instead of calling `play(uri)`,
   which restarts at 0:00. Needs an ear on a real recovery to confirm the
   restart is gone.
-- **Output-chain latency never calibrated.** The chirp calibration (INT-03)
-  exists for exactly this and has not been run on this route. Do it before
-  claiming sub-50 ms.
+- **Output-chain latency never calibrated — now measured at ~207 ms.** The
+  chirp calibration (INT-03) exists for exactly this and has never run on any
+  route, because INT-03b (rendering the chirp through the output route) is
+  still a TODO, so the prior stays 0. Field test 7 measured the real figure
+  acoustically. This is the top sync item now.
 - **`consecutiveLosses` is not song-change aware** — three losses without an
   intervening LOCKED land the session in terminal ERROR, which only a user tap
   clears.
