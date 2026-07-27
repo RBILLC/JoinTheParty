@@ -142,6 +142,32 @@ Run it first on any suspicious log — it is far faster than reading the trace.
 4. **Multi-song** — the real bar. Sync must survive two or three consecutive
    songs with no user intervention.
 
+## Reading persisted state off the phone
+
+**Do this before blaming the sync engine.** The app restores a per-route
+engine setpoint every session, and a bad one makes a perfectly healthy engine
+hold a large constant offset — the engine drives its own error to ~0 while the
+microphone measures seconds of lag. Field Test 4 spent two runs chasing a
+"filter divergence" that was a stored −2007 ms.
+
+The tell: `e=` in the CORRECTION log line differs from the fix's `zEnd=` by a
+constant. That constant is `setpoint + output latency`, not a filter bug.
+
+```powershell
+$b64 = adb -t 12 shell "run-as com.jointheparty.app sh -c 'base64 files/datastore/nudge_store.preferences_pb'"
+$bytes = [Convert]::FromBase64String(($b64 -join '').Trim())
+-join ($bytes | ForEach-Object { if ($_ -ge 32 -and $_ -lt 127) { [char]$_ } else { '.' } })
+```
+
+That prints the keys (`trim:`, `setpoint2:`, `outlatency:` per route). To read
+a value, find the key's offset and dump the following bytes: the value is a
+protobuf varint after a `12 <len> 18` prefix, and negative numbers appear as a
+long run of `ff`. `18 a9 f0 ff ff ff ff ff ff ff 01` decodes to −2007.
+
+`adb shell pm clear com.jointheparty.app` wipes this, but it also destroys the
+Spotify auth tokens and forces a re-authorisation through the UI — prefer
+reading the value and fixing the code.
+
 ## Known traps
 
 - **`lag_analyzer.exe` needs the llvm-mingw `bin` on `PATH`** or it fails with

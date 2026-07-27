@@ -81,24 +81,70 @@ wrong. All three are fixed:
   (30 s) exactly equalled the converged fix cadence (`fix_interval_max_ns`,
   30 s), so in steady state every fix bypassed the guard. Now 90 s.
 
+## Two more root causes behind the same symptom
+
+Fixing the self-match guard exposed a residual ~1–2 s lag that persisted, and
+which turned out to be two entirely separate bugs wearing the same costume.
+
+### The correction was computed for the wrong instant
+
+A recognition fix is 0.8–1.9 s old by the time ACRCloud answers. The engine
+computed its seek target from `projected_local_ms(t)` where `t` is the fix's
+**capture** timestamp, so every correction landed that far behind the room —
+and because every correction re-established it, no amount of correcting could
+remove it. The policy already led by the command latency; it also has to lead
+by the recognition round trip. `wk.now_ns` is real session time (continuous
+capture pushes advance it), so the decision now happens at now while the
+observation stays at capture time, where it belongs.
+
+This is the "playing about a second behind" reported since the very first
+field test.
+
+### A poisoned setpoint, read straight off the phone
+
+The decisive measurement. The CORRECTION log line was extended to carry the
+engine state it was computed from, which immediately showed `e=1892` against a
+raw observation of `zEnd=+139` — a constant ~1750 ms gap, not the noisy
+divergence a broken filter produces. Dumping the app's DataStore:
+
+```
+setpoint:speaker  →  −2007 ms
+```
+
+Written by the wheel-rebase runaway before that bug was fixed, restored on
+every session since, and faithfully obeyed: the engine drove **its own** error
+to ~0 while sitting two seconds behind the room. Setting the wheel trim to 0
+never touched it — it lives under a separate key.
+
+Quarantined three ways: the key was renamed (`setpoint2:`) so known-garbage
+values are unreachable, the value is clamped to the wheel's own ±1500 range on
+both save and restore, and committing the wheel at 0 now clears the setpoint
+outright, since the absorbed bias was otherwise invisible and unclearable from
+the UI.
+
+**Lesson for future sessions:** when the engine reports converged but the room
+sounds wrong, read the persisted state before suspecting the filter. A
+constant offset between `e=` and `zEnd=` is stored state, not a filter bug.
+The recipe is in `field-test-protocol.md`.
+
 ## Result
 
-| | acoustic lag (Beosound) |
-|---|---|
-| before | 1168 ms, steady, never converging |
-| after | 64–106 ms |
+| | acoustic lag (Beosound) | engine |
+|---|---|---|
+| before | 1168 ms, steady, never converging | oscillating ±1800 ms |
+| after self-match guard | 64–106 ms, with ~2.5 s excursions | limit cycle every ~29 s |
+| after all three fixes | **62–76 ms, steady** | **LOCKED at −141 ms, zero corrections** |
 
-For reference, the same rig measures ~85 ms of room reverb with nothing
-playing, so the residual is at the noise floor of the measurement.
+The same rig measures ~85 ms of room reverb with nothing playing, so the
+residual is at the noise floor. Engine and microphone now agree, which is the
+real result: the app's own telemetry finally means what it says.
 
 ## Still open
 
-- **Output-latency bias.** The engine reported −705 ms when the mic measured
-  1168 ms — a ~460 ms gap. That is our own output-chain latency (Spotify's
-  reported position leads what is actually audible) and it is not modelled, so
-  the engine converges to a biased setpoint. The chirp calibration (INT-03)
-  exists to measure exactly this; it has never been run on this route. This is
-  the remaining source of the "about a second behind" the ear reports.
+- **Output-latency bias.** Now small enough to be inside the measurement noise
+  floor, but still unmodelled: the chirp calibration (INT-03) exists to measure
+  the output chain per route and has never been run on this one. Worth doing
+  before claiming sub-50 ms.
 - **Spotify autoplays past the room.** When the room's song ends, Spotify
   continues to its own next track, which the room is not playing. Deferred by
   PM decision.
