@@ -39,6 +39,24 @@ Pro's serial contains a space (`... (2)._adb-tls-connect._tcp`), which breaks
 `adb -s` argument parsing. Transport IDs change between sessions — re-read them
 from `adb devices -l` every time.
 
+### When a phone drops off adb (expect this)
+
+Field test 7 lost the Pixel 10 Pro **three times**; its wireless debugging
+switches itself off, and every re-enable assigns a **new port**. Symptoms:
+`device offline`, or `cannot connect … actively refused it (10061)` against
+both the old port and the one mDNS still advertises (mDNS caches a stale port —
+do not trust it).
+
+There is no adb-side fix: wireless debugging must be toggled back on **on the
+phone**, and the new `IP:port` read off its settings screen. `adb kill-server`
+does not help. Budget for this and ask the human early rather than burning the
+run.
+
+**Losing adb does not end a session.** With INT-06's foreground service the app
+keeps listening, playing, and correcting with no debug connection at all — the
+microphone still grades it. Treat a dropout as lost *instrumentation*, not a
+lost run.
+
 ## The microphone
 
 Device name, exactly: `Headset Microphone (Beosound A1 2nd Gen)`
@@ -60,13 +78,24 @@ Two traps, both of which have cost a whole run:
 so the room can be watched **while** the test runs rather than after:
 
 ```bash
-export PATH="$S/toolchain/llvm-mingw-.../bin:$PATH"   # lag_analyzer needs its DLLs
 ffmpeg -hide_banner -loglevel error -f dshow -audio_buffer_size 100 \
-  -i audio="Headset Microphone (Beosound A1 2nd Gen)" \
-  -t 600 -ac 1 -ar 44100 -f s16le - 2>/dev/null \
-  | build/core/lag_analyzer.exe --stream --rate 44100 --channels 1 --min-lag-ms 60 \
+  -i "audio=Headset Microphone (Beosound A1 2nd Gen)" \
+  -ac 1 -ar 48000 -f s16le - \
+  | build/core/lag_analyzer.exe --stream --rate 48000 --max-lag-ms 2500 \
   > "$S/live_lag.csv"
 ```
+
+**The DLL trap.** `lag_analyzer.exe` needs llvm-mingw's `libunwind.dll` and
+`libc++.dll`. Putting the toolchain on `PATH` is *not* enough for a piped
+background job, which does not inherit an interactive `PATH` edit — it fails
+with `error while loading shared libraries: libunwind.dll`, and because the
+failure is on the far side of a pipe, ffmpeg reports a confusing muxer error
+instead. Both DLLs now sit permanently next to the binary in `build/core/`;
+if you rebuild into a clean tree, copy them again.
+
+Omit `-t 600` unless you want the capture to self-terminate — an open-ended
+capture lets one pipeline serve a whole session, and `wc -l` on the CSV gives
+a cheap timeline marker (record the line number when you change something).
 
 Output columns: `t_s,lag_ms,peak_ratio,confident,rms_db`.
 
@@ -75,8 +104,10 @@ Reading it:
   matters. This is what the listener hears.
 - `peak_ratio > 4` sets `confident`. Ratios of 10–30 are typical with both
   phones audible; ignore anything not confident.
-- **Noise floor is ~85 ms** — that is room reverb, measured with nothing
-  playing. Do not read a lag below ~110 ms as a real offset.
+- **Measure the noise floor every session — it moves.** It is room reverb, so
+  it depends on where the phones and mic sit: 85 ms in field test 4-5, but
+  41–51 ms in field test 7. Record it with nothing playing before you join,
+  and judge results against *that* number, not a remembered one.
 - `rms_db` around −37 means both sources are audible. Near −45 with nothing
   playing means the room is silent; check Phone A.
 
@@ -141,6 +172,68 @@ Run it first on any suspicious log — it is far faster than reading the trace.
    `play(uri)` restart from 0:00 (a known unguarded path).
 4. **Multi-song** — the real bar. Sync must survive two or three consecutive
    songs with no user intervention.
+5. **Backgrounded** — screen off for 10+ minutes against a long source, then
+   judge by microphone alone (see the INT-06 section below).
+
+## Two numbers that must agree
+
+Take **both** readings at every checkpoint and write them down together:
+
+| | where |
+|---|---|
+| engine belief | `sync err=…ms` in the `JTP` log |
+| acoustic truth | `lag_ms` in the analyzer CSV, both sources audible |
+
+A **stable gap** between them is not noise — it is a constant the engine cannot
+see, and it points at calibration rather than the filter. Field test 7 read
+`err=3ms` against a microphone-measured 207 ms, flat to ±2 ms across 51
+windows; that constant is the uncalibrated output chain (INT-03), and the
+flatness is what proved tracking was healthy underneath.
+
+Also check which output path Spotify picked, because it changes the constant:
+
+```bash
+adb -t N shell dumpsys audio | grep "state:started"
+#  FLAG_DEEP_BUFFER  -> high-latency path, expect a large constant bias
+```
+
+## Testing the foreground service (INT-06)
+
+The service is what lets the phone be pocketed, so these checks need the screen
+**off** — which also means the mic is your only instrument.
+
+```bash
+# is it actually a mic-type FGS?
+adb -t N shell dumpsys activity services com.jointheparty.app | grep isForeground
+#   isForeground=true foregroundId=1 types=0x00000080   <- 0x80 = MICROPHONE
+
+# what does the notification say?
+adb -t N shell dumpsys notification --noredact | grep "android.text=String"
+
+# screen off, and confirm it
+adb -t N shell input keyevent KEYCODE_SLEEP
+adb -t N shell dumpsys power | grep -m1 mWakefulness=   # expect Dozing/Asleep
+```
+
+**Use a long room source for soak tests.** Field test 7's soak was cut short
+because the room track (4:46) simply ended — a YouTube *mix* or playlist keeps
+the room alive for the full ten minutes. A soak bounded by track length proves
+nothing about the service.
+
+**The Stop action cannot be driven by `am start-service`** — the service is
+correctly `exported="false"`, so the intent is refused with "Requires
+permission not exported from uid". It must be tapped:
+
+```bash
+adb -t N shell cmd statusbar expand-notifications
+# expand the notification (tap its chevron), then scroll the shade —
+# on a Pixel 10 Pro the Stop action sits below the fold
+adb -t N shell input swipe 540 2100 540 1500 300
+```
+
+Verify a Stop actually completed, all three ways — the phase reaches `IDLE`,
+`dumpsys activity services` prints `(nothing)`, and there are zero
+`NotificationRecord` entries for the package.
 
 ## Reading persisted state off the phone
 
