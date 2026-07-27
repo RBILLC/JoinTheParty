@@ -144,7 +144,21 @@ A precision phase-trim control for AV engineers, layered on top of automatic syn
 
 ---
 
-## 9. Data Flow
+## 9. Constraint Handling — Session lifetime (backgrounding)
+
+**Constraint:** the mic capture + correction loop must survive the user backgrounding the app (checking Spotify, locking the phone) or the party experience breaks mid-sync. Android kills backgrounded processes doing mic/CPU work within seconds, and a bound service dies with its last bound client.
+
+### Verdict: **dedicated foreground service (`SessionForegroundService`, type `microphone`) owning only lifetime + notification, session state held separately in a process-scoped `SessionGraph`**
+
+- **Foreground service, not a bound-only service.** A service bound to `MainActivity` dies exactly when we need survival — screen off, task switch. A foreground service with an active notification is the OS-sanctioned way to keep mic capture alive once the Activity is gone.
+- **The service owns lifetime, not state.** `SessionGraph` — process-scoped, anchored in `JoinThePartyApplication` — holds SyncCore, recognition, Spotify controller, and engine lifetime; the service only starts/stops itself and posts the notification. This keeps `SessionViewModel` ignorant of whether a service is running, and lets Activity recreation (rotation, task switch) reattach to the same live session instead of losing it — something today's Activity-owned session cannot do.
+- **`stopWithTask="false"`, notification Stop is the exit.** Letting a task swipe kill the service would silently drop an in-progress sync mid-party — worse than the standard foreground-service behavior of surviving swipe. The notification's Stop action gives the user an explicit way out, so the survival behavior doesn't need fighting.
+- **Alternative rejected — keep-screen-on + Activity-owned lifetime (today's design).** Works only while the Activity survives, which stops being true the moment the OS can background or kill the process (an incoming call, checking another app) — the exact failure this ticket exists to close. It's also the reason the keep-screen-on hack exists; the foreground service makes it unnecessary.
+- **Accepted gap:** a mic-type FGS cannot be *started* from the background on API 34+. Not a problem here — the only start trigger, `startListening`, always fires from a foreground user tap.
+
+---
+
+## 10. Data Flow
 
 ```
                        ┌──────────────────────────────────────────────┐
@@ -176,7 +190,7 @@ One rule governs the diagram: **everything timing-critical lives in SyncCore or 
 
 ---
 
-## 10. Folder Structure
+## 11. Folder Structure
 
 ```
 JoinTheParty/
@@ -200,8 +214,11 @@ JoinTheParty/
 │       └── Bridge/                # Swift ↔ SyncCore interop
 ├── android/
 │   └── app/src/main/
+│       ├── java/.../JoinThePartyApplication.kt  # Application subclass; anchors SessionGraph
 │       ├── java/.../ui/           # Compose screens, nudge wheel
 │       ├── java/.../audio/        # Oboe capture, route observation
+│       ├── java/.../session/      # SessionGraph (process-scoped), SessionViewModel
+│       ├── java/.../service/      # SessionForegroundService, notification
 │       ├── java/.../recognition/  # ShazamKit AAR provider (ACRCloud fallback)
 │       ├── java/.../spotify/      # App Remote controller, PKCE auth
 │       └── cpp/                   # JNI bridge to SyncCore
@@ -215,10 +232,11 @@ JoinTheParty/
 
 ---
 
-## 11. Risks & Open Questions (carry into next phase)
+## 12. Risks & Open Questions (carry into next phase)
 
 1. **Spotify Premium + installed-app requirement** — hard gate; onboarding must detect and explain both.
 2. **App Remote seek granularity/jitter** — the whole design assumes it; validate real-world seek settle-time distributions early with `tools/latency-bench`.
 3. **ShazamKit Android token/quota terms** — confirm commercial usage terms for the Android AAR before launch.
 4. **AEC3 synthesized-reference quality** — the §7 approach needs empirical validation; the recognition-side guard is the safety net if it underdelivers.
 5. **Version mismatch (Shazam catalog audio vs Spotify master)** — ISRC matching minimizes it; the iterative loop absorbs the residual, but quantify typical residuals during testing.
+6. **Backgrounded Spotify consent** — an App Remote reconnect that needs first-run consent while the app is backgrounded fails closed to `needsSpotify`; the session notification is the only recovery signal until the user returns to the foreground (§9, INT-06).

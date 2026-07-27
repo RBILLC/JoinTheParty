@@ -164,6 +164,40 @@ any → lost                  SC_EVT_TRACK_LOST → auto-restart listening (max 
 any → needsSpotify/needsPremium   detected at session start or App Remote connect failure
 ```
 
+### 2.5 Session lifetime & foreground service (Android, INT-06)
+
+- **`SessionGraph`** (`session/SessionGraph.kt`, process-scoped, lazily initialized, anchored in a new `JoinThePartyApplication`): owns SyncCore, `RecognitionProvider`, `HttpBackendClient`, `AudioTrackChirpPlayer`, `AppRemoteSpotifyController`, `NudgeStore`, `AudioRouteObserver`, and a `CoroutineScope(SupervisorJob() + Dispatchers.Default)` — the session's lifetime anchor, replacing `viewModelScope`. Built once per process. **Single-owner rule:** `SessionGraph` is the only caller of `engine.close()`, invoked only once the phase reaches a terminal state (`idle`/`error`, not transient `lost`) **and** `SessionForegroundService` has stopped.
+- **`SessionViewModel`** is re-scoped, not rewritten: same state machine, same tests; takes its scope from `SessionGraph` instead of `androidx.lifecycle.ViewModel` (no more `onCleared` → `engine.close()`), and is itself held by `SessionGraph` so Activity recreation reattaches to the live instance. `MainActivity` stops using `by viewModels { Factory }`.
+- **`SessionForegroundService`** (`service/SessionForegroundService.kt`, `foregroundServiceType="microphone"`): owns foreground lifetime + notification only, never builds or holds the graph.
+  - Start: `startForegroundService`, triggered from `startListening` when phase leaves `idle` (always called while the app is foregrounded — mic-type FGS cannot start from background on API 34+).
+  - Stop: `stopSelf` when phase returns to `idle` or a terminal `error`.
+  - `android:stopWithTask="false"` — task swipe must not kill an active session; the notification's Stop action is the intended exit.
+- **Notification** (one channel `"session"`, `IMPORTANCE_LOW`, silent), built with `NotificationCompat` (already available via `androidx.core.ktx` — no new dependency). Driven by collecting `SessionGraph`'s `SyncState` inside the service's own `CoroutineScope(SupervisorJob() + Dispatchers.Default)` (plain `Service`, not `LifecycleService` — a manual scope avoids pulling in `lifecycle-service` for one collector), throttled to phase changes only, never per-second position:
+
+  ```
+  idle/listening                    → "Listening for a track…"
+  matching                          → "Matching…"
+  aiming/converging                 → "Syncing — <title> · <artist>"
+  locked                            → "Synced — <title> · <artist>"
+  drifting                          → "Re-syncing — <title> · <artist>"
+  lost                              → "Lost the track — retrying"
+  needsSpotify/needsPremium/error   → "Action needed — open JoinTheParty"
+  ```
+
+  Stop action: notification `PendingIntent` → service `ACTION_STOP` intent → `SessionViewModel.reset()`.
+- **Permission matrix:**
+
+  | Permission | Requested by | API level | Denial behavior |
+  |---|---|---|---|
+  | `RECORD_AUDIO` | MainActivity (`registerForActivityResult`, unchanged) | all | session cannot start |
+  | `POST_NOTIFICATIONS` | MainActivity, requested alongside `RECORD_AUDIO` | 33+ | non-fatal — FGS still runs, notification suppressed |
+  | `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MICROPHONE` | manifest only (install-time) | 28+ / 34+ | n/a |
+
+  No `WAKE_LOCK`: the Oboe native audio callback plus FGS priority are sufficient. The keep-screen-on workaround this replaces is removed.
+- **`AppRemoteSpotifyController.activityContext`** moves from `onCreate`/`onDestroy` to `onStart`/`onStop` — set only while the Activity can actually render App Remote's consent UI. Accepted limitation: an App Remote reconnect that needs consent while backgrounded fails closed to `needsSpotify`; the notification's "Action needed" copy is the recovery path.
+- **`AudioRouteObserver`** moves to `SessionGraph` ownership (`applicationContext`), started with the session rather than the Activity.
+- Unaffected: the C ABI (§1) and state machine transitions (§2.4) — SyncCore never learns about Android lifecycles.
+
 ---
 
 ## 3. Authentication & Token Flows
@@ -217,6 +251,8 @@ No user accounts in v1. No audio ever leaves the device except ShazamKit's own s
 | CMake | ≥ 3.28, single `core/CMakeLists.txt` consumed by both mobile builds and desktop test build | — | One build definition; desktop test target runs fixture suite in CI. |
 
 **Version policy:** every third-party is pinned exactly (version catalog / lockfiles / vendored tags). No floating ranges. SyncCore vendored deps upgrade only via PR that runs the desktop fixture-regression suite.
+
+**INT-06 note:** no new dependency. `SessionForegroundService`'s notification uses `NotificationCompat` from `androidx.core.ktx` (already present); the service manages its own `CoroutineScope` rather than adding `androidx.lifecycle:lifecycle-service`.
 
 ---
 
