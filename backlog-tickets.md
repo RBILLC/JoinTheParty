@@ -34,11 +34,11 @@
 | CORE-06 | ✅ Done — ±30ms guard (PM-confirmed), seek-refreshed reference, headphone bypass, C-API tested; energy condition deferred to real APM | `b344da8` |
 | INT-04 | 🟡 Route→AEC wiring + UI hint done (unit-tested); 10/10 speaker-mode field trials AC needs real APM + device | `b344da8` |
 | INT-06 | 🟡 06a/06b/06c implemented; **field test 7 passed** FGS start, notification text, Stop action, screen-off + adb-loss survival. Pending: 10-min soak (only ~104 s of music), task-swipe. See docs/field-test-7-int06.md | `729052a` `c29c517` `2f113a9` `1161065` |
-| CAL-01 | ⬜ Not started | — |
-| CAL-02 | ⬜ Not started | — |
+| CAL-01 | 🟡 Code done — chirp now takes Spotify's deep-buffer transport; **headline AC needs the two-phone mic rig** (chirp-reported vs mic-measured) | `5cea89f` |
+| CAL-02 | ✅ Done — shared `dsp/fft` helper, `dsp/lag_window` ported, `lag_analyzer` consumes it (selftest green), new DSP tests | `77144c2` |
 | CAL-03 | ⬜ Not started | — |
 | CAL-04 | ⬜ Not started | — |
-| CAL-05 | ⬜ Not started | — |
+| CAL-05 | ✅ Done — `sc_get_input_level` + JNI + `SyncEngine.inputLevel()`; idle release measures elapsed time (the assumed 2 ms poll period decayed ~7x too slowly under Windows timer granularity) | `77144c2` |
 | CAL-06 | ⬜ Not started | — |
 | CAL-07 | ⬜ Not started | — |
 | CAL-08 | ⬜ Not started | — |
