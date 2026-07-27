@@ -567,10 +567,8 @@ class SessionViewModel(
     // ---- Calibration (INT-03) ---------------------------------------------
 
     /**
-     * Arms the engine's chirp detector. The shell-side chirp *playback*
-     * (through the active output route) is TODO(INT-03b) — until it exists,
-     * a run with nothing audible ends in the engine's 8 s timeout →
-     * [CalibrationState.Failed], which is the honest outcome.
+     * Arms the engine's chirp detector, then plays the calibration chirp
+     * through the active output route.
      */
     fun startCalibration() {
         if (_syncState.value.calibration == CalibrationState.Running) return
