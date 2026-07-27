@@ -67,8 +67,19 @@ private const val MAX_SAMPLING_ATTEMPTS = 20
  */
 private const val ENGINE_DEADBAND_MS = 350
 
-/** Below this confidence a wheel commit skips the error rebase (§4.4). */
-private const val REBASE_MIN_CONFIDENCE = 0.2f
+/**
+ * Below this confidence a wheel commit skips the error rebase (§4.4).
+ *
+ * FULL-LOOP TEST (2026-07-26): 0.2 caused a runaway — each commit seeks,
+ * seek inflates estimator variance (settling), and the next commit rebased
+ * against the settling transient (conf ~0.3): setpoint −176 → −3133 in five
+ * spins → forced LOST. Settled estimates log conf 0.79–0.83, settling
+ * transients 0.28–0.32; 0.6 splits the two populations cleanly.
+ */
+private const val REBASE_MIN_CONFIDENCE = 0.6f
+
+/** Backstop: one commit may absorb at most this much measured error. */
+private const val REBASE_MAX_MS = 600.0
 
 /** Aim-verification loop (arch §6.2 coarse aim, made deterministic). */
 private const val MAX_AIM_ATTEMPTS = 4
@@ -443,7 +454,7 @@ class SessionViewModel(
         // Audit §4.4: only absorb the measured error when the estimate is
         // fresh enough to mean something; a decayed estimate rebases noise.
         val rebase = if (lastEstimateConfidence >= REBASE_MIN_CONFIDENCE) {
-            lastEstimateErrorMs
+            lastEstimateErrorMs.coerceIn(-REBASE_MAX_MS, REBASE_MAX_MS)
         } else {
             0.0
         }
