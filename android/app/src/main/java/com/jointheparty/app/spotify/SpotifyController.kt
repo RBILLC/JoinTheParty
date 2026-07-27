@@ -62,6 +62,15 @@ interface SpotifyController {
     fun pause(): Boolean
 
     /**
+     * Issues `PlayerApi.resume()`. Returns false if not connected.
+     *
+     * The counterpart to [pause] for the case where the right track is
+     * ALREADY loaded: `play(uri)` would restart it from 0:00, which is
+     * audible, so re-acquiring an existing track resumes it instead.
+     */
+    fun resume(): Boolean
+
+    /**
      * Issues `PlayerApi.seekTo(positionMs)` and MUST echo
      * `sc_notify_seek_issued` (technical-requirements.md §1.2) so the
      * estimator suppresses measurements during the settle window. Returns

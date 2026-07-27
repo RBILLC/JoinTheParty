@@ -112,6 +112,14 @@ decayed to 0.00, playing the wrong song and unable to discover the right one.
 *Fixed:* `1836b30` — a player state naming a track we did not command means
 Spotify auto-advanced; pause, drop the track, re-listen after a quiet window.
 
+**This can only be handled reactively.** App Remote exposes no way to disable
+autoplay, so it cannot be prevented — only detected. Residual cost is up to
+about a second of wrong-song audio before the pause lands. A *preemptive* pause
+at end-of-track was considered and rejected: Spotify's track duration and the
+room's version routinely differ (remaster vs original), so it would pause early
+and churn near the end of every song. Recovery from it is now also quiet,
+because the same-track guard resumes rather than restarting.
+
 ### 5. The guard disarmed itself under noisy data
 The room-timeline anchor re-seeded on **every** accepted fix
 (`room_anchor_confirmed = tracks_room`). When recognition alternated between
@@ -152,9 +160,11 @@ Read this section before quoting the headline number.
 
 - **No foreground service (INT-06).** Pocketing the phone or locking the screen
   kills the session. Biggest demo-vs-product gap.
-- **`play(uri)` has no same-track guard** (`SessionViewModel.kt`, MATCHING-phase
-  re-resolution). Every recovery restarts the track audibly from 0:00 before
-  the aim corrects it.
+- ~~`play(uri)` has no same-track guard~~ — **fixed, not yet field-verified.**
+  `startPlayback` now compares the resolved URI against what Spotify already
+  has loaded; if they match it resumes and aims instead of calling `play(uri)`,
+  which restarts at 0:00. Needs an ear on a real recovery to confirm the
+  restart is gone.
 - **Output-chain latency never calibrated.** The chirp calibration (INT-03)
   exists for exactly this and has not been run on this route. Do it before
   claiming sub-50 ms.

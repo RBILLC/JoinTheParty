@@ -261,8 +261,25 @@ class SessionViewModel(
         viewModelScope.launch(dispatcher) {
             when (val r = controller.connect()) {
                 SpotifyController.ConnectionResult.Connected -> {
-                    com.jointheparty.app.debug.DebugLog.log("Spotify connected → play $uri")
-                    controller.play(uri)
+                    // Re-acquiring the track we are ALREADY on must not call
+                    // play(uri): that restarts it from 0:00, which is plainly
+                    // audible for the ~1 s before the aim drags it back. It
+                    // happens on every recovery — a track-lost, a room gap, a
+                    // Spotify auto-advance we paused out of — because the
+                    // MATCHING branch re-resolves without comparing to what is
+                    // already loaded. Resume and aim instead; the aim below is
+                    // what puts us at the room's position either way.
+                    val loaded = controller.lastKnownPlayerState
+                    if (loaded?.trackUri == uri) {
+                        com.jointheparty.app.debug.DebugLog.log(
+                            "Spotify connected → $uri already loaded; " +
+                                "resume+aim (no restart)",
+                        )
+                        if (loaded.isPaused) controller.resume()
+                    } else {
+                        com.jointheparty.app.debug.DebugLog.log("Spotify connected → play $uri")
+                        controller.play(uri)
+                    }
                     // FIELD TEST 2 FIX (round 1): play(uri) starts from 0:00
                     // — without the arch §6.2 coarse aim the estimator
                     // immediately measures the full song-position error
