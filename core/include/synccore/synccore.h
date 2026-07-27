@@ -168,6 +168,43 @@ sc_status_t sc_get_input_level(sc_session_t*, float* out_level);
 sc_status_t sc_begin_calibration(sc_session_t*);  /* emits SC_EVT_CALIBRATION_RESULT */
 sc_status_t sc_cancel_calibration(sc_session_t*);
 
+/* ---- Acoustic referee (CAL-03, technical-requirements.md §2.6) ---- */
+
+/* Non-RT: requests one referee measurement of the residual acoustic sync
+ * error. The result arrives asynchronously as SC_EVT_LATENCY_RESIDUAL —
+ * this call only enqueues the request; it never blocks and never returns
+ * the measurement directly.
+ *
+ * Single-buffer autocorrelation, no reference signal: runs the ported
+ * lag_analyzer algorithm (dsp/lag_window.h) over the post-AEC capture
+ * history sc_copy_recent_capture already retains (~12 s). No new audio is
+ * captured or played, and sc_push_reference is never consulted — nothing
+ * calls it in production, and it would require a decoded copy of the
+ * room's audio, which is exactly what this measurement doesn't need. The
+ * mic hears two time-shifted copies of the same program material during
+ * speaker/BT-speaker playback (ours and the room's); the lag between them
+ * IS the acoustic sync error a listener perceives. Search range is fixed
+ * at [40, 2500] ms — the 2500 ms ceiling is load-bearing (see the
+ * SC_EVT_LATENCY_RESIDUAL payload doc below) and is not a parameter.
+ *
+ * Gated: SC_EVT_LATENCY_RESIDUAL.valid is false unless the estimator's
+ * current position is converged (LOCKED, i.e. the same condition
+ * SC_EVT_SYNC_ESTIMATE.converged reports) AND the measured peak_ratio
+ * exceeds 4.0. While locked the position error is ~0, so any acoustic gap
+ * this window finds is attributable to output-chain latency, not
+ * estimator error; sampling while unconverged would conflate the two. A
+ * route with no acoustic path back into the mic (e.g. headphones) or a
+ * room that has gone silent or changed tracks naturally fails the
+ * peak_ratio gate on its own — there is no separate route check.
+ *
+ * Forces AEC off for the duration of the sample, then restores whatever
+ * mode was active immediately before — AEC would otherwise cancel the
+ * very echo of our own output this measures. This is a verifier, not a
+ * servo: it never writes output_latency_prior_ms or any other live
+ * control state, only measures and emits. Aggregating repeated samples
+ * into a calibration profile is shell-side (a later ticket). */
+sc_status_t sc_sample_latency_residual(sc_session_t*);
+
 /* ---- Events out ---- */
 
 typedef enum {
@@ -176,7 +213,8 @@ typedef enum {
     SC_EVT_REQUEST_FIX,        /* payload: NULL — run a recognition pass now */
     SC_EVT_FIX_REJECTED,       /* payload: sc_evt_fix_rejected_t */
     SC_EVT_TRACK_LOST,         /* payload: NULL */
-    SC_EVT_CALIBRATION_RESULT  /* payload: sc_evt_calibration_result_t */
+    SC_EVT_CALIBRATION_RESULT, /* payload: sc_evt_calibration_result_t */
+    SC_EVT_LATENCY_RESIDUAL    /* payload: sc_evt_latency_residual_t (CAL-03) */
 } sc_event_type_t;
 
 typedef struct {
@@ -205,6 +243,19 @@ typedef struct {
     int32_t measured_latency_ms;
     bool    valid;
 } sc_evt_calibration_result_t;
+
+/* CAL-03 acoustic referee result (technical-requirements.md §2.6). Emitted
+ * only in response to sc_sample_latency_residual, never spontaneously. */
+typedef struct {
+    int32_t residual_ms;  /* lag between the two capture copies, ms */
+    float   peak_ratio;   /* autocorrelation peak / mean(|autocorrelation|)
+                            * over the search window; > 4.0 required for
+                            * valid (mirrors lag_analyzer's own "found" rule) */
+    bool    valid;         /* false unless converged (LOCKED) AND
+                            * peak_ratio > 4.0; residual_ms/peak_ratio are
+                            * still populated when false so callers can log
+                            * the near-miss, but must not act on them */
+} sc_evt_latency_residual_t;
 
 typedef void (*sc_event_cb)(sc_event_type_t, const void* payload, void* user_data);
 

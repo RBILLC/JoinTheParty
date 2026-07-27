@@ -401,6 +401,14 @@ private class FakeSyncEngine : SyncEngine {
         return true
     }
 
+    var latencyResidualSampled = 0
+        private set
+
+    override fun sampleLatencyResidual(): Boolean {
+        latencyResidualSampled += 1
+        return true
+    }
+
     override fun close() {
         closed = true
     }

@@ -61,6 +61,13 @@ class SyncCore(
         data object TrackLost : Event
 
         data class CalibrationResult(val latencyMs: Int, val valid: Boolean) : Event
+
+        /** CAL-03: emitted only in response to [sampleLatencyResidual]. */
+        data class LatencyResidual(
+            val residualMs: Int,
+            val peakRatio: Float,
+            val valid: Boolean,
+        ) : Event
     }
 
     private val eventFlow = MutableSharedFlow<Event>(
@@ -157,6 +164,14 @@ class SyncCore(
     override fun cancelCalibration(): Boolean = nativeCancelCalibration(handle) == 0
 
     /**
+     * CAL-03: requests one acoustic-referee measurement (technical-
+     * requirements.md §2.6). Fire-and-forget — the result arrives later as
+     * [Event.LatencyResidual] on [events]. Aggregating repeated samples into
+     * a calibration profile is shell-side (CAL-04).
+     */
+    override fun sampleLatencyResidual(): Boolean = nativeSampleLatencyResidual(handle) == 0
+
+    /**
      * Current (possibly learned) Spotify command latency. Persist per
      * device/route and pass back as [commandLatencyPriorMs] next session —
      * PM decision 2026-07-21: learning survives cold starts.
@@ -188,6 +203,7 @@ class SyncCore(
             3 -> Event.FixRejected(RejectReason.entries.getOrElse(i0) { RejectReason.LOW_CONFIDENCE })
             4 -> Event.TrackLost
             5 -> Event.CalibrationResult(i0, i1 != 0)
+            6 -> Event.LatencyResidual(i0, d0.toFloat(), i1 != 0)
             else -> return
         }
         eventFlow.tryEmit(event)
@@ -226,6 +242,7 @@ class SyncCore(
 
     private external fun nativeBeginCalibration(handle: Long): Int
     private external fun nativeCancelCalibration(handle: Long): Int
+    private external fun nativeSampleLatencyResidual(handle: Long): Int
     private external fun nativeGetCommandLatencyMs(handle: Long): Int
     private external fun nativeCopyRecentCapture(
         handle: Long, out: FloatArray, maxFrames: Int, outEndNs: LongArray,

@@ -77,6 +77,14 @@ interface SyncEngine {
     fun beginCalibration(): Boolean
     fun cancelCalibration(): Boolean
 
+    /**
+     * CAL-03: requests one acoustic-referee measurement (technical-
+     * requirements.md §2.6) — fire-and-forget, the result arrives as
+     * [SyncCore.Event.LatencyResidual] on [events]. Aggregating repeated
+     * samples into a calibration profile is shell-side (CAL-04).
+     */
+    fun sampleLatencyResidual(): Boolean
+
     fun notifySeekIssued(targetMs: Long, issuedMonoNs: Long): Boolean
 
     fun notifyLocalPlayback(commandedPositionMs: Long): Boolean

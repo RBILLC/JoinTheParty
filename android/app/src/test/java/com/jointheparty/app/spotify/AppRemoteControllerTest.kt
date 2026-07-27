@@ -98,6 +98,8 @@ private class FakeSyncEngine : SyncEngine {
 
     override fun cancelCalibration(): Boolean = true
 
+    override fun sampleLatencyResidual(): Boolean = true
+
     override fun copyRecentCapture(out: FloatArray): SyncEngine.CaptureWindow? = null
 
     override fun notifySeekIssued(targetMs: Long, issuedMonoNs: Long): Boolean {

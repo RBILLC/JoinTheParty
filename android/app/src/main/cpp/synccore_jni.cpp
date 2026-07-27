@@ -57,6 +57,7 @@ JNIEnv* attached_env() {
 // CORRECTION:         l0=seek_to_ms
 // FIX_REJECTED:       i0=reason
 // CALIBRATION_RESULT: i0=measured_latency_ms i1=valid
+// LATENCY_RESIDUAL:   i0=residual_ms d0=peak_ratio i1=valid
 // REQUEST_FIX / TRACK_LOST: no payload
 void event_trampoline(sc_event_type_t type, const void* payload, void* user) {
     auto* h = static_cast<BridgeHandle*>(user);
@@ -86,6 +87,13 @@ void event_trampoline(sc_event_type_t type, const void* payload, void* user) {
             auto* c = static_cast<const sc_evt_calibration_result_t*>(payload);
             i0 = c->measured_latency_ms;
             i1 = c->valid ? 1 : 0;
+            break;
+        }
+        case SC_EVT_LATENCY_RESIDUAL: {
+            auto* r = static_cast<const sc_evt_latency_residual_t*>(payload);
+            i0 = r->residual_ms;
+            d0 = r->peak_ratio;
+            i1 = r->valid ? 1 : 0;
             break;
         }
         case SC_EVT_REQUEST_FIX:
@@ -317,6 +325,15 @@ Java_com_jointheparty_app_core_SyncCore_nativeGetCommandLatencyMs(
     int32_t out = -1;
     if (sc_get_command_latency_ms(h->session, &out) != SC_OK) return -1;
     return out;
+}
+
+// CAL-03: fire-and-forget request; the measurement itself arrives later as
+// SC_EVT_LATENCY_RESIDUAL through the usual event trampoline above.
+JNIEXPORT jint JNICALL
+Java_com_jointheparty_app_core_SyncCore_nativeSampleLatencyResidual(
+    JNIEnv*, jobject, jlong handle) {
+    auto* h = handle_of(handle);
+    return h ? sc_sample_latency_residual(h->session) : SC_ERR_INVALID_ARG;
 }
 
 // CAL-05: polled getter, mirrors nativeGetCommandLatencyMs's pattern. 0.0f

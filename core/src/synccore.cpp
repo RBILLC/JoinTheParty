@@ -22,6 +22,7 @@
 
 #include "aec/aec.h"
 #include "correlate/correlate.h"
+#include "dsp/lag_window.h"
 #include "estimator/estimator.h"
 #include "policy/policy.h"
 #include "spsc_ring.h"
@@ -82,6 +83,14 @@ constexpr int kMaxConsecutiveSelfRejects = 3;
 constexpr size_t kRingBytes = static_cast<size_t>(kSupportedRateHz) * sizeof(float) * 12;
 // NAT-06b: post-AEC capture history retained for recognition sampling.
 constexpr size_t kHistoryFrames = static_cast<size_t>(kSupportedRateHz) * 12;
+// CAL-03 acoustic referee (technical-requirements.md §2.6): search-window
+// bounds handed to the ported dsp/lag_window.h analyze_window, identical to
+// lag_analyzer's own field-proven CLI defaults.
+constexpr double kResidualMinLagMs = 40.0;
+// LOAD-BEARING — do not widen. At 4000 ms the analyzer locks onto harmonics
+// of the music's own periodicity and reports spurious multi-second lags
+// (docs/sync-test-results.md). 2500 ms is the field-validated ceiling.
+constexpr double kResidualMaxLagMs = 2500.0;
 
 struct Command {
     enum class Kind {
@@ -94,7 +103,8 @@ struct Command {
         kSetAecMode,
         kPushReference,
         kBeginCalibration,
-        kCancelCalibration
+        kCancelCalibration,
+        kSampleLatencyResidual
     } kind;
     sc_recognition_fix_t fix{};
     sc_player_state_t player{};
@@ -124,6 +134,14 @@ struct sc_session {
     // so a session that has never received capture reports silence, not
     // garbage, with no special-casing in the getter.
     std::atomic<float> input_level{0.0f};
+
+    // CAL-03: worker-maintained mirror of the AEC mode currently in effect
+    // (sc_aec_mode_t stored as int32_t), relaxed store by the worker /
+    // relaxed load by the test hook sc_test_get_aec_mode. Exists so a test
+    // can observe from another thread that the referee's forced-OFF window
+    // was correctly restored, without racing the worker's own wk.aec (which
+    // is worker-thread-only, unsynchronized state).
+    std::atomic<int32_t> aec_mode_mirror{static_cast<int32_t>(SC_AEC_PLATFORM_ONLY)};
 
     // NAT-06b capture-history tee: circular buffer of the last ~12 s of
     // post-AEC capture, written by the worker during drain, read by
@@ -188,6 +206,9 @@ struct sc_session {
         // period — see decay_input_level_idle().
         std::chrono::steady_clock::time_point last_level_update =
             std::chrono::steady_clock::now();
+        // CAL-03: reused across calls to avoid a fresh 12 s allocation per
+        // referee sample (sized lazily to kHistoryFrames on first use).
+        std::vector<float> residual_scratch;
     } wk;
 
     std::thread worker;
@@ -524,6 +545,8 @@ struct sc_session {
                 break;
             case Command::Kind::kSetAecMode:
                 wk.aec.set_mode(static_cast<sc_aec_mode_t>(cmd.value_ms));
+                aec_mode_mirror.store(static_cast<int32_t>(cmd.value_ms),
+                                      std::memory_order_relaxed);
                 break;
             case Command::Kind::kPushReference:
                 wk.aec.push_reference(cmd.audio.data(), cmd.audio.size());
@@ -541,6 +564,71 @@ struct sc_session {
                 wk.detector.disarm();
                 std::lock_guard<std::mutex> lock(mtx);
                 calibrating = false;
+                break;
+            }
+            case Command::Kind::kSampleLatencyResidual: {
+                // Gate on convergence FIRST: the estimator's current
+                // projection at session time, the same state
+                // SC_EVT_SYNC_ESTIMATE.converged reports. While locked the
+                // position error is ~0, so any acoustic gap this window
+                // finds is attributable to output-chain latency rather than
+                // estimator error (tech-req §2.6's attribution argument);
+                // sampling while unconverged would conflate the two.
+                //
+                // The analysis still RUNS when unconverged (below) so
+                // residual_ms/peak_ratio are populated for diagnostics —
+                // only the `valid` bit is gated on convergence, matching the
+                // acceptance test's "even with a clean high-peak_ratio
+                // signal present" case.
+                const synccore::Estimate est = wk.estimator.estimate_at(wk.now_ns);
+                const bool converged_locked = est.valid && est.converged;
+
+                // Force AEC off for the sampled window, restore immediately
+                // after. With today's passthrough stub (aec.h) this changes
+                // nothing observable — SC_AEC_FULL doesn't actually cancel
+                // anything yet — but once the real APM lands, leaving AEC on
+                // would cancel the very echo of our own output this
+                // measurement is trying to hear. The referee only measures
+                // and restores; it never leaves the session in a different
+                // AEC state than it found it in.
+                const sc_aec_mode_t prior_aec_mode = wk.aec.mode();
+                wk.aec.set_mode(SC_AEC_OFF);
+                aec_mode_mirror.store(static_cast<int32_t>(SC_AEC_OFF),
+                                      std::memory_order_relaxed);
+
+                // Reads capture history only — no new audio captured or
+                // played. Reuses the public accessor (safe to call from the
+                // worker thread itself: it only takes history_mtx, which the
+                // worker never holds across command processing).
+                if (wk.residual_scratch.size() != kHistoryFrames)
+                    wk.residual_scratch.assign(kHistoryFrames, 0.0f);
+                const int32_t n = sc_copy_recent_capture(
+                    this, wk.residual_scratch.data(),
+                    static_cast<int32_t>(kHistoryFrames), nullptr);
+
+                wk.aec.set_mode(prior_aec_mode);
+                aec_mode_mirror.store(static_cast<int32_t>(prior_aec_mode),
+                                      std::memory_order_relaxed);
+
+                sc_evt_latency_residual_t out{};
+                if (n > 0) {
+                    // Single-buffer autocorrelation, no reference signal
+                    // (tech-req §2.6): the mic hears two copies of the same
+                    // song (ours and the room's); the peak between them is
+                    // the acoustic error a listener perceives.
+                    const synccore::WindowLag lag = synccore::analyze_window(
+                        wk.residual_scratch.data(), static_cast<size_t>(n),
+                        kSupportedRateHz, kResidualMinLagMs, kResidualMaxLagMs);
+                    out.residual_ms = static_cast<int32_t>(std::lround(lag.lag_ms));
+                    out.peak_ratio = static_cast<float>(lag.peak_ratio);
+                    // lag.found already IS "peak_ratio > 4.0" (lag_window.cpp);
+                    // AND it with convergence for the full gate.
+                    out.valid = converged_locked && lag.found;
+                }
+                // Verifier, not a servo: no write to output_latency_prior_ms,
+                // route_latency_prior_ms, the estimator, or the policy —
+                // this command only measures and emits.
+                dispatch(SC_EVT_LATENCY_RESIDUAL, &out);
                 break;
             }
         }
@@ -773,6 +861,14 @@ sc_status_t sc_cancel_calibration(sc_session_t* s) {
     return SC_OK;
 }
 
+sc_status_t sc_sample_latency_residual(sc_session_t* s) {
+    if (!s) return SC_ERR_INVALID_ARG;
+    Command cmd;
+    cmd.kind = Command::Kind::kSampleLatencyResidual;
+    s->enqueue(std::move(cmd));
+    return SC_OK;
+}
+
 sc_status_t sc_set_event_callback(sc_session_t* s, sc_event_cb cb, void* user_data) {
     if (!s) return SC_ERR_INVALID_ARG;
     std::lock_guard<std::mutex> lock(s->mtx);
@@ -790,6 +886,15 @@ void sc_test_stats(sc_session_t* s, uint64_t* frames_consumed,
         *frames_consumed = s->frames_consumed.load(std::memory_order_relaxed);
     if (overrun_blocks)
         *overrun_blocks = s->overrun_blocks.load(std::memory_order_relaxed);
+}
+
+// CAL-03: last AEC mode the worker actually applied — lets a test confirm a
+// sc_sample_latency_residual call restored the prior mode instead of
+// leaving AEC forced off.
+void sc_test_get_aec_mode(sc_session_t* s, sc_aec_mode_t* out_mode) {
+    if (!s || !out_mode) return;
+    *out_mode = static_cast<sc_aec_mode_t>(
+        s->aec_mode_mirror.load(std::memory_order_relaxed));
 }
 
 }  // extern "C"

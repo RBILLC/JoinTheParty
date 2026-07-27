@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "../src/synccore_testing.h"
 #include "correlate/correlate.h"
 #include "synccore/synccore.h"
 
@@ -63,6 +64,21 @@ std::vector<float> pseudo_noise_ref(int samples, uint32_t seed) {
     std::vector<float> ref(static_cast<size_t>(samples));
     for (auto& v : ref) v = 0.5f * rng.next();
     return ref;
+}
+
+// Pseudo-music (low-passed white noise, same idiom as test_lag_window.cpp):
+// CAL-03's referee runs the autocorrelation-based analyze_window, which
+// (per dsp/lag_window.h's "mild whitening" design) is tuned for
+// non-flat-spectrum program material, not raw white noise.
+std::vector<float> pseudo_music(size_t n, uint32_t seed) {
+    std::vector<float> sig(n, 0.0f);
+    Lcg rng(seed);
+    float lp = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        lp += 0.08f * (rng.next() - lp);
+        sig[i] = lp;
+    }
+    return sig;
 }
 
 void test_gcc_phat_accuracy_20db() {
@@ -204,6 +220,212 @@ void test_session_calibration_roundtrip() {
     sc_destroy(s);
 }
 
+// ---- CAL-03 acoustic referee (sc_sample_latency_residual) --------------
+
+struct ResidualLog {
+    std::atomic<int> estimates{0};
+    std::atomic<bool> last_converged{false};
+    std::atomic<bool> got_residual{false};
+    std::atomic<bool> residual_valid{false};
+    std::atomic<int32_t> residual_ms{0};
+    std::atomic<float> peak_ratio{0.0f};
+};
+
+void residual_cb(sc_event_type_t type, const void* payload, void* user) {
+    auto* log = static_cast<ResidualLog*>(user);
+    if (type == SC_EVT_SYNC_ESTIMATE) {
+        auto* e = static_cast<const sc_evt_sync_estimate_t*>(payload);
+        log->last_converged.store(e->converged);
+        log->estimates.fetch_add(1);
+    } else if (type == SC_EVT_LATENCY_RESIDUAL) {
+        auto* r = static_cast<const sc_evt_latency_residual_t*>(payload);
+        log->residual_valid.store(r->valid);
+        log->residual_ms.store(r->residual_ms);
+        log->peak_ratio.store(r->peak_ratio);
+        log->got_residual.store(true);
+    }
+}
+
+// Drives the estimator to LOCKED (converged) the same way
+// test_estimator.cpp's World harness does: a small, constant, in-deadband
+// error across 3 consecutive fixes (EstimatorConfig::convergence_fixes).
+// Player position advances 1:1 from 60 000 ms; each fix reports the
+// external source a fixed 5 ms behind local, well inside the default 25 ms
+// deadband, and each fix continues the SAME room timeline so the CORE-06
+// self-match guard never has a reason to reject one.
+void drive_to_converged(sc_session_t* s, ResidualLog* log, uint64_t* last_t_out) {
+    constexpr uint64_t kSec = 1'000'000'000ull;
+    uint64_t t = 0;
+    for (int i = 1; i <= 3; ++i) {
+        t = static_cast<uint64_t>(i) * 10 * kSec;
+        sc_player_state_t ps{};
+        ps.position_ms = 60'000 + static_cast<int64_t>(t / 1'000'000ull);
+        ps.is_paused = false;
+        ps.received_mono_ns = t;
+        CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+
+        sc_recognition_fix_t fix{};
+        fix.source = SC_FIX_SHAZAMKIT;
+        const double local = 60'000.0 + static_cast<double>(t) / 1e6;
+        fix.match_offset_ms = static_cast<int64_t>(std::llround(local - 5.0));
+        fix.capture_mono_ns = t;
+        fix.confidence = 0.9f;
+        CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+
+        const int before = log->estimates.load();
+        for (int j = 0; j < 400 && log->estimates.load() == before; ++j)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(log->last_converged.load());
+    *last_t_out = t;
+}
+
+// Builds an n-sample capture buffer containing one pseudo-music signal plus
+// a copy of itself delayed by lag_s seconds at half amplitude — the
+// "room + our own output" geometry the referee is meant to detect — and
+// pushes it into the session's capture history in 10 ms blocks starting at
+// start_ns.
+void push_two_copy_capture(sc_session_t* s, double lag_s, double seconds,
+                           uint64_t start_ns, uint32_t seed) {
+    const size_t n = static_cast<size_t>(seconds * kRate);
+    const auto sig = pseudo_music(n, seed);
+    const size_t d = static_cast<size_t>(lag_s * kRate);
+    std::vector<float> mixed(n);
+    for (size_t i = 0; i < n; ++i)
+        mixed[i] = sig[i] + (i >= d ? 0.5f * sig[i - d] : 0.0f);
+
+    const int block = kRate / 100;  // 10 ms
+    const uint64_t block_ns = kSec / 100;
+    uint64_t ts = start_ns;
+    for (size_t off = 0; off + static_cast<size_t>(block) <= mixed.size();
+         off += static_cast<size_t>(block), ts += block_ns)
+        sc_push_capture(s, mixed.data() + off, block, ts);
+}
+
+// Acceptance criterion (backlog CAL-03): a two-copy capture at a known lag,
+// sampled while LOCKED, reports that lag within ±5 ms and valid=true.
+void test_latency_residual_roundtrip() {
+    sc_config_t cfg{};
+    cfg.sample_rate_hz = kRate;
+    cfg.channels = 1;
+    cfg.initial_route = SC_ROUTE_SPEAKER;
+    cfg.output_latency_prior_ms = -1;
+    cfg.command_latency_prior_ms = -1;
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    ResidualLog log;
+    sc_set_event_callback(s, residual_cb, &log);
+
+    uint64_t last_t = 0;
+    drive_to_converged(s, &log, &last_t);
+
+    // 6 s window, 300 ms injected lag — comfortably inside [40, 2500] ms.
+    push_two_copy_capture(s, 0.3, 6.0, last_t + kSec, 777);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // drain margin
+
+    CHECK(sc_sample_latency_residual(s) == SC_OK);
+    for (int i = 0; i < 1000 && !log.got_residual.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    CHECK(log.got_residual.load());
+    CHECK(log.residual_valid.load());
+    CHECK(std::abs(log.residual_ms.load() - 300) <= 5);
+    CHECK(log.peak_ratio.load() > 4.0f);
+
+    sc_destroy(s);
+}
+
+// Gating test (backlog CAL-03): calling sc_sample_latency_residual with NO
+// prior converged==true estimate must yield valid=false even though the
+// capture contains a clean, easily-detected two-copy signal — the
+// convergence gate, not the peak_ratio gate, is what fails here. Exactly
+// one fix is submitted (not enough for the 3-consecutive-fix convergence
+// requirement), so the estimator is valid but never LOCKED.
+void test_latency_residual_gating_unconverged() {
+    constexpr uint64_t kSecLocal = 1'000'000'000ull;
+    sc_config_t cfg{};
+    cfg.sample_rate_hz = kRate;
+    cfg.channels = 1;
+    cfg.initial_route = SC_ROUTE_SPEAKER;
+    cfg.output_latency_prior_ms = -1;
+    cfg.command_latency_prior_ms = -1;
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    ResidualLog log;
+    sc_set_event_callback(s, residual_cb, &log);
+
+    sc_player_state_t ps{};
+    ps.position_ms = 60'000;
+    ps.is_paused = false;
+    ps.received_mono_ns = 10 * kSecLocal;
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+
+    sc_recognition_fix_t fix{};
+    fix.source = SC_FIX_SHAZAMKIT;
+    fix.match_offset_ms = 59'995;  // 5 ms in-deadband, same as the converged path
+    fix.capture_mono_ns = 10 * kSecLocal;
+    fix.confidence = 0.9f;
+    CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    for (int i = 0; i < 400 && log.estimates.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.estimates.load() >= 1);
+    CHECK(!log.last_converged.load());  // one fix: not LOCKED yet
+
+    push_two_copy_capture(s, 0.3, 6.0, 20 * kSecLocal, 778);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    CHECK(sc_sample_latency_residual(s) == SC_OK);
+    for (int i = 0; i < 1000 && !log.got_residual.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    CHECK(log.got_residual.load());
+    CHECK(!log.residual_valid.load());
+    // Confirms this is the convergence gate, not a peak_ratio miss: the
+    // same signal that gates VALID in the roundtrip test still measures a
+    // clean, high peak_ratio here.
+    CHECK(log.peak_ratio.load() > 4.0f);
+
+    sc_destroy(s);
+}
+
+// AEC-mode test (backlog CAL-03): sc_sample_latency_residual forces AEC off
+// for the sampled window and restores the prior mode immediately after,
+// never leaving the session in a different AEC state than it found it in.
+void test_latency_residual_restores_aec_mode() {
+    sc_config_t cfg{};
+    cfg.sample_rate_hz = kRate;
+    cfg.channels = 1;
+    cfg.initial_route = SC_ROUTE_SPEAKER;
+    cfg.output_latency_prior_ms = -1;
+    cfg.command_latency_prior_ms = -1;
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    ResidualLog log;
+    sc_set_event_callback(s, residual_cb, &log);
+
+    CHECK(sc_set_aec_mode(s, SC_AEC_FULL) == SC_OK);
+
+    uint64_t last_t = 0;
+    drive_to_converged(s, &log, &last_t);
+    push_two_copy_capture(s, 0.3, 6.0, last_t + kSec, 779);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    CHECK(sc_sample_latency_residual(s) == SC_OK);
+    for (int i = 0; i < 1000 && !log.got_residual.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(log.got_residual.load());
+
+    // The referee's own SC_EVT_LATENCY_RESIDUAL dispatch happens (on the
+    // worker thread) strictly after it restores the prior mode, so once the
+    // event has landed the restore is guaranteed complete — this is a
+    // post-condition check, not a race against the worker.
+    sc_aec_mode_t mode = SC_AEC_OFF;
+    sc_test_get_aec_mode(s, &mode);
+    CHECK(mode == SC_AEC_FULL);
+
+    sc_destroy(s);
+}
+
 }  // namespace
 
 int main() {
@@ -214,6 +436,9 @@ int main() {
     test_chirp_detector_streaming();
     test_chirp_detector_timeout();
     test_session_calibration_roundtrip();
+    test_latency_residual_roundtrip();
+    test_latency_residual_gating_unconverged();
+    test_latency_residual_restores_aec_mode();
 
     if (g_failures == 0) {
         std::printf("correlate_tests: all tests passed\n");

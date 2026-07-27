@@ -650,6 +650,12 @@ class SessionViewModel(
             // when `recognition` is null.
             SyncCore.Event.RequestFix -> runRecognitionPass()
             is SyncCore.Event.CalibrationResult -> onCalibrationResult(event)
+            // CAL-03: the referee only measures and emits. Nobody calls
+            // engine.sampleLatencyResidual() yet, and aggregating repeated
+            // samples into a CalibrationProfile (agreement across ≥3 valid
+            // windows, drift detection) is CAL-04's job, not the
+            // ViewModel's — so this is deliberately a no-op for now.
+            is SyncCore.Event.LatencyResidual -> Unit
             // INT-02: execute the engine's micro-seek; the controller echoes
             // notifySeekIssued (settle window + latency learning).
             is SyncCore.Event.Correction -> {

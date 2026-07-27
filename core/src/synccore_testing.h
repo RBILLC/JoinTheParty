@@ -17,6 +17,11 @@ extern "C" {
 void sc_test_stats(sc_session_t*, uint64_t* frames_consumed,
                    uint64_t* overrun_blocks);
 
+/* CAL-03: reads the AEC mode currently in effect on the worker. Used to
+ * confirm sc_sample_latency_residual restores the prior mode after its
+ * forced-OFF measurement window. */
+void sc_test_get_aec_mode(sc_session_t*, sc_aec_mode_t* out_mode);
+
 #ifdef __cplusplus
 }
 #endif
