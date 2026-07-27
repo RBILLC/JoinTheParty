@@ -334,11 +334,23 @@ struct sc_session {
                 wk.room_anchor_offset_ms = cmd.fix.match_offset_ms;
                 wk.room_anchor_ns = t;
                 wk.consecutive_self_rejects = 0;
-                const synccore::Estimate est = wk.estimator.estimate_at(t);
-                wk.last_emit_ns = t;
+                // The OBSERVATION belongs at capture time t (above), but the
+                // DECISION belongs at now: a fix is 0.8–1.9 s old by the time
+                // the recognizer answers, and a seek target computed for t
+                // lands that much behind the room. The policy already leads
+                // by the command latency; it must also lead by the
+                // recognition round trip. wk.now_ns is real session time —
+                // continuous capture pushes advance it — so this costs
+                // nothing and keeps the no-clocks-in-the-core rule.
+                //
+                // Field Test 4: this is the systematic ~1 s lag that survived
+                // every other fix, because every correction re-established it.
+                const uint64_t decide_ns = wk.now_ns;
+                const synccore::Estimate est = wk.estimator.estimate_at(decide_ns);
+                wk.last_emit_ns = decide_ns;
                 emit_estimate(est);
                 apply(wk.policy.on_estimate(
-                    est, wk.estimator.projected_local_ms(t), t));
+                    est, wk.estimator.projected_local_ms(decide_ns), decide_ns));
                 command_latency_mirror_ms.store(
                     static_cast<int32_t>(
                         std::lround(wk.policy.command_latency_ms())),

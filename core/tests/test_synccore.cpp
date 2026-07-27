@@ -113,6 +113,8 @@ struct EventLog {
     std::atomic<int> last_reject_reason{-1};
     std::atomic<double> last_error_ms{0.0};
     std::atomic<uint64_t> callback_thread_hash{0};
+    std::atomic<int> corrections{0};
+    std::atomic<int64_t> last_seek_to_ms{0};
 };
 
 void event_cb(sc_event_type_t type, const void* payload, void* user) {
@@ -127,6 +129,10 @@ void event_cb(sc_event_type_t type, const void* payload, void* user) {
         auto* rej = static_cast<const sc_evt_fix_rejected_t*>(payload);
         log->last_reject_reason.store(rej->reason);
         log->rejects.fetch_add(1);
+    } else if (type == SC_EVT_CORRECTION) {
+        auto* corr = static_cast<const sc_evt_correction_t*>(payload);
+        log->last_seek_to_ms.store(corr->seek_to_ms);
+        log->corrections.fetch_add(1);
     }
 }
 
@@ -308,6 +314,65 @@ void test_self_hearing_guard() {
     CHECK(log.rejects.load() == 1);
     const double moved = log.last_error_ms.load();
     CHECK(moved < -1250.0 && moved > -1950.0);
+
+    sc_destroy(s);
+}
+
+// Field Test 4, the systematic ~1 s lag: a recognition fix is 0.8–1.9 s old
+// by the time the recognizer answers. A seek target computed for the fix's
+// CAPTURE time lands exactly that far behind the room, and since every
+// correction re-established it, no amount of correcting ever removed it.
+// The decision must be made at current session time.
+void test_correction_leads_by_recognition_age() {
+    constexpr uint64_t kSec = 1'000'000'000ull;
+    sc_config_t cfg = valid_config();
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    EventLog log;
+    sc_set_event_callback(s, event_cb, &log);
+
+    // Local playback: 10 000 ms at t0, advancing 1:1.
+    const uint64_t t0 = mono_ns();
+    sc_player_state_t ps{};
+    ps.position_ms = 10000;
+    ps.received_mono_ns = t0;
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+
+    // Advance session time to t0 + 6 s the way the shell does it — with
+    // capture. The core reads no clocks; capture timestamps ARE its clock.
+    std::vector<float> block(24000, 0.0f);  // 0.5 s at 48 kHz
+    for (uint64_t k = 1; k <= 12; ++k)
+        sc_push_capture(s, block.data(), 24000, t0 + k * 500'000'000ull);
+    for (int i = 0; i < 200; ++i) {
+        uint64_t end_ns = 0;
+        std::vector<float> sink(1024);
+        if (sc_copy_recent_capture(s, sink.data(), 1024, &end_ns) > 0 &&
+            end_ns >= t0 + 6 * kSec)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    // A fix CAPTURED at t0+5 s (local was 15 000 then) reporting the room at
+    // 13 500 → we are 1 500 ms ahead and must seek back. But by now it is
+    // t0+6 s and local is 16 000, so the target must be computed from 16 000,
+    // not 15 000 — a 1 000 ms difference that is exactly the lag we heard.
+    sc_recognition_fix_t fix{};
+    fix.source = SC_FIX_SHAZAMKIT;
+    fix.match_offset_ms = 13500;
+    fix.capture_mono_ns = t0 + 5 * kSec;
+    fix.confidence = 0.9f;
+    CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    for (int i = 0; i < 400 && log.corrections.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    CHECK(log.corrections.load() == 1);
+    // Session time is the END of the last capture block, so now = t0+6.5 s
+    // and local = 16 500. Correct target: 16 500 + command latency (250) −
+    // 1 500 = 15 250. The capture-time bug gives 15 000 + 250 − 1 500 =
+    // 13 750 — a 1.5 s deficit that lands the phone behind the room and that
+    // the next correction would recreate.
+    const int64_t seek = log.last_seek_to_ms.load();
+    CHECK(seek > 15100 && seek < 15400);
 
     sc_destroy(s);
 }
@@ -519,6 +584,7 @@ int main() {
     test_self_hearing_guard();
     test_self_match_guard_recovers_from_bad_reference();
     test_self_match_guard_ignores_unconfirmed_reference();
+    test_correction_leads_by_recognition_age();
     test_copy_recent_capture();
     test_concurrent_capture_and_control();
 
