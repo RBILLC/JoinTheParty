@@ -1,5 +1,5 @@
 # SyncCore — the single build definition consumed by desktop tests/CI,
-# the iOS build, and the Android externalNativeBuild (architecture-spec §11).
+# the iOS build, and the Android externalNativeBuild (architecture-spec §12).
 cmake_minimum_required(VERSION 3.28)
 
 project(synccore LANGUAGES C CXX)

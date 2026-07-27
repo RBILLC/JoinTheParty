@@ -44,14 +44,14 @@
 ## Epic 0 — Risk & Research (run first; cheap, de-risks everything)
 
 ### RES-01 · Confirm ShazamKit Android commercial terms & quotas
-**Description:** Verify Apple's ShazamKit Android AAR redistribution/commercial terms, request quotas, and token TTL rules (tech-req §3.2, arch §12.3). Outcome is a written go/no-go; fallback decision is ACRCloud.
+**Description:** Verify Apple's ShazamKit Android AAR redistribution/commercial terms, request quotas, and token TTL rules (tech-req §3.2, arch §13.3). Outcome is a written go/no-go; fallback decision is ACRCloud.
 **Acceptance criteria:**
 - Written summary of license terms, quota limits, and token constraints committed to `docs/`.
 - Go/no-go decision recorded; if no-go, ACRCloud selected and NAT-06 re-scoped.
 **Dependencies:** none. **Blocks:** NAT-06, AUTH-04.
 
 ### RES-02 · App Remote seek latency & jitter benchmark
-**Description:** Build `tools/latency-bench`: scripted measurement of Spotify App Remote command→audible latency and seek settle-time distribution on 2 iOS + 2 Android reference devices (arch §12.2). Results set the estimator's priors and settle window.
+**Description:** Build `tools/latency-bench`: scripted measurement of Spotify App Remote command→audible latency and seek settle-time distribution on 2 iOS + 2 Android reference devices (arch §13.2). Results set the estimator's priors and settle window.
 **Acceptance criteria:**
 - Bench rig runs a scripted seek sequence and logs measured latencies to CSV.
 - Distribution report (median/p90) per device committed to `docs/`; default `command_latency_prior_ms` and settle-window values chosen from data.
@@ -62,10 +62,10 @@
 ## Epic 1 — Scaffold & Tokens
 
 ### SCAF-01 · Monorepo scaffold + core build system
-**Description:** Create the repo layout from arch §11 (`core/`, `ios/`, `android/`, `backend/`, `tools/`, `docs/`). Root `core/CMakeLists.txt` (CMake ≥ 3.28) building an empty `synccore` static lib + desktop test target. CI pipeline runs the desktop tests on push.
+**Description:** Create the repo layout from arch §12 (`core/`, `ios/`, `android/`, `backend/`, `tools/`, `docs/`). Root `core/CMakeLists.txt` (CMake ≥ 3.28) building an empty `synccore` static lib + desktop test target. CI pipeline runs the desktop tests on push.
 **Acceptance criteria:**
 - `cmake --build` produces `libsynccore` for host + a runnable (empty) test binary.
-- CI green on a trivial test; folder layout matches arch §11.
+- CI green on a trivial test; folder layout matches arch §12.
 - Version-pin policy files in place (Gradle version catalog stub, vendored `third_party/` README).
 **Dependencies:** none.
 

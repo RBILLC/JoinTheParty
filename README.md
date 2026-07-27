@@ -3,7 +3,7 @@
 Hear a speaker playing music. Open the app. Your Spotify plays the same song,
 in sync, in your ears.
 
-## Repo layout (architecture-spec.md §10)
+## Repo layout (architecture-spec.md §12)
 
 | Path | Contents |
 |---|---|

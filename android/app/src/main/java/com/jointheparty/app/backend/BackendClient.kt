@@ -25,7 +25,7 @@ private const val MOCK_PASS_DELAY_MS = 50L
 
 /**
  * AUTH-03/04: the app-facing seam over the backend service
- * (architecture-spec.md §10's `backend/` — "thin service: token vending,
+ * (architecture-spec.md §12's `backend/` — "thin service: token vending,
  * ISRC→URI cache; nothing latency-critical"). Two endpoints
  * (technical-requirements.md §3.3):
  *
@@ -67,7 +67,7 @@ sealed interface TrackResolution {
  * error mapping, `Dispatchers.IO`).
  *
  * MOCK MODE: [baseUrl] is null in the current state — no backend is
- * deployed yet (architecture-spec.md §10's `backend/` directory has no
+ * deployed yet (architecture-spec.md §12's `backend/` directory has no
  * service running). With a null [baseUrl], every method short-circuits to
  * a canned success (below the `MOCK constants` marker) after a small
  * `delay(50)` so downstream wiring — [com.jointheparty.app.recognition

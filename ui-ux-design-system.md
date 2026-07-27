@@ -15,7 +15,7 @@ The three prior repos (`NYCSmiley`, `space_bet`, `CatPlants`) share an explicit 
 | Old habit | Why it dies | Billet replacement |
 |---|---|---|
 | Flat cold `#121212` + translucent "glass" panels | Reads as software pretending to be a dashboard | Warm near-black base; **opaque matte** surfaces with machined depth (top-edge highlight + soft shadow) |
-| Breathing/pulsing animated backgrounds | Ambient motion = arcade energy | Static background; motion exists only where the user's hand or the sync state causes it |
+| Breathing/pulsing animation as constant decoration | Ambient motion behind playback, or laid over a data-dense surface, reads as arcade energy the moment it never stops | Static in steady state. Ambient motion is welcome in transitional/waiting states — discovery, pairing, listening, matching — where it signals the system working, not mood lighting; prefer driving it from a real signal over letting it free-run (§5) |
 | Cyan/blue brand gradient, taxi yellow | Neon = "crypto bro" signature | One metallic accent (burnished brass), used for exactly one meaning: sync heat |
 | Hairline HUD ticks, corner brackets, `LIVE` tags | Decoration cosplaying as instrumentation | Structure carries meaning or doesn't exist; no badges |
 | JetBrains Mono for every value | Coder-terminal voice | One grotesk family; values are Light-weight tabular numerals, not code |
@@ -110,7 +110,7 @@ Dynamic Type / font scaling: everything scales except `heroMs` (clamped at 1.3×
 
 ## 5. Motion & haptics — "damped mass"
 
-Everything moves like it has weight and a damper. **No looping ambient animation anywhere** (the anti-breathing rule).
+Everything moves like it has weight and a damper. One principle governs when motion is allowed to run on its own: **steady state stays still; transitional and waiting states may breathe.** Once something's locked, settled, or simply there to be read (the session at lock, a list, the caliper scale), motion stops — there's nothing left to signal, only something to look at. While the system is working on something the user is waiting on — device discovery, pairing, listening, matching — ambient motion is welcome, because it *is* information (the system is alive and busy) rather than decoration on top of information. Where a real signal exists, drive the motion from it; free-running motion is the fallback only where no signal exists. The instant a lock happens, ambient motion stops outright and the heat scale (§2) becomes the one living element on screen — the instrument settling, not two things moving at once.
 
 | Token | Spec | Used by |
 |---|---|---|
@@ -149,6 +149,18 @@ Behavior:
 - Below the well: the `heroMs` readout shows signed error (`−12 ms`), live at ≤15 Hz from the `MeterFrame` stream; at lock it reads `in sync` (Light 300, `brass`).
 - `engraved` `+`/`−` labels at the well's right edge mark ahead/behind. Confidence renders as the local line's opacity (0.35 → 1.0) — uncertainty looks *faint*, not flashing.
 - Accessibility: meter state mirrored to an accessibility label ("12 milliseconds behind, converging"); error direction never encoded by color alone (position is the encoding).
+
+**Before the meter — Listening / Matching**
+
+No `MeterFrame` stream exists yet in these phases — there's no fix to report — so the phase word is the entire screen: `title`/`ink2`, centered, with a quiet `Cancel` beneath it in `label`/`ink3`. Copy is confirmed as-is: **"Listening…"**, then **"Matching…"** — plain, and it doesn't oversell what's happening.
+
+A smoothed input-level signal now exists here (≤15 Hz, alongside the meter's own stream family, never in `SyncState`), and Listening/Matching are themselves waiting states — exactly the case §5's motion principle names as welcome. The phase word's opacity tracks it: `ink2` at rest, brightening toward `ink` as level rises, `0.55 + 0.45 × level` (level normalized 0–1), through `settle` (§5, ω=`settleOmega`) so a stray syllable doesn't flicker it — it eases toward the new level and holds, weight responding to loudness rather than jitter. Nothing else moves: no scale, no bounce (arcade), no glow or gradient (retired, §2/§4). No color changes either — these phases have no sync heat yet, so the word stays inside ink/ink2/ink3 throughout; `brass` still means sync confidence alone, nothing else, ever.
+
+At silence the word holds its 0.55 floor — dim, not gone. That dimness *is* the "we can't hear anything" signal, legible without a line of copy. If it never lifts, the existing recognition-timeout backstop already covers the terminal case (`"Couldn't find the song — tap to try again"`, the `ERROR` phase) — no second error string is needed here.
+
+It stops at `AIMING`: once a fix lands and the meter appears, the heat scale becomes the one living element on screen (above), and the phase word's own motion has nothing left to add.
+
+**Reduced Motion**: level no longer drives continuous opacity. It quantizes to two states — dim / bright — and crossfades between them over `reducedMotionCrossfadeMs` (200 ms) only when the state actually changes, rather than tracking continuously.
 
 ### 6.2 The Nudge Wheel — "the trim dial"
 
@@ -190,6 +202,181 @@ Onboarding is **three screens, one sentence each** (listen → match → play in
 4. Never: countdown timers, "unlock" language, feature-gating theatrics, or repeating the gate after dismissal more than once per session.
 
 Errors app-wide follow the same voice: state what happened, state the fix, no apology theater. *"Can't hear the speaker — move closer or turn the music up."*
+
+---
+
+### 6.5 Calibration — provenance, the caliper scale, and the quiet entry point
+
+Reached only from the single quiet entry point behind Settings/calibration/A-B (§4) — never surfaced on the session screen itself. Three provenance classes feed one shared visual language: the caliper scale, used to browse (device shelf), inspect (device detail), and — for By ear — dial in a value (tone-match, below). One signature element carries the whole feature, deliberately: §1's thesis is "a precision instrument you happen to hold," and a caliper *is* that instrument, literally rather than decoratively. No other visual device is introduced anywhere in this section.
+
+**Provenance — three labels, and why they must never render identically**
+
+| Label | What it means | How it's produced | Caliper tell |
+|---|---|---|---|
+| `Measured` | Ground truth: the phone heard its own chirp round-trip through this route. | Acoustic chirp (phone mic + speaker/BT speaker). | Real ticks (1–`maxRetainedSamples`), **solid** hairline. |
+| `By ear` | The user judged it. | Tone-match ritual, or a nudge-wheel trim promoted after repeating (§6.2, below). | Real ticks, **solid** hairline. Accuracy is quoted as ±30 ms in copy, never implied tighter. |
+| `Estimated` | We have not measured this device. A flat placeholder so playback isn't silent while unset — nothing is inferred or computed. | Applied only when the first-contact gate is declined. | Zero ticks, **dashed** hairline. |
+
+Rendering these identically would flatten a real trust gradient: a measured chirp is closer to ground truth than a placeholder nobody's touched. The interface says so without a badge — provenance is carried by the engraved word itself plus the caliper's own tick-count and stroke-style vocabulary (below). No color is spent distinguishing them: color stays reserved for connection-state here and for the heat scale elsewhere in the app (§2).
+
+**The caliper scale — the signature element**
+
+Latency is one scalar, so this is not a scatter plot; it's a single horizontal ms axis, drawn like a vernier scale, that plays two roles — a **read-out** everywhere a value is shown (shelf, detail), and, during tone-match, an **input**: the same axis, dragged instead of read. One component, two modes; the display *is* the control.
+
+- **Axis** — a `hairline` stroke spanning the available width. `0` at the left, `DT.Calibration.scaleRangeMs` (600 ms) at the right, both set in `engraved`/`ink3`, matching the meter's `+`/`−` well-edge labels (§6.1). Linear, not logarithmic: this axis compares devices to a fixed ritual and to each other, not error-around-zero like the meter, so it doesn't need the meter's log compression.
+- **Measurement ticks** — one fine vertical line per retained sample, `DT.Calibration.tickStrokeWidthPt` (1pt) wide, in `ink3` at `DT.Calibration.tickAlpha` (0.35) — the same faint-means-uncertain idiom as the meter's confidence alpha. Where samples agree, their ticks land on the same column and compound under ordinary alpha blending — no stacking logic, just several translucent lines drawn on top of each other, darkening toward `ink` exactly where the device agrees with itself. A wide scatter stays faint and spread; a tight cluster reads as a solid dark band. No number, badge, or word is needed — spread *is* the confidence.
+- **Retention** — up to `DT.Calibration.maxRetainedSamples` (12) most-recent samples, a ring buffer: a stale outlier from a noisier moment ages out on its own, so the strip always reflects current conditions. This is provenance-agnostic — an acoustic chirp reading and a tone-match result are both just ticks to the caliper (see Trim promotion, below, for the wheel's contribution).
+- **Settled line** — the profile's committed value is a single `DT.Calibration.settledLineStrokeWidthPt` (2pt) hairline drawn over the ticks. Its **color** encodes connection state, not provenance: `brass` for the currently connected device (the one warm accent, §2/§4), `ink2` for every other known device — cold shelf, warm now, exactly one warm line on screen at a time. Its **stroke style** encodes provenance instead: **solid** where the line is backed by real ticks (Measured, By ear), **dashed** where it isn't (Estimated) — the honest tell that this number was never actually taken.
+- **Zero / one / many samples**:
+  - *No profile at all* (never seen before the gate ran): no line, no ticks — the row/pane reads "Not calibrated" instead of a provenance word.
+  - *Estimated*: the settled line only, dashed, zero ticks.
+  - *One sample*: a single tick coincident with the settled line — nothing to compound yet, so it reads at full `tickAlpha`, not stacked.
+  - *Many samples*: ticks compound as above; the settled line sits at the profile's committed value (computed elsewhere — a technical-requirements concern), drawn last, on top.
+- **As an input** (tone-match) — same well, same axis, same stroke weights. Instead of a static settled line, a **cursor** in the connected device's line color tracks the user's drag along the 0–600 axis. There is no separate handle or thumb graphic: the line you'll end up looking at forever *is* the thing you're dragging now.
+
+**Device shelf**
+
+One row per known device — name, latency (tabular numerals), provenance, and a compact caliper strip (`DT.Calibration.shelfStripHeightPt`, 20dp — a thumbnail of the detail pane's scale, identical stroke weights, same 0–600 range). Tapping a row opens Device detail.
+
+```
+ Living room speaker                              204 ms
+ MEASURED · measured 2 days ago
+ ┈┈┈┈┈┈┈┈┈┈┈┆┆┃┆┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈   ← brass, solid: connected now
+
+ AirPods Pro                                       182 ms
+ ESTIMATED · not measured yet
+ ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈╌╌╌╌╌╌╌╌╌╌┈┈┈┈┈┈┈┈┈┈┈┈┈   ← ink2, dashed, no ticks: never measured
+
+ Kitchen speaker                                    96 ms
+ BY EAR · set by ear, 6 days ago
+ ┈┈┈┈┈┈┈┆┈┆┈┆┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈   ← ink2, solid, ticks from repeated tone-match
+```
+
+Row anatomy, top to bottom: name in `label`/`ink`; value right-aligned on the same baseline, `label`/`ink`, tabular; provenance line — `engraved`/`ink3` word plus a `fine`/`ink3` qualifier ("measured {relative time}" / "not measured yet" / "set by ear, {relative time}"); the strip, full row width, beneath.
+
+**Empty state** (no known devices yet) — an invitation, not a shrug:
+- Body: *"No devices calibrated yet. Play something through a speaker or headphones and JoinTheParty will get to know it."*
+- Primary: **"Calibrate phone speaker"** — the one device that's always available, so the invitation has somewhere to go immediately.
+
+**Device detail**
+
+```
+                       204 ms
+                       ▔▔▔▔▔▔
+
+ 0                                                     600
+ ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┆┆┆┃┆┆┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+
+ MEASURED · measured 2 days ago
+
+           [ Calibrate again ]
+```
+
+Value in `heroMs` + `heroUnit` (§3), always `ink` — never `brass`, even for the connected device: brass is spent once, on the caliper line, not doubled onto the number (a deliberate call to keep "exactly one warm element" unambiguous rather than having two things both plausibly claim it). Full caliper scale beneath at `DT.Calibration.detailScaleHeightPt` (72dp) in a `recess` well, the same carved-in language as the meter (§6.1). Provenance line as on the shelf. One secondary pill, **"Calibrate again"** — secondary, not primary: arriving here isn't itself a call to redo anything.
+
+Two banners can appear above the action in place of the plain provenance line — never both at once, and neither interrupts playback; both live only inside this deliberately-opened pane:
+
+*Drift* (the referee finds the profile no longer matches reality):
+- Provenance line becomes: *"MEASURED · timing's drifted, worth a redo"*
+- Banner: *"This one's drifted from where we measured it. A quick recalibration will tighten it back up."*
+- Primary: **"Recalibrate"** · Quiet: **"Later"**
+
+*Trim promotion* (repeated manual nudges converge on the same offset):
+- Banner: *"You've nudged this by about −180 ms, three times running. Make that the calibration?"*
+- Primary: **"Use this offset"** · Quiet: **"Keep as is"**
+- On accept: the nudge wheel (§6.2) returns to zero; confirmation in `fine`: *"Folded into the calibration — the wheel's back at zero."* The accepted offset is stored as a By ear tick, same as any tone-match result — the caliper doesn't care how a tick was produced, only whether it agrees with its neighbors.
+
+**Guided calibration**
+
+Extends the existing four-state sheet (Idle / Running / Success / Failed), unchanged in shape: eyebrow `CALIBRATE`, route name as title, one state's copy visible at a time, no progress bar (`CalibrationSheet.kt`). Two route classes now exist.
+
+*Measured — acoustic chirp* (phone speaker, Bluetooth speakers). Unchanged from the shipped copy:
+
+| State | Copy | Action |
+|---|---|---|
+| Idle | "Plays a short tone and measures how long this route takes to make it audible." | Primary **"Start calibration"** |
+| Running | "Listening for the chirp…" | Secondary **"Cancel"** |
+| Success | Title (`brass`): "Latency measured: {ms} ms" · fine: "Saved for this route — sync will aim ahead by it automatically." | Primary **"Done"** |
+| Failed | "Couldn't hear the chirp — turn the volume up and try again." | Primary **"Try again"** · Quiet **"Try by ear instead"** |
+
+The Quiet exit on Failed is new: By ear is a fallback on *every* route, not just headphones.
+
+*By ear — tone-match* (the only headphone flow; also reachable from any acoustic Failed state). Interaction is **adjust-until-aligned**, not tap-along-to-a-beat: tapping measures the user's own reaction time stacked on top of the audio latency, which is a systematic bias in one direction; judging perceptual alignment isn't.
+
+| State | Copy | Action |
+|---|---|---|
+| Idle | "Headphones can't be heard by the phone's mic — so you're the instrument here. We'll play a tone on a loop; drag the mark on the scale until it lands with what you hear." | Primary **"Start"** |
+| Running | Interactive caliper (below), persistent line: "Drag until they land together." | Primary **"That's it"** (enabled after the first drag) · Quiet **"Cancel"** |
+| Success | Title (`brass`): "By-ear offset set: {ms} ms" · fine: "Good to about ±30 ms — enough to keep things tight. Nudge it further anytime from the trim wheel." | Primary **"Done"** |
+| Failed | *(none — every completed attempt produces a usable value; a bad result gets fixed via "Calibrate again," not a retry state)* | — |
+
+Idle copy is deliberately not apologetic — "so you're the instrument here" reframes the mic's limitation as the user's role, the same concierge move already established for the Premium gate (§6.4). Success copy states the ±30 ms figure plainly and never implies laboratory precision.
+
+**The visual beat**
+
+During Running, the interactive caliper plays the tone on a loop, one repetition every `DT.Calibration.toneMatchPeriodMs` (1200 ms). Each repetition, the cursor **strikes**: a hard cut to full `brassBright` for `DT.Calibration.toneMatchStrikeMs` (100 ms), then a hard cut back to resting `brass` — a discrete registration mark, not a fade or a glow. Paired with an `abClick` haptic tick every cycle (§5's existing "rigid click": tone-match is structurally the same gesture as A/B "compare against the room," comparing what you hear against a reference, so the same token is reused rather than inventing a new one). `lockThunk` stays reserved for session sync engagement alone — §5's "signature physical moment" — and isn't spent here. Confirming ("That's it") carries no dedicated haptic: an ordinary pill tap, like every other button in the app.
+
+This is the case §5's motion principle names as welcome: transitional, user-caused, data-driven. Tone-match Running *is* the working state, and the strike is the actual reference signal being judged against — not decoration laid over one.
+
+**What breathes and what stays still, across this section**: the tone-match beat (above) is the only ambient-style motion anywhere in §6.5. The caliper scale itself — on the shelf, in Device detail, and as the tone-match input's resting frame — is a data-dense, steady-state surface; it stays static once its one orchestrated `settle` reveal completes (Motion, below), including while a calibration is running elsewhere in the sheet. At rest it's something to read, not something working.
+
+**Reduced Motion**: the brightness flash is dropped — a strobing strike is a stronger accessibility concern than an eased spring — and replaced by a static engraved-style mark at the cursor's position each cycle; the `abClick` haptic becomes the primary beat reference in its place. The tone itself is unaffected; only the visual strike loses its motion.
+
+**First-contact gate**
+
+Shown once, before playback, when an unknown device becomes the active output. A guided prompt, not a wall — it always offers a way out that doesn't read as failure.
+
+*Acoustic-capable device (phone speaker, Bluetooth speaker):*
+- Title: *"New here: {device name}"*
+- Body: *"A quick calibration keeps everyone in sync on this speaker. Takes about ten seconds."*
+- Primary: **"Calibrate now"** → guided acoustic flow.
+- Quiet: **"Not now"** — fine caption beneath: *"We'll use a generic default until you do."*
+
+*Headphone-class device:*
+- Title: *"New here: {device name}"*
+- Body: *"Headphones can't be heard by the phone's mic — so you're the instrument here. We'll play a tone and you match it by ear. Takes about fifteen seconds."*
+- Primary: **"Calibrate by ear"** → guided tone-match flow.
+- Quiet: **"Not now"** — same fine caption.
+
+Declining either applies `Estimated`, described honestly rather than as a computed guess: the provenance qualifier reads **"not measured yet"** on both the shelf and the detail pane, never "estimated from…" anything. Nothing is inferred automatically anywhere in this system — Estimated is a flat placeholder, and the copy never implies otherwise.
+
+**Drift prompt**
+
+Never a modal interruption mid-party — §4's negative-space rule extends here: nothing competes with the session screen's four elements. The invitation lives entirely inside the shelf/detail pane, visited deliberately:
+- The shelf row's provenance qualifier swaps to *"timing's drifted, worth a redo."*
+- Opening that row's detail pane surfaces the drift banner (specified under Device detail, above).
+
+No push, no toast, no badge count — the same "spread is confidence, not a number" restraint that governs how the caliper looks also governs *when* the prompt is allowed to appear.
+
+**Trim promotion**
+
+Copy and behavior are specified under Device detail, above, as a banner rather than a separate screen — it needs the detail pane's context (which device, what history) to make sense on its own. Ask, never adopt silently; accepting zeroes the wheel and stores the folded offset as a By ear tick.
+
+**Motion**
+
+- Opening the sheet, and swapping shelf → detail → guided panes: `heavy` (§5) — the same spring already used for sheet presentation, reused rather than inventing a second vocabulary for calibration specifically.
+- The caliper's ticks and settled line, on a pane's first appearance: one orchestrated `settle` (ω = `settleOmega`, 14) pass — they rise/fade in together, once, as the pane lands; never re-triggered while the pane stays open.
+- The tone-match strike is the one exception to "everything is a spring": a hard cut by design (above), not a `settle`/`heavy` motion at all.
+- Reduced Motion: springs become a `reducedMotionCrossfadeMs` (200 ms) crossfade, per §5, applied to the pane-open reveal; the strike's reduced-motion behavior is specified above (flash removed outright, not crossfaded — a flash has no meaningful crossfade).
+
+**Tokens (`DT.Calibration`)**
+
+| Token | Value | Role |
+|---|---|---|
+| `scaleRangeMs` | 600 | Caliper axis, 0–600 ms, linear. Shared by every read-out *and* by the tone-match input. |
+| `tickStrokeWidthPt` | 1 | Individual measurement tick. |
+| `tickAlpha` | 0.35 | Per-tick opacity; compounds under ordinary blending where samples agree. |
+| `settledLineStrokeWidthPt` | 2 | Settled value / drag cursor stroke — matches the meter's fused-line weight (§6.1). |
+| `maxRetainedSamples` | 12 | Ring buffer of ticks kept per device, any provenance. |
+| `shelfStripHeightPt` | 20 | Compact caliper on the device shelf. |
+| `detailScaleHeightPt` | 72 | Full caliper well on Device detail. |
+| `toneMatchPeriodMs` | 1200 | Tone/strike repetition interval during By ear calibration. |
+| `toneMatchStrikeMs` | 100 | Duration of the cursor's `brassBright` flash per repetition. |
+| `byEarAccuracyMs` | 30 | The ± figure quoted in By ear success copy — single source for that claim. |
+| `trimPromotionSampleCount` | 3 | Repeats at ~the same offset before the promotion banner offers to adopt it. |
+| `trimPromotionToleranceMs` | 15 | "About the same offset" tolerance band for the count above. |
+| `driftMinSamples` | 3 | Referee measurements required to confirm drift, not just noise. |
+| `driftThresholdMs` | 40 | Deviation from the settled value that qualifies as drift. |
 
 ---
 

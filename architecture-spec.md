@@ -158,7 +158,25 @@ A precision phase-trim control for AV engineers, layered on top of automatic syn
 
 ---
 
-## 10. Data Flow
+## 10. Constraint Handling — Output-chain latency
+
+**Constraint:** `output_chain_latency` (§6.1) can't be measured by one technique for every route — headphones are acoustically invisible to the mic, and the calibration chirp itself was found to be measuring the wrong signal path.
+
+### Verdict: **route-behavior-selected method (MEASURED / BY_EAR / ESTIMATED); chirp forced through the same deep-buffer transport as real playback; perceptual tone-match as the headphone method (and a universal fallback); referee as verifier, not controller**
+
+- **Calibration must traverse the playback path, not shortcut around it.** `AudioTrackChirpPlayer`'s static mono buffer rides Android's fast mixer; Spotify's own audio doesn't (`FLAG_DEEP_BUFFER`, stereo, 44.1 kHz — field-test-7 measured 207 ms acoustic latency there vs. 3 ms engine-reported on the fast-mixer path). A latency number from the wrong path is worse than no number — it's confidently wrong and nothing downstream cross-checks it. Fix is transport-only: same chirp waveform (f0/f1/duration/fades unchanged, so the correlator's reference still matches), `PERFORMANCE_MODE_POWER_SAVING`/`MODE_STREAM`/stereo/44.1 kHz. The tone-match tone (below) rides the same fixed transport for the same reason.
+- **Headphones are structurally unmeasurable, not just hard to measure.** No acoustic signal reaches the mic at any volume — there is nothing to correlate, at any SNR. Rather than gate on a device-class lookup, the guided flow simply *tries* the chirp on every non-speaker route and lets `ChirpDetector`'s existing 8 s arm timeout be the signal: no detection auto-falls to `BY_EAR` tone-match. Zero new API surface, and it's agnostic to what the route actually is (headphones, a muted device, a bad mic day).
+- **Tone-match is adjust-until-aligned, not tap-along.** Tapping in time with a beat measures the user's motor-response latency (~50–100 ms) stacked on top of the audio latency being measured — a second unknown that would need its own calibration. Perceptual alignment (dial an offset until what's heard matches what's seen) has no motor-response term, so the dialled value is a materially cleaner latency estimate. Expected accuracy ±30 ms (human audio/visual alignment tolerance — asymmetric; lag is forgiven more readily than lead) plus one display-frame (~16 ms) carried as a known, accepted systematic term. Offered on every route, not only headphones — a chirp-distrustful user always has an ears-only fallback.
+- **The referee verifies; it does not steer.** Continuously nudging `output_latency_prior_ms` from the acoustic residual was rejected: the residual is attributable to output latency only while the estimator is LOCKED and converged (§6.2's deadband means position error is near-zero then); sampling while converging/drifting would fold position error into a latency correction, and the two failure modes become indistinguishable. The referee instead samples periodically while locked, requires agreement across ≥3 windows plus its own `peak_ratio` confidence gate, and only ever writes to the stored profile — never the live prior. A drifted profile prompts a UI-level redo instead of auto-correcting silently.
+- **The referee autocorrelates the capture alone — there is no reference signal.** SyncCore has no decoded copy of what Spotify is playing (exactly why AEC is a passthrough stub, §7) and `sc_push_reference` is never called in production, so a reference cross-correlation was never buildable. Instead: while playing through a speaker/BT-speaker route, the mic hears two copies of the same song — ours and the room's. Autocorrelating the 12 s post-AEC capture history (`sc_copy_recent_capture`) via a ported `analyze_window`/`lag_analyzer` module finds the peak at the lag between those two copies — the acoustic error a listener actually perceives, and the exact technique that has graded every field test to date.
+- **Eligibility and self-invalidation fall out of the signal, not a route check.** Headphones put no copy of our audio into the mic, so there's no second peak and `peak_ratio` fails by construction — cheaper to skip early via a cached `acousticallyReachable` flag, but the `peak_ratio` gate is the real mechanism. The same gate protects against a silent or track-changed room: a low-lag reading with only one source playing is reverb, not sync (field testing's ~85 ms reverb noise floor with nothing playing) — `peak_ratio`, not the lag value, is what tells the two apart.
+- **Search range 40–2500 ms, and the ceiling is load-bearing.** Widening past 2500 ms lets the analyzer lock onto harmonics of the music's own periodicity — spurious multi-second readings, observed in field testing at a 4000 ms ceiling.
+- **Alternative rejected — A2DP codec-class latency priors.** Considered for headphone routes: an SBC/AAC/aptX/LDAC seed table via `BluetoothCodecStatus` (API 28+, needs `BLUETOOTH_CONNECT`). Rejected — codec name alone doesn't fix latency, chipset and firmware do, so the table would buy a confident-looking number with no way to verify it, behind a permission and an OS floor, for a value that's still a guess. Deferred, not cancelled (risk §13.7).
+- **Alternative rejected — always play a mid-session verification chirp.** Works, but is audible and disruptive; passive autocorrelation of capture data the mic is already producing wins.
+
+---
+
+## 11. Data Flow
 
 ```
                        ┌──────────────────────────────────────────────┐
@@ -190,7 +208,7 @@ One rule governs the diagram: **everything timing-critical lives in SyncCore or 
 
 ---
 
-## 11. Folder Structure
+## 12. Folder Structure
 
 ```
 JoinTheParty/
@@ -201,7 +219,10 @@ JoinTheParty/
 │   │   ├── estimator/             # Kalman filter, drift model
 │   │   ├── policy/                # correction policy, deadband, self-hearing guard
 │   │   ├── aec/                   # WebRTC AEC3 wrapper, reference synthesis
-│   │   ├── correlate/             # GCC-PHAT, chirp calibration
+│   │   ├── correlate/             # GCC-PHAT, chirp calibration, latency-
+│   │   │                          #   residual referee (ported from
+│   │   │                          #   lag_analyzer.cpp), shared kissfft
+│   │   │                          #   alloc/pad/fwd/inv helper
 │   │   └── clock/                 # monotonic timebase, latency bookkeeping
 │   ├── third_party/               # webrtc-apm, kissfft (vendored, pinned)
 │   └── tests/                     # desktop unit tests w/ recorded audio fixtures
@@ -232,7 +253,7 @@ JoinTheParty/
 
 ---
 
-## 12. Risks & Open Questions (carry into next phase)
+## 13. Risks & Open Questions (carry into next phase)
 
 1. **Spotify Premium + installed-app requirement** — hard gate; onboarding must detect and explain both.
 2. **App Remote seek granularity/jitter** — the whole design assumes it; validate real-world seek settle-time distributions early with `tools/latency-bench`.
@@ -240,3 +261,4 @@ JoinTheParty/
 4. **AEC3 synthesized-reference quality** — the §7 approach needs empirical validation; the recognition-side guard is the safety net if it underdelivers.
 5. **Version mismatch (Shazam catalog audio vs Spotify master)** — ISRC matching minimizes it; the iterative loop absorbs the residual, but quantify typical residuals during testing.
 6. **Backgrounded Spotify consent** — an App Remote reconnect that needs first-run consent while the app is backgrounded fails closed to `needsSpotify`; the session notification is the only recovery signal until the user returns to the foreground (§9, INT-06).
+7. **Flat `ESTIMATED` default (150 ms) absorbs real per-device error.** v1 defers per-codec/per-device latency detection (considered and dropped — see §10) in favor of one generic value plus user-driven `BY_EAR` tone-match. Devices far from 150 ms (e.g., aptX LL, nearer 40 ms) get a materially wrong coarse aim until the user calibrates. Revisit a per-codec or per-device-name prior table if field telemetry shows `ESTIMATED` sessions taking meaningfully longer to converge.

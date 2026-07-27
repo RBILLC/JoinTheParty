@@ -136,6 +136,13 @@ MeterFrame  = { errorMs: Double, driftPpm: Double, confidence: Float, converged:
 
 **Requirement — two streams, not one.** `SyncState` (low-frequency, drives layout/navigation) and `MeterFrame` (≤15 Hz, drives the sync meter + wheel readout) are separate observable streams. Meter updates MUST NOT trigger recomposition/re-render of the session screen — only of the meter canvas.
 
+**Requirement — input level, a third signal that's never gated on a fix.** `SC_EVT_SYNC_ESTIMATE` doesn't fire until the first recognition fix lands, so the meter stream is dormant through all of `listening`/`matching` — exactly the phases where the user is waiting to learn whether the mic can hear anything (docs/ux-audit-2026-07.md #8; drives a mic-reactive treatment of the phase word).
+- **`sc_status_t sc_get_input_level(sc_session_t*, float* out_level)` — a polled getter, not a new event.** The worker's event channel is estimate-driven; making it emit before a fix exists would special-case every consumer. A getter needs no such gating and reports silence for free when capture is stopped or the session is idle — nothing to suppress.
+- **Units:** normalized `0..1` smoothed level, not dBFS — the shell drives a visual treatment directly off the value, so `0..1` needs no log/clamp step on the far side. Ballistics: attack ~10 ms / release ~300 ms exponential envelope so the UI doesn't jitter per-sample.
+- **Computed in the worker**, alongside the existing post-AEC history append (`append_history`, called right after `aec.process_capture`, synccore.cpp:210/214) — same buffer, no new tap, no RT-thread involvement. Written into a `std::atomic<float>` (relaxed store); `sc_get_input_level` does a relaxed load — no lock, no allocation, safe to poll from any thread. Never touches the RT audio callback or ring buffer.
+- **Independent of calibration and the estimator** — valid whenever capture is running: before the first fix, during calibration, before and after lock.
+- **Kotlin seam:** `SyncEngine.inputLevel(): Flow<Float>`, polled at ≤15 Hz — explicitly part of the high-frequency stream family alongside `MeterFrame` (same §2.1 rule), never folded into `SyncState`, never observed by the session screen root.
+
 ### 2.2 iOS (SwiftUI)
 
 - `SessionStore`: `@Observable` (Observation framework), `@MainActor`. Owns the `SessionPhase` state machine; sole writer of `SyncState`.
@@ -198,6 +205,63 @@ any → needsSpotify/needsPremium   detected at session start or App Remote conn
 - **`AudioRouteObserver`** moves to `SessionGraph` ownership (`applicationContext`), started with the session rather than the Activity.
 - Unaffected: the C ABI (§1) and state machine transitions (§2.4) — SyncCore never learns about Android lifecycles.
 
+### 2.6 Per-device calibration profiles
+
+**Scope.** Calibration establishes `output_chain_latency` (arch §6.1) for the *playback* path only. Recognition reads the mic, not the speaker, so an uncalibrated device never blocks or degrades song identification — only the initial seek aim and the referee's residual tracking.
+
+**Method taxonomy (`CalibrationProfile.method`):**
+
+| Method | Mechanism | When |
+|---|---|---|
+| `MEASURED` | Acoustic chirp round-trip (`sc_begin_calibration`, GCC-PHAT) | Speaker always; wired/Bluetooth attempted first |
+| `BY_EAR` | Tone-match calibration, or a promoted wheel trim (below) | Wired/Bluetooth when the chirp goes undetected; always available as a fallback |
+| `ESTIMATED` | Single generic default, no measurement | User declines the first-contact gate entirely |
+
+- **No device-class permission or lookup.** Wired and Bluetooth routes are ambiguous (could be a speaker or headphones) but the guided flow doesn't try to classify them — it attempts `MEASURED` unconditionally. `ChirpDetector`'s existing 8 s arm timeout with no detection *is* the "this is headphones" signal, and auto-transitions the flow to `BY_EAR`. `SC_ROUTE_SPEAKER` always attempts `MEASURED` (mic guaranteed to hear the phone's own speaker).
+- **`ESTIMATED` default: 150 ms**, applied to `output_latency_prior_ms` when the user cancels calibration. Centered on the common case (Bluetooth SBC/AAC and the deep-buffer speaker path), one value for every route class — v1 does not attempt per-codec detection (considered and dropped, see arch §10 / §13.7). Labelled "not yet calibrated" in the UI, not a measurement.
+
+**Tone-match (`BY_EAR`) mechanism.** The app plays a short periodic tone through the active route (same fixed deep-buffer/stream/stereo/44.1 kHz transport as the chirp fix below — a wrong-path tone gives a wrong-path offset, same failure mode as the original chirp bug) while showing a synchronized visual beat. The user **adjusts an offset control until the heard tone coincides with the seen beat**; the dialled value becomes `latencyMs`.
+- **Adjust-until-aligned, not tap-along, by design.** Tap-along measures the user's motor-response latency (~50–100 ms) stacked on the audio latency being measured — a second unknown needing its own calibration. Perceptual alignment has no motor-response term, so it's a materially cleaner estimate.
+- **Accuracy bound: ±30 ms**, human audio/visual alignment tolerance (asymmetric — lag forgiven more readily than lead), stated as the method's expected accuracy, not hidden as false precision. One display-frame (~16 ms) is a known, accepted systematic term on top.
+- Available on any route, not just headphones/wired/Bluetooth — an explicit alternative for a user who distrusts the `MEASURED` chirp result.
+
+**Chirp path fix (correctness bug).** `AudioTrackChirpPlayer` currently plays `MODE_STATIC` mono 48 kHz — Android's fast-mixer path, a different route than Spotify's own playback (observed `FLAG_DEEP_BUFFER`, stereo, 44.1 kHz; field-test-7 measured 207 ms acoustic vs. 3 ms engine-reported). Fix: request `PERFORMANCE_MODE_POWER_SAVING`, `CONTENT_TYPE_MUSIC`, stereo, 44.1 kHz, `MODE_STREAM`, large buffer — the same deep-buffer path Spotify uses. Chirp waveform (f0/f1/duration/fades) is unchanged, so the correlator's reference still matches; only the transport changes. A calibration number from the wrong path is worse than no calibration — it is confidently wrong.
+
+**Referee (verifier, not a servo).** Port `analyze_window`/`next_pow2` from `core/tools/lag_analyzer.cpp` into a new module under `core/src/correlate/`; factor the kissfft alloc/pad/forward/inverse pattern duplicated between `correlate.cpp` and the ported code into one shared internal FFT helper (no shared helper exists today).
+- **Single-buffer autocorrelation, not a reference cross-correlation.** `analyze_window(const float* x, size_t n, int rate, double min_lag_ms, double max_lag_ms)` takes exactly one buffer — it is what `lag_analyzer` has used to grade every field test. The mic hears two copies of the same song during speaker/BT-speaker playback (ours and the room's); autocorrelating that single capture produces a peak at the lag between them, which *is* the acoustic sync error a listener perceives. No reference signal is needed or used. (An earlier draft of this spec proposed cross-correlating against `sc_push_reference` — wrong on two counts: nothing calls `pushReference` in production, per `docs/aec-implementation-review.md`'s open-follow-up list, and it would require a decoded copy of Spotify's audio, which is exactly what we don't have and the reason AEC is a passthrough stub.)
+- New C ABI: `sc_status_t sc_sample_latency_residual(sc_session_t*)` — non-RT. Runs the ported `analyze_window` over `sc_copy_recent_capture`'s 12 s post-AEC buffer, `min_lag_ms=40, max_lag_ms=2500` (the field-proven bounds from `lag_analyzer`'s CLI defaults). **The 2500 ms ceiling must not be widened:** at 4000 ms the analyzer locks onto harmonics of the music's own periodicity, producing spurious multi-second readings (`docs/sync-test-results.md`). No new audio is captured or played. Emits `SC_EVT_LATENCY_RESIDUAL { int32_t residual_ms; float peak_ratio; bool valid; }`.
+- **Gating (in SyncCore):** `valid=false` unless `SC_EVT_SYNC_ESTIMATE.converged` is currently true (LOCKED) and `peak_ratio > 4.0` (mirrors `lag_analyzer`'s own `found` rule). `sc_set_aec_mode(SC_AEC_OFF)` for the sampled window, restored after — AEC would otherwise cancel the very echo of our own output the residual measures (a documented no-op today against the AEC stub; correct once the real APM lands).
+- **Attribution argument.** While locked, the seek target is known-accurate, so the position error is ~0; any acoustic gap the autocorrelation finds between our output and the room's is therefore attributable to `output_chain_latency`, not to estimator position error. Sampling while unconverged would conflate the two and corrupt the profile.
+- **Eligibility falls out of the signal itself.** Headphones put no copy of our audio into the mic, so there is no second peak to find — `valid=false` by construction, not by a route check. `acousticallyReachable` (below) is a cached optimisation to skip sampling headphone routes early, not the actual safety mechanism; the `peak_ratio` gate is.
+- **A stopped or changed room source self-invalidates.** If the room goes silent or switches tracks there's no coherent second copy in the capture, so `peak_ratio` fails the threshold and the window is discarded. This is load-bearing: field testing found a low-lag reading with only ONE source playing is meaningless — it's reverb, not sync (`docs/sync-test-results.md`'s ≈85 ms reverb noise floor with nothing playing). The `peak_ratio` gate, not the lag value itself, is what keeps the referee from mistaking reverb for a measurement.
+- **Aggregation is shell-side** (SyncCore stays stateless about profiles): the shell calls `sc_sample_latency_residual` periodically while locked and requires agreement across **≥3 valid windows** before writing one sample into the profile's ring. The referee never adjusts the live `output_latency_prior_ms`; it only appends samples and, when a sample's residual exceeds ±50 ms of the profile's current `latencyMs`, sets `drifted=true` so the UI can prompt a redo.
+
+**Profile record** replaces the flat `outlatency:<routeId>` Int key (left orphaned — precedent is no migration). New `stringPreferencesKey("calibration_profile:<routeId>")`, JSON via `gson` (already a dependency):
+
+```
+CalibrationProfile {
+  schemaVersion: Int             // = 1
+  routeId, routeClass, deviceName: String
+  method: MEASURED | BY_EAR | ESTIMATED
+  latencyMs: Int
+  confidence: Float              // [0,1]
+  sampleCount: Int
+  acousticallyReachable: Boolean // true once a chirp has ever been detected on this routeId; lets the
+                                  //   shell skip sampling headphone routes early — a cached optimisation,
+                                  //   not the safety mechanism (that's the referee's own peak_ratio gate)
+  createdAtMs, updatedAtMs: Long
+  refereeSamples: [{ residualMs: Int, atMs: Long }]  // bounded ring, cap 20
+  drifted: Boolean
+}
+```
+One JSON blob per route — a single atomic write. `NudgeStore`'s five independent Int keys can't be written atomically, and a partially-written profile would be indistinguishable from a valid one.
+
+**Trim promotion.** ≥3 wheel-trim commits on the same routeId, all within ±25 ms of their median, `|median| > 30 ms` (above the 25 ms correction deadband, arch §6.1) → prompt "use this as your calibration for `<device>`?" — never adopt silently. Accept: fold the median into `latencyMs`, set `method = BY_EAR`, reset the wheel trim to 0 (keeps the wheel's centre meaningful). Decline: suppress the prompt for that routeId for a 7-day cooling-off period.
+
+**First-contact gate.** Unknown routeId (no profile) at session start → guided calibration runs before playback starts (recognition proceeds unaffected). The flow attempts `MEASURED`; on wired/Bluetooth it auto-falls to `BY_EAR` on chirp-detection timeout. The user may cancel either flow → `ESTIMATED` (150 ms default) and the profile is written with `sampleCount=0` so the UI can re-offer calibration next session.
+
+**Unchanged:** the state machine (§2.4) and the C ABI's "SyncCore never reads clocks" rule — the referee is a measurement consumer of existing capture/reference data, not a new control path.
+
 ---
 
 ## 3. Authentication & Token Flows
@@ -222,7 +286,7 @@ any → needsSpotify/needsPremium   detected at session start or App Remote conn
   1. App calls `POST /v1/tokens/shazam` (authenticated by app attestation — Play Integrity / App Attest).
   2. Backend mints JWT: `alg=ES256`, `kid=<key id>`, `iss=<team id>`, TTL **24 h** (Apple allows up to 6 months; we vend short).
   3. App caches in memory + `EncryptedSharedPreferences`, refreshes on 401/`InvalidToken` or expiry−1 h.
-- Rate/quota: ShazamKit Android has request quotas per developer account — recognizer must reuse one session per sync session and respect SyncCore's `SC_EVT_REQUEST_FIX` cadence (no free-running recognition loops). Confirm commercial terms (spec §11.3) before launch — **blocking ticket**.
+- Rate/quota: ShazamKit Android has request quotas per developer account — recognizer must reuse one session per sync session and respect SyncCore's `SC_EVT_REQUEST_FIX` cadence (no free-running recognition loops). Confirm commercial terms (arch §13.3) before launch — **blocking ticket**.
 
 ### 3.3 Backend surface (thin, v1)
 
@@ -253,6 +317,8 @@ No user accounts in v1. No audio ever leaves the device except ShazamKit's own s
 **Version policy:** every third-party is pinned exactly (version catalog / lockfiles / vendored tags). No floating ranges. SyncCore vendored deps upgrade only via PR that runs the desktop fixture-regression suite.
 
 **INT-06 note:** no new dependency. `SessionForegroundService`'s notification uses `NotificationCompat` from `androidx.core.ktx` (already present); the service manages its own `CoroutineScope` rather than adding `androidx.lifecycle:lifecycle-service`.
+
+**Calibration note (§2.6):** no new dependency and no new permission. Profile records serialize with `gson` (already present) into a `stringPreferencesKey`; the referee reuses the already-vendored KissFFT via the new shared FFT helper. v1 explicitly drops the A2DP-codec-based latency seed (would have required `BluetoothCodecStatus`, API 28+, and `BLUETOOTH_CONNECT`) in favor of a single generic `ESTIMATED` default plus user-driven `BY_EAR` tone-match — deferred, not cancelled (arch §13.7).
 
 ---
 
