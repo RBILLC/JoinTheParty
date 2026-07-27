@@ -77,6 +77,9 @@ private class FakeSyncEngine : SyncEngine {
     override val meterFrames: Flow<SyncCore.Event.SyncEstimate> =
         events.filterIsInstance<SyncCore.Event.SyncEstimate>().conflate()
 
+    // CAL-05: inert stand-in, unused by anything under test in this file.
+    override fun inputLevel(): Flow<Float> = kotlinx.coroutines.flow.flowOf(0f)
+
     val notifySeekIssuedCalls = mutableListOf<Pair<Long, Long>>()
     val notifyLocalPlaybackCalls = mutableListOf<Long>()
     val submitPlayerStateCalls = mutableListOf<Triple<Long, Boolean, Long>>()

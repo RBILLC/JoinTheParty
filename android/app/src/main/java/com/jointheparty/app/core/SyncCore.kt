@@ -2,6 +2,7 @@ package com.jointheparty.app.core
 
 import androidx.annotation.Keep
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -73,6 +74,20 @@ class SyncCore(
     /** ≤15 Hz estimate stream for the sync meter; conflated per collector. */
     override val meterFrames: Flow<Event.SyncEstimate> =
         events.filterIsInstance<Event.SyncEstimate>().conflate()
+
+    /**
+     * CAL-05: cold poll loop over `sc_get_input_level`, same idiom as
+     * SessionViewModel.playbackPositionMs — starts on collection, stops the
+     * instant collection stops, no shared/hot state to leak between
+     * collectors. [INPUT_LEVEL_POLL_INTERVAL_MS] keeps cadence comfortably
+     * under the ≤15 Hz ceiling (technical-requirements.md §2.1).
+     */
+    override fun inputLevel(): Flow<Float> = kotlinx.coroutines.flow.flow {
+        while (true) {
+            emit(nativeGetInputLevel(handle))
+            delay(INPUT_LEVEL_POLL_INTERVAL_MS)
+        }
+    }
 
     private var handle: Long
 
@@ -215,8 +230,13 @@ class SyncCore(
     private external fun nativeCopyRecentCapture(
         handle: Long, out: FloatArray, maxFrames: Int, outEndNs: LongArray,
     ): Int
+    private external fun nativeGetInputLevel(handle: Long): Float
 
     companion object {
+        // ≤15 Hz per technical-requirements.md §2.1 (period must be
+        // >= 66.667 ms); 70 ms (~14.3 Hz) keeps clear margin.
+        private const val INPUT_LEVEL_POLL_INTERVAL_MS = 70L
+
         init {
             System.loadLibrary("synccore_jni")
         }

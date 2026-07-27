@@ -17,6 +17,8 @@ add_library(synccore STATIC
     src/estimator/estimator.cpp
     src/policy/policy.cpp
     src/correlate/correlate.cpp
+    src/dsp/fft.cpp
+    src/dsp/lag_window.cpp
     src/aec/aec.cpp
     third_party/kissfft/kiss_fft.c
     third_party/kissfft/kiss_fftr.c
@@ -78,13 +80,16 @@ if(SYNCCORE_BUILD_TESTS)
     synccore_add_test(estimator_tests tests/test_estimator.cpp)
     synccore_add_test(policy_tests tests/test_policy.cpp)
     synccore_add_test(correlate_tests tests/test_correlate.cpp)
+    synccore_add_test(input_level_tests tests/test_input_level.cpp)
+    synccore_add_test(dsp_tests tests/test_lag_window.cpp)
 
     # Field-test ground-truth tool (desktop only): windowed autocorrelation
-    # over a PC-mic recording of two devices playing the same song.
+    # over a PC-mic recording of two devices playing the same song. Consumes
+    # the core-owned dsp/lag_window module (CAL-02) — no FFT code of its own.
     add_executable(lag_analyzer tools/lag_analyzer.cpp)
     target_link_libraries(lag_analyzer PRIVATE synccore)
     target_include_directories(lag_analyzer
-        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft)
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME lag_analyzer_selftest COMMAND lag_analyzer --selftest)
 
     # The public header must stay consumable as plain C99 — compile a pure C

@@ -311,6 +311,11 @@ private class FakeSyncEngine : SyncEngine {
     override val meterFrames: Flow<SyncCore.Event.SyncEstimate> =
         events.filterIsInstance<SyncCore.Event.SyncEstimate>().conflate()
 
+    // CAL-05: inert stand-in — nothing under test drives the session screen
+    // off this stream (that's CAL-06); a single-value flow satisfies the
+    // interface without a fake poll loop to keep alive/cancel.
+    override fun inputLevel(): Flow<Float> = kotlinx.coroutines.flow.flowOf(0f)
+
     val nudgeCalls = mutableListOf<Int>()
     val routeCalls = mutableListOf<Pair<SyncCore.Route, Int>>()
     val aecCalls = mutableListOf<SyncCore.AecMode>()

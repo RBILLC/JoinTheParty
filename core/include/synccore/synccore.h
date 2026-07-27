@@ -147,6 +147,22 @@ sc_status_t sc_push_reference(sc_session_t*, const float* mono, int32_t frames,
  * cold starts instead of resetting to the default. */
 sc_status_t sc_get_command_latency_ms(sc_session_t*, int32_t* out_ms);
 
+/* CAL-05 (technical-requirements.md §2.1): smoothed capture input level,
+ * normalized 0..1 (not dBFS — the shell drives a visual treatment
+ * directly off the value). A POLLED GETTER, not an event: SC_EVT_* is
+ * estimate-driven and doesn't exist until the first recognition fix
+ * lands, which would leave LISTENING/MATCHING with no signal at all;
+ * a getter needs no such gating and reports silence for free whenever
+ * capture is idle or was never started. Independent of calibration and
+ * the estimator — valid before the first fix, during calibration, and
+ * before/after lock. Ballistics: one-pole attack/release envelope,
+ * ~10 ms attack / ~300 ms release, computed on the worker thread
+ * alongside the existing post-AEC capture-history append (no new tap
+ * into the capture path, never touches the RT audio callback or ring
+ * buffer). Written to a relaxed atomic by the worker; this getter does a
+ * relaxed load — no lock, no allocation, callable from any thread. */
+sc_status_t sc_get_input_level(sc_session_t*, float* out_level);
+
 /* ---- Calibration ---- */
 
 sc_status_t sc_begin_calibration(sc_session_t*);  /* emits SC_EVT_CALIBRATION_RESULT */

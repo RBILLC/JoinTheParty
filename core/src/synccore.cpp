@@ -39,6 +39,18 @@ constexpr int32_t kDefaultCommandLatencyMs = 250;
 constexpr int32_t kNudgeClampMs = 4000;
 constexpr int32_t kMaxFramesPerPush = 1 << 16;
 constexpr uint64_t kEstimateEmitPeriodNs = 66'666'667ull;  // ≤ 15 Hz
+// CAL-05 input-level ballistics (technical-requirements.md §2.1): one-pole
+// attack/release envelope over the post-AEC capture, ~10 ms attack / ~300 ms
+// release. Kept as time constants (not a fixed per-call coefficient) because
+// the per-block coefficient depends on how much audio-time each drained
+// block actually represents — see step_input_level's derivation below.
+constexpr double kInputLevelAttackSec = 0.010;
+constexpr double kInputLevelReleaseSec = 0.300;
+// The worker's own idle-poll cadence (see cv.wait_for below).
+constexpr auto kWorkerPollInterval = std::chrono::milliseconds(2);
+// Upper bound on a single idle release step, so a stalled worker (debugger,
+// starvation) can't collapse the level meter in one jump.
+constexpr double kMaxIdleDecayStepSec = 0.100;
 // CORE-06 self-match guard, rebuilt after Field Test 3 (2026-07-26).
 //
 // The room plays continuously, so its offset MUST advance 1:1 with the
@@ -107,6 +119,12 @@ struct sc_session {
     // sc_get_command_latency_ms can read it from any thread.
     std::atomic<int32_t> command_latency_mirror_ms{kDefaultCommandLatencyMs};
 
+    // CAL-05: worker-maintained smoothed input level (0..1), relaxed store
+    // by the worker / relaxed load by sc_get_input_level. Zero-initialized
+    // so a session that has never received capture reports silence, not
+    // garbage, with no special-casing in the getter.
+    std::atomic<float> input_level{0.0f};
+
     // NAT-06b capture-history tee: circular buffer of the last ~12 s of
     // post-AEC capture, written by the worker during drain, read by
     // sc_copy_recent_capture from any thread. Guarded by history_mtx (both
@@ -162,6 +180,14 @@ struct sc_session {
         int64_t cand_offset_ms = -1;
         uint64_t cand_ns = 0;
         std::vector<float> scratch;
+        // CAL-05: one-pole envelope follower state (full double precision;
+        // only the published atomic is truncated to float).
+        double input_level_state = 0.0;
+        // Wall-clock stamp of the last envelope step, so the idle release
+        // decays by measured elapsed time rather than an assumed poll
+        // period — see decay_input_level_idle().
+        std::chrono::steady_clock::time_point last_level_update =
+            std::chrono::steady_clock::now();
     } wk;
 
     std::thread worker;
@@ -188,7 +214,7 @@ struct sc_session {
             std::deque<Command> pending;
             {
                 std::unique_lock<std::mutex> lock(mtx);
-                cv.wait_for(lock, std::chrono::milliseconds(2), [this] {
+                cv.wait_for(lock, kWorkerPollInterval, [this] {
                     return stopping || !commands.empty();
                 });
                 pending.swap(commands);
@@ -196,9 +222,11 @@ struct sc_session {
             }
 
             // Drain captured audio; capture timestamps advance session time.
+            bool drained_any = false;
             for (;;) {
                 wk.scratch.clear();  // keeps capacity — no realloc per block
                 if (!ring.try_read(&hdr, &wk.scratch)) break;
+                drained_any = true;
                 frames_consumed.fetch_add(hdr.frames, std::memory_order_relaxed);
                 const uint64_t block_end =
                     hdr.capture_mono_ns +
@@ -211,13 +239,84 @@ struct sc_session {
                 if (wk.detector.armed())
                     wk.detector.push(wk.scratch.data(), wk.scratch.size(),
                                      hdr.capture_mono_ns);
+                // CAL-05: same post-AEC buffer append_history taps below —
+                // no new tap into the capture path.
+                update_input_level(wk.scratch);
                 append_history(wk.scratch.data(), wk.scratch.size(), block_end);
             }
+            if (!drained_any) decay_input_level_idle();
 
             for (const Command& cmd : pending) process(cmd);
 
             tick();
         }
+    }
+
+    // CAL-05: one-pole attack/release envelope follower (spec §2.1).
+    //
+    // Coefficient derivation: for y += alpha * (x - y), the step response
+    // after elapsed time T is 1 - e^(-T/tau) toward x. So the coefficient
+    // for a given block is alpha = 1 - e^(-T/tau), where T is that block's
+    // OWN duration and tau is the attack or release time constant — this is
+    // derived per call from the actual block length rather than a hardcoded
+    // per-call factor, so the ballistics stay correct however the shell
+    // chunks its capture pushes.
+    void step_input_level(double magnitude, double block_sec) {
+        const double tau = magnitude > wk.input_level_state
+                                ? kInputLevelAttackSec
+                                : kInputLevelReleaseSec;
+        const double alpha = 1.0 - std::exp(-block_sec / tau);
+        wk.input_level_state += alpha * (magnitude - wk.input_level_state);
+        wk.input_level_state = std::clamp(wk.input_level_state, 0.0, 1.0);
+        input_level.store(static_cast<float>(wk.input_level_state),
+                          std::memory_order_relaxed);
+        // Every step restamps, so the idle path's measured dt covers only
+        // the gap since the last update — whichever path produced it.
+        wk.last_level_update = std::chrono::steady_clock::now();
+    }
+
+    // Instantaneous level for a drained block: peak absolute sample value
+    // (capture is already normalized float, so no separate dBFS/clamp step
+    // is needed on the far side — spec §2.1). block_sec comes from the
+    // block's own frame count, not wall-clock timing of the push.
+    void update_input_level(const std::vector<float>& block) {
+        if (block.empty()) return;
+        float peak = 0.0f;
+        for (float v : block) peak = std::max(peak, std::fabs(v));
+        peak = std::min(peak, 1.0f);
+        const double block_sec = static_cast<double>(block.size()) /
+                                 static_cast<double>(kSupportedRateHz);
+        step_input_level(static_cast<double>(peak), block_sec);
+    }
+
+    // No capture drained this worker iteration — nothing to compute a
+    // magnitude from. Rather than leaving the last loud value stale forever
+    // once capture actually stops (Oboe's stream close sends no sc_*
+    // notification; the worker's only signal is "no more blocks arrive"),
+    // release the envelope toward silence.
+    //
+    // The elapsed duration here MUST be measured, not assumed. An earlier
+    // version passed kWorkerPollInterval (2 ms) as the nominal iteration
+    // time, reasoning that a compile-time constant avoids a clock read. It
+    // decayed ~7x too slowly on Windows, where the default timer resolution
+    // is ~15.6 ms, so cv.wait_for(2ms) actually sleeps far longer than 2 ms
+    // and the envelope advanced 2 ms of "time" per ~15 ms of reality
+    // (test_decays_after_capture_stops_entirely caught it).
+    //
+    // Reading steady_clock here does NOT breach the "SyncCore never reads a
+    // clock" invariant. That rule exists so *session timing* — offsets,
+    // drift, correction targets — derives solely from capture timestamps and
+    // is therefore immune to clock skew between devices. This is a
+    // display-only level meter whose decay rate affects nothing downstream;
+    // no estimate, event, or correction reads it.
+    void decay_input_level_idle() {
+        const double elapsed_sec =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          wk.last_level_update)
+                .count();
+        // Guard against a long stall (debugger, thread starvation) dumping a
+        // huge dt into the envelope: clamp to a sane upper bound.
+        step_input_level(0.0, std::min(elapsed_sec, kMaxIdleDecayStepSec));
     }
 
     void emit_estimate(const synccore::Estimate& e) {
@@ -645,6 +744,12 @@ int32_t sc_copy_recent_capture(sc_session_t* s, float* out, int32_t max_frames,
 sc_status_t sc_get_command_latency_ms(sc_session_t* s, int32_t* out_ms) {
     if (!s || !out_ms) return SC_ERR_INVALID_ARG;
     *out_ms = s->command_latency_mirror_ms.load(std::memory_order_relaxed);
+    return SC_OK;
+}
+
+sc_status_t sc_get_input_level(sc_session_t* s, float* out_level) {
+    if (!s || !out_level) return SC_ERR_INVALID_ARG;
+    *out_level = s->input_level.load(std::memory_order_relaxed);
     return SC_OK;
 }
 

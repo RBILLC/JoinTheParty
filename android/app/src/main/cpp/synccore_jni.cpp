@@ -319,4 +319,18 @@ Java_com_jointheparty_app_core_SyncCore_nativeGetCommandLatencyMs(
     return out;
 }
 
+// CAL-05: polled getter, mirrors nativeGetCommandLatencyMs's pattern. 0.0f
+// on an invalid handle is indistinguishable from genuine silence by design —
+// sc_get_input_level's own contract is to report silence, not an error
+// sentinel, whenever there's nothing to read.
+JNIEXPORT jfloat JNICALL
+Java_com_jointheparty_app_core_SyncCore_nativeGetInputLevel(JNIEnv*, jobject,
+                                                             jlong handle) {
+    auto* h = handle_of(handle);
+    if (!h) return 0.0f;
+    float out = 0.0f;
+    if (sc_get_input_level(h->session, &out) != SC_OK) return 0.0f;
+    return out;
+}
+
 }  // extern "C"

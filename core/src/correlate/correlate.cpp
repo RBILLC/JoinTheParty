@@ -4,20 +4,13 @@
 #include <cmath>
 #include <cstring>
 
-#include "kiss_fft.h"
-#include "kiss_fftr.h"
+#include "dsp/fft.h"
 
 namespace synccore {
 
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-
-size_t next_pow2(size_t n) {
-    size_t p = 1;
-    while (p < n) p <<= 1;
-    return p;
-}
 
 }  // namespace
 
@@ -30,28 +23,22 @@ CorrelationResult gcc_phat(const float* haystack, size_t haystack_len,
         return result;
 
     const size_t nfft = next_pow2(haystack_len + needle_len);
-    const size_t nbins = nfft / 2 + 1;
 
-    kiss_fftr_cfg fwd = kiss_fftr_alloc(static_cast<int>(nfft), 0, nullptr, nullptr);
-    kiss_fftr_cfg inv = kiss_fftr_alloc(static_cast<int>(nfft), 1, nullptr, nullptr);
-    if (!fwd || !inv) {
-        free(fwd);
-        free(inv);
-        return result;
-    }
+    RealFft fft(nfft);
+    if (!fft.valid()) return result;
 
     std::vector<float> padded(nfft, 0.0f);
-    std::vector<kiss_fft_cpx> spec_h(nbins), spec_n(nbins);
+    std::vector<kiss_fft_cpx> spec_h, spec_n;
 
     std::memcpy(padded.data(), haystack, haystack_len * sizeof(float));
-    kiss_fftr(fwd, padded.data(), spec_h.data());
+    fft.forward(padded, spec_h);
 
     std::fill(padded.begin(), padded.end(), 0.0f);
     std::memcpy(padded.data(), needle, needle_len * sizeof(float));
-    kiss_fftr(fwd, padded.data(), spec_n.data());
+    fft.forward(padded, spec_n);
 
     // Cross-spectrum with PHAT whitening: S = X·Y* / |X·Y*|.
-    for (size_t i = 0; i < nbins; ++i) {
+    for (size_t i = 0; i < fft.nbins(); ++i) {
         const float re = spec_h[i].r * spec_n[i].r + spec_h[i].i * spec_n[i].i;
         const float im = spec_h[i].i * spec_n[i].r - spec_h[i].r * spec_n[i].i;
         const float mag = std::sqrt(re * re + im * im);
@@ -64,10 +51,8 @@ CorrelationResult gcc_phat(const float* haystack, size_t haystack_len,
         }
     }
 
-    std::vector<float> corr(nfft);
-    kiss_fftri(inv, spec_h.data(), corr.data());
-    free(fwd);
-    free(inv);
+    std::vector<float> corr;
+    fft.inverse(spec_h, corr);
 
     const int search =
         std::min<int>(max_lag_samples,
