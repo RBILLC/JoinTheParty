@@ -39,10 +39,33 @@ constexpr int32_t kDefaultCommandLatencyMs = 250;
 constexpr int32_t kNudgeClampMs = 4000;
 constexpr int32_t kMaxFramesPerPush = 1 << 16;
 constexpr uint64_t kEstimateEmitPeriodNs = 66'666'667ull;  // ≤ 15 Hz
-// CORE-06 (PM-confirmed 2026-07-22): a fix matching our own commanded
-// playback position within this window, while in speaker mode, is
-// self-hearing — the mic locked onto our own output.
-constexpr int64_t kSelfHearingWindowMs = 30;
+// CORE-06 self-match guard, rebuilt after Field Test 3 (2026-07-26).
+//
+// The room plays continuously, so its offset MUST advance 1:1 with the
+// wall clock. That gives a prediction, and a fix that breaks it while
+// simultaneously landing on our OWN audible position is the mic hearing
+// us rather than the room. Both conditions are required: at true lock the
+// room and our own position coincide, and that fix still tracks the room
+// prediction, so it is accepted normally. A room perturbation (someone
+// skips the source) breaks the prediction but does NOT match our position,
+// so it is accepted too — which is what makes this safe to run ungated.
+//
+// Field Test 3 measured the two populations directly: self-matches landed
+// within 200 ms of our own position while running 1.2–1.8 s off the room
+// prediction, and genuine room fixes tracked the prediction within 250 ms.
+constexpr double kRoomContinuityGateMs = 500.0;
+constexpr double kSelfMatchWindowMs = 400.0;
+// Beyond this the room prediction has coasted too long to arbitrate. MUST
+// stay well clear of PolicyConfig::fix_interval_max_ns (30 s when converged)
+// plus a recognition round trip — at 30 s the guard switched itself off at
+// exactly the moment the session converged, which is when it matters most.
+constexpr uint64_t kRoomPredictionMaxAgeNs = 90'000'000'000ull;
+// A reference that keeps rejecting is more likely wrong than the room is:
+// the anchor can only have been seeded by a fix that was itself accepted
+// without arbitration. Drop it after this many and let the room re-seed —
+// Field Test 4 hit exactly this lockout, rejecting every fix for a minute
+// while the mic confirmed the session was actually in sync.
+constexpr int kMaxConsecutiveSelfRejects = 3;
 // ~12 s of 48 kHz mono float + headers, rounded up to 4 MiB by the ring.
 constexpr size_t kRingBytes = static_cast<size_t>(kSupportedRateHz) * sizeof(float) * 12;
 // NAT-06b: post-AEC capture history retained for recognition sampling.
@@ -117,7 +140,19 @@ struct sc_session {
         synccore::SyncCoreAec aec{kSupportedRateHz};
         uint64_t now_ns = 0;        // latest input timestamp seen
         uint64_t last_emit_ns = 0;  // last SC_EVT_SYNC_ESTIMATE emission
-        int64_t last_commanded_position_ms = -1;  // self-hearing guard, CORE-06
+        // Retained for diagnostics only — the self-match guard no longer
+        // reads it (it was a frozen seek target that never advanced with the
+        // wall clock, which is why the old guard never fired).
+        int64_t last_commanded_position_ms = -1;
+        // Room-timeline reference for the self-match guard: offset + capture
+        // time of the last accepted fix. It only earns the right to REJECT
+        // anything once a second accepted fix has corroborated it — the very
+        // first fix of a session is accepted without arbitration, so a lone
+        // seed may itself be a self-match and must not be trusted to judge.
+        int64_t room_anchor_offset_ms = -1;
+        uint64_t room_anchor_ns = 0;
+        bool room_anchor_confirmed = false;
+        int consecutive_self_rejects = 0;
         std::vector<float> scratch;
     } wk;
 
@@ -199,6 +234,11 @@ struct sc_session {
             case synccore::ActionKind::kTrackLost:
                 wk.estimator.reset();
                 wk.policy.reset();
+                // The room timeline we were predicting is gone; a stale
+                // reference would arbitrate the re-bootstrap fixes.
+                wk.room_anchor_offset_ms = -1;
+                wk.room_anchor_confirmed = false;
+                wk.consecutive_self_rejects = 0;
                 dispatch(SC_EVT_TRACK_LOST, nullptr);
                 break;
         }
@@ -239,19 +279,42 @@ struct sc_session {
                     dispatch(SC_EVT_FIX_REJECTED, &rej);
                     return;
                 }
-                // CORE-06 self-hearing guard (architecture-spec §7.3,
-                // ±30 ms PM-confirmed): in speaker mode a fix that matches
-                // our own commanded playback position is the mic hearing
-                // us, not the room — accepting it would report perfect
-                // sync forever. Known v1 limitation: near true lock the
-                // external source legitimately sits inside this window
-                // too; the energy-dominance condition that disambiguates
-                // arrives with the real APM (post-stub).
-                if (wk.aec.mode() == SC_AEC_FULL &&
-                    wk.last_commanded_position_ms >= 0 &&
-                    std::abs(cmd.fix.match_offset_ms -
-                             wk.last_commanded_position_ms) <=
-                        kSelfHearingWindowMs) {
+                // CORE-06 self-match guard (architecture-spec §7.3).
+                //
+                // The previous form compared the fix against
+                // last_commanded_position_ms — a FROZEN seek target that
+                // never advanced with the wall clock, so it went stale
+                // within a second and never fired. Field Test 3 caught the
+                // consequence: with the phone's own output audible to its
+                // own mic, ACR locked onto us on ~40% of fixes, each one
+                // reporting near-zero error and convincing the filter it
+                // was synced while the room ran 1.2 s ahead. The session
+                // oscillated for 6 minutes and never converged.
+                const double off = static_cast<double>(cmd.fix.match_offset_ms);
+                const bool anchor_usable =
+                    wk.room_anchor_offset_ms >= 0 && t > wk.room_anchor_ns &&
+                    t - wk.room_anchor_ns < kRoomPredictionMaxAgeNs;
+                const double predicted_room =
+                    anchor_usable
+                        ? static_cast<double>(wk.room_anchor_offset_ms) +
+                              static_cast<double>(t - wk.room_anchor_ns) / 1e6
+                        : 0.0;
+                const bool tracks_room =
+                    anchor_usable &&
+                    std::abs(off - predicted_room) <= kRoomContinuityGateMs;
+
+                if (anchor_usable && wk.room_anchor_confirmed && !tracks_room &&
+                    wk.estimator.has_player_state() &&
+                    std::abs(off - wk.estimator.local_audible_ms(t)) <=
+                        kSelfMatchWindowMs) {
+                    if (++wk.consecutive_self_rejects >=
+                        kMaxConsecutiveSelfRejects) {
+                        // We are almost certainly judging with a bad
+                        // reference. Forget it; the next fix re-seeds.
+                        wk.room_anchor_offset_ms = -1;
+                        wk.room_anchor_confirmed = false;
+                        wk.consecutive_self_rejects = 0;
+                    }
                     sc_evt_fix_rejected_t rej{SC_REJECT_SELF_HEARING};
                     dispatch(SC_EVT_FIX_REJECTED, &rej);
                     return;
@@ -264,6 +327,13 @@ struct sc_session {
                     return;
                 }
                 wk.policy.on_fix_accepted(t);
+                // Two consecutive fixes that agree on one continuous room
+                // timeline confirm the reference; anything else re-seeds it
+                // unconfirmed (song change, room skip, or a bad seed).
+                wk.room_anchor_confirmed = tracks_room;
+                wk.room_anchor_offset_ms = cmd.fix.match_offset_ms;
+                wk.room_anchor_ns = t;
+                wk.consecutive_self_rejects = 0;
                 const synccore::Estimate est = wk.estimator.estimate_at(t);
                 wk.last_emit_ns = t;
                 emit_estimate(est);

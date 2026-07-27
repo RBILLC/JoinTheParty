@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -215,62 +216,201 @@ void test_setters_clamp_and_validate() {
     sc_destroy(s);
 }
 
-// CORE-06: in speaker mode (SC_AEC_FULL), a fix matching our own commanded
-// playback position within ±30 ms is self-hearing and must be rejected;
-// outside the window — or with AEC off — fixes flow normally.
+// CORE-06 self-match guard, rewritten after Field Test 3 (2026-07-26).
+//
+// Geometry under test is the one the field run actually produced: the phone
+// plays out its own speaker, so its mic hears BOTH the room and itself, and
+// the room runs 1 200 ms ahead of us. The recognizer then reports one of two
+// populations — the room's offset, or our own — and the guard must keep only
+// the first without ever rejecting a bootstrap fix or a room perturbation.
+//
+// Deadband is opened wide here on purpose: this test is about which fixes
+// reach the filter, not about corrections, and a correction would pull the
+// settle window in and mask the result.
 void test_self_hearing_guard() {
+    constexpr uint64_t kSec = 1'000'000'000ull;
     sc_config_t cfg = valid_config();
+    cfg.deadband_ms = 5000;
     sc_session_t* s = nullptr;
     CHECK(sc_create(&cfg, &s) == SC_OK);
     EventLog log;
     sc_set_event_callback(s, event_cb, &log);
 
+    // Our own playback: 10 000 ms at t0, advancing 1:1 from there.
+    const uint64_t t0 = mono_ns();
     sc_player_state_t ps{};
     ps.position_ms = 10000;
-    ps.received_mono_ns = mono_ns();
+    ps.received_mono_ns = t0;
     CHECK(sc_submit_player_state(s, &ps) == SC_OK);
     CHECK(sc_set_aec_mode(s, SC_AEC_FULL) == SC_OK);
-    CHECK(sc_notify_local_playback(s, 10000) == SC_OK);
 
-    // Fix at our own commanded position + 20 ms → inside the guard window.
-    sc_recognition_fix_t fix{};
-    fix.source = SC_FIX_SHAZAMKIT;
-    fix.match_offset_ms = 10020;
-    fix.capture_mono_ns = mono_ns();
-    fix.confidence = 0.9f;
-    CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
-    for (int i = 0; i < 200 && log.rejects.load() < 1; ++i)
+    auto submit = [&](int64_t offset_ms, uint64_t t) {
+        sc_recognition_fix_t fix{};
+        fix.source = SC_FIX_SHAZAMKIT;
+        fix.match_offset_ms = offset_ms;
+        fix.capture_mono_ns = t;
+        fix.confidence = 0.9f;
+        CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    };
+    // Acceptance is asserted through the FILTER STATE, not an event count:
+    // the worker also emits interpolated estimates whenever session time
+    // advances, so counting SC_EVT_SYNC_ESTIMATE would count those too.
+    // `processed` waits for one such emission to prove the command drained.
+    auto processed = [&] {
+        const int before = log.estimates.load();
+        for (int i = 0; i < 400 && log.estimates.load() == before; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    };
+    auto error_is = [&](double want) {
+        return std::abs(log.last_error_ms.load() - want) < 120.0;
+    };
+
+    // Bootstrap (local 15 000, room 16 200): nothing to arbitrate against
+    // yet, so it MUST be accepted — rejecting the first fix is precisely how
+    // a session gets stuck in MATCHING forever. It seeds the room reference
+    // but does NOT yet earn the right to judge other fixes.
+    submit(16200, t0 + 5 * kSec);
+    processed();
+    CHECK(log.rejects.load() == 0);
+    CHECK(error_is(-1200.0));  // we are genuinely 1.2 s behind the room
+
+    // A second room fix on the same continuous timeline (16 200 + 5 000)
+    // corroborates the reference — only now may it reject anything.
+    submit(21200, t0 + 10 * kSec);
+    processed();
+    CHECK(log.rejects.load() == 0);
+    CHECK(error_is(-1200.0));
+
+    // Self-match against the CONFIRMED reference: it lands on our OWN
+    // audible position (25 000) while the room prediction says 26 200. This
+    // is the fix that used to sail through and tell the filter it was
+    // perfectly synced while the room ran away from us.
+    submit(25000, t0 + 15 * kSec);
+    for (int i = 0; i < 400 && log.rejects.load() < 1; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     CHECK(log.rejects.load() == 1);
     CHECK(log.last_reject_reason.load() == SC_REJECT_SELF_HEARING);
-    CHECK(log.estimates.load() == 0);
+    CHECK(error_is(-1200.0));  // filter state untouched by the rejected fix
 
-    // 200 ms away → genuinely the external speaker → accepted.
-    fix.match_offset_ms = 10200;
-    fix.capture_mono_ns = mono_ns();
-    CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
-    for (int i = 0; i < 200 && log.estimates.load() < 1; ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    CHECK(log.estimates.load() == 1);
+    // The genuine room fix still tracks the prediction (21 200 + 10 000)
+    // even though we remain 1 200 ms adrift → accepted, no new reject.
+    submit(31200, t0 + 20 * kSec);
+    processed();
+    CHECK(log.rejects.load() == 1);
+    CHECK(error_is(-1200.0));
+
+    // Room perturbation: someone skips the source 700 ms ahead. That breaks
+    // the room prediction, but it does NOT sit on our position, so the guard
+    // must let it through — otherwise the app could never follow the room.
+    // The filter steps partway toward the new observation (−1 900).
+    submit(36900, t0 + 25 * kSec);
+    processed();
+    CHECK(log.rejects.load() == 1);
+    const double moved = log.last_error_ms.load();
+    CHECK(moved < -1250.0 && moved > -1950.0);
 
     sc_destroy(s);
+}
 
-    // Same self-match with AEC off (headphones) → accepted: the mic cannot
-    // hear our own playback, so a matching offset is real sync.
-    s = nullptr;
+// The anti-poisoning rule: the very first fix of a session is accepted
+// without arbitration, so it may itself be a self-match. A lone, unconfirmed
+// seed must therefore never be allowed to reject anything — otherwise one
+// bad bootstrap silently locks the session out of every real measurement.
+void test_self_match_guard_ignores_unconfirmed_reference() {
+    constexpr uint64_t kSec = 1'000'000'000ull;
+    sc_config_t cfg = valid_config();
+    cfg.deadband_ms = 5000;
+    sc_session_t* s = nullptr;
     CHECK(sc_create(&cfg, &s) == SC_OK);
-    EventLog log2;
-    sc_set_event_callback(s, event_cb, &log2);
+    EventLog log;
+    sc_set_event_callback(s, event_cb, &log);
+
+    const uint64_t t0 = mono_ns();
+    sc_player_state_t ps{};
+    ps.position_ms = 10000;
+    ps.received_mono_ns = t0;
     CHECK(sc_submit_player_state(s, &ps) == SC_OK);
-    CHECK(sc_notify_local_playback(s, 10000) == SC_OK);
-    fix.match_offset_ms = 10020;
-    fix.capture_mono_ns = mono_ns();
+    CHECK(sc_set_aec_mode(s, SC_AEC_FULL) == SC_OK);
+
+    sc_recognition_fix_t fix{};
+    fix.source = SC_FIX_SHAZAMKIT;
+    fix.confidence = 0.9f;
+    fix.match_offset_ms = 16200;
+    fix.capture_mono_ns = t0 + 5 * kSec;
     CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
-    for (int i = 0; i < 200 && log2.estimates.load() < 1; ++i)
+    for (int i = 0; i < 400 && log.estimates.load() < 1; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    CHECK(log2.estimates.load() == 1);
-    CHECK(log2.rejects.load() == 0);
+
+    // Textbook self-match shape (our position 20 000, prediction 21 200) —
+    // but the reference has only one fix behind it, so it must NOT reject.
+    const int before = log.estimates.load();
+    fix.match_offset_ms = 20000;
+    fix.capture_mono_ns = t0 + 10 * kSec;
+    CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    for (int i = 0; i < 400 && log.estimates.load() == before; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.rejects.load() == 0);
+
     sc_destroy(s);
+}
+
+// Field Test 4: the guard locked itself out — once its reference disagreed
+// with reality it rejected EVERY subsequent fix while the mic confirmed the
+// session was actually in sync. A reference that keeps rejecting is more
+// likely wrong than the room is, so it must be dropped and re-seeded.
+void test_self_match_guard_recovers_from_bad_reference() {
+    constexpr uint64_t kSec = 1'000'000'000ull;
+    sc_config_t cfg = valid_config();
+    cfg.deadband_ms = 5000;
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    EventLog log;
+    sc_set_event_callback(s, event_cb, &log);
+
+    const uint64_t t0 = mono_ns();
+    sc_player_state_t ps{};
+    ps.position_ms = 10000;
+    ps.received_mono_ns = t0;
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+    CHECK(sc_set_aec_mode(s, SC_AEC_FULL) == SC_OK);
+
+    auto submit = [&](int64_t offset_ms, uint64_t t) {
+        sc_recognition_fix_t fix{};
+        fix.source = SC_FIX_SHAZAMKIT;
+        fix.match_offset_ms = offset_ms;
+        fix.capture_mono_ns = t;
+        fix.confidence = 0.9f;
+        CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    };
+    auto processed = [&] {
+        const int before = log.estimates.load();
+        for (int i = 0; i < 400 && log.estimates.load() == before; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    };
+
+    // Establish and confirm a room reference 1 200 ms ahead of us.
+    submit(16200, t0 + 5 * kSec);
+    processed();
+    submit(21200, t0 + 10 * kSec);
+    processed();
+    CHECK(log.rejects.load() == 0);
+
+    // Three consecutive self-matches. The first two are rejected; the third
+    // rejection also DROPS the reference rather than defending it forever.
+    submit(25000, t0 + 15 * kSec);
+    submit(30000, t0 + 20 * kSec);
+    submit(35000, t0 + 25 * kSec);
+    for (int i = 0; i < 400 && log.rejects.load() < 3; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.rejects.load() == 3);
+    CHECK(log.last_reject_reason.load() == SC_REJECT_SELF_HEARING);
+
+    // With the reference dropped, measurements flow again instead of the
+    // session going permanently deaf.
+    const int before = log.rejects.load();
+    submit(41200, t0 + 30 * kSec);
+    processed();
+    CHECK(log.rejects.load() == before);
 }
 
 // NAT-06b: the capture-history tee returns the newest frames in order with
@@ -377,6 +517,8 @@ int main() {
     test_events_and_payloads();
     test_setters_clamp_and_validate();
     test_self_hearing_guard();
+    test_self_match_guard_recovers_from_bad_reference();
+    test_self_match_guard_ignores_unconfirmed_reference();
     test_copy_recent_capture();
     test_concurrent_capture_and_control();
 

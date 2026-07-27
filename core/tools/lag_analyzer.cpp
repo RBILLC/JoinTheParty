@@ -15,11 +15,18 @@
 //
 // Desktop-only tool; built beside the test suite.
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #include "kiss_fft.h"
 #include "kiss_fftr.h"
@@ -157,6 +164,57 @@ int run(const Wav& wav, double min_lag_ms, double max_lag_ms) {
     return 0;
 }
 
+// Live mode: raw s16le PCM on stdin (from e.g. ffmpeg -f s16le -), one lag
+// line every `hop` seconds. Same analysis as the file path, but the room can
+// be watched WHILE the app is running instead of after the fact — which is
+// what makes it usable as a test instrument rather than a post-mortem.
+int run_stream(int rate, int channels, double min_lag_ms, double max_lag_ms) {
+    const size_t win = static_cast<size_t>(8.0 * rate);
+    const size_t hop = static_cast<size_t>(2.0 * rate);
+    std::vector<float> buf;
+    buf.reserve(win + hop);
+    std::vector<int16_t> chunk(static_cast<size_t>(4096 * channels));
+    size_t since_last = 0;
+    double t = 0.0;
+
+    std::fprintf(stderr, "stream: %d Hz, %d ch, 8s window / 2s hop\n", rate,
+                 channels);
+    std::printf("t_s,lag_ms,peak_ratio,confident,rms_db\n");
+    std::fflush(stdout);
+
+    for (;;) {
+        const size_t got =
+            std::fread(chunk.data(), sizeof(int16_t), chunk.size(), stdin);
+        if (got == 0) break;
+        const size_t frames = got / static_cast<size_t>(channels);
+        for (size_t i = 0; i < frames; ++i) {
+            int32_t acc = 0;
+            for (int c = 0; c < channels; ++c)
+                acc += chunk[i * static_cast<size_t>(channels) +
+                             static_cast<size_t>(c)];
+            buf.push_back(static_cast<float>(acc) /
+                          (32768.0f * static_cast<float>(channels)));
+        }
+        t += static_cast<double>(frames) / rate;
+        since_last += frames;
+        if (buf.size() > win) buf.erase(buf.begin(), buf.begin() + static_cast<long>(buf.size() - win));
+        if (buf.size() < win || since_last < hop) continue;
+        since_last = 0;
+
+        double sum_sq = 0.0;
+        for (size_t i = 0; i < win; ++i) sum_sq += buf[i] * buf[i];
+        const double rms = std::sqrt(sum_sq / static_cast<double>(win));
+        const double rms_db = 20.0 * std::log10(rms + 1e-9);
+
+        const auto r =
+            analyze_window(buf.data(), win, rate, min_lag_ms, max_lag_ms);
+        std::printf("%.0f,%.0f,%.2f,%d,%.1f\n", t, r.lag_ms, r.peak_ratio,
+                    r.found ? 1 : 0, rms_db);
+        std::fflush(stdout);
+    }
+    return 0;
+}
+
 int selftest() {
     // Pseudo-music: filtered noise, plus a copy delayed 800 ms at -6 dB.
     const int rate = 48000;
@@ -192,13 +250,29 @@ int selftest() {
 int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "--selftest") return selftest();
     if (argc < 2) {
-        std::fprintf(stderr, "usage: lag_analyzer <recording.wav> | --selftest\n");
+        std::fprintf(stderr,
+                     "usage: lag_analyzer <recording.wav> | --stream | "
+                     "--selftest\n");
         return 2;
     }
     double min_lag = 40, max_lag = 2500;
+    int rate = 44100, channels = 1;
     for (int i = 2; i + 1 < argc; i += 2) {
         if (std::string(argv[i]) == "--min-lag-ms") min_lag = std::atof(argv[i + 1]);
         if (std::string(argv[i]) == "--max-lag-ms") max_lag = std::atof(argv[i + 1]);
+        if (std::string(argv[i]) == "--rate") rate = std::atoi(argv[i + 1]);
+        if (std::string(argv[i]) == "--channels") channels = std::atoi(argv[i + 1]);
+    }
+    if (std::string(argv[1]) == "--stream") {
+        if (rate <= 0 || channels <= 0) {
+            std::fprintf(stderr, "bad --rate/--channels\n");
+            return 2;
+        }
+#ifdef _WIN32
+        // Without this the CRT mangles 0x0A/0x1A in the PCM stream.
+        _setmode(_fileno(stdin), _O_BINARY);
+#endif
+        return run_stream(rate, channels, min_lag, max_lag);
     }
     Wav wav;
     if (!read_wav_pcm16(argv[1], &wav)) {

@@ -87,6 +87,13 @@ public:
     double projected_local_ms(uint64_t now_ns) const;
     bool has_player_state() const { return has_player_; }
 
+    // What a microphone in the room hears US playing, projected to `now` —
+    // i.e. the offset a recognizer would report if it locked onto our own
+    // output instead of the room's. Drives the self-match guard (§7.3).
+    double local_audible_ms(uint64_t now_ns) const {
+        return projected_local_ms(now_ns) - output_latency_ms_;
+    }
+
     void reset();
 
 private:
