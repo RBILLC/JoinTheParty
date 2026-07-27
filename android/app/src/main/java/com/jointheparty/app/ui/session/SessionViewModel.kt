@@ -78,6 +78,9 @@ private const val ENGINE_DEADBAND_MS = 350
  */
 private const val REBASE_MIN_CONFIDENCE = 0.6f
 
+/** Settle time after pausing our own output before the mic is worth sampling. */
+private const val AUTO_ADVANCE_QUIET_MS = 700L
+
 /** Backstop: one commit may absorb at most this much measured error. */
 private const val REBASE_MAX_MS = 600.0
 
@@ -336,9 +339,15 @@ class SessionViewModel(
     private fun playerStateWatcher() {
         val controller = spotify ?: return
         viewModelScope.launch(dispatcher) {
-            controller.playerStates.collect {
+            controller.playerStates.collect { state ->
                 if (_syncState.value.phase == SessionPhase.AIMING) {
                     onPlaybackStarted()
+                }
+                val commanded = _syncState.value.track?.spotifyUri
+                if (commanded != null && state.trackUri != null &&
+                    state.trackUri != commanded && !state.isPaused
+                ) {
+                    onSpotifyAutoAdvanced(controller, state.trackUri)
                 }
             }
         }
@@ -435,6 +444,7 @@ class SessionViewModel(
             gateDismissedThisSession = false
             firstEstimateSeen = false
             samplingAttempts = 0
+            autoAdvanceHandled = null
             _syncState.update {
                 SyncState(routeId = it.routeId, routeName = it.routeName, nudgeMs = it.nudgeMs)
             }
@@ -766,6 +776,9 @@ class SessionViewModel(
 
     /** Latest engine-measured error; consumed by wheel-commit rebasing. */
     @Volatile
+    /** Track URI we have already reacted to auto-advancing onto (§ above). */
+    private var autoAdvanceHandled: String? = null
+
     private var lastEstimateErrorMs: Double = 0.0
 
     /** Freshness guard for the rebase (audit §4.4): a stale, low-confidence
@@ -831,6 +844,43 @@ class SessionViewModel(
             // locked → drifting (estimate leaves the deadband)
             !event.converged && phase == SessionPhase.LOCKED ->
                 transition(SessionPhase.DRIFTING)
+        }
+    }
+
+    /**
+     * Spotify reached the end of the track we asked for and moved on by
+     * itself, to something the room is not playing.
+     *
+     * Field Test 4 caught what this costs: the room finished "My Life" while
+     * Spotify auto-advanced to "Summer, Highland Falls". Our own speaker sits
+     * inches from our own microphone, so from then on the recognizer only
+     * ever heard US. The self-match guard did its job and refused every one
+     * of those fixes, but that left the session with no information at all —
+     * nominally LOCKED, confidence decayed to 0.00, playing the wrong song
+     * and unable to discover the right one.
+     *
+     * The only way to hear the room again is to stop competing with it, so
+     * pause first, drop the track, and re-listen exactly like a fresh join.
+     */
+    private fun onSpotifyAutoAdvanced(controller: SpotifyController, actualUri: String) {
+        if (autoAdvanceHandled == actualUri) return  // one response per track
+        autoAdvanceHandled = actualUri
+        com.jointheparty.app.debug.DebugLog.log(
+            "Spotify auto-advanced to $actualUri — pausing to hear the room",
+        )
+        controller.pause()
+        _syncState.update { it.copy(track = null) }
+        transition(SessionPhase.LOST)
+        if (!transition(SessionPhase.LISTENING)) return
+        if (recognition == null) return
+        firstEstimateSeen = false
+        samplingAttempts = 0
+        onMatchInFlight()
+        viewModelScope.launch(dispatcher) {
+            // The pause has to actually take effect before the mic is worth
+            // sampling, otherwise the first window still contains our audio.
+            delay(AUTO_ADVANCE_QUIET_MS)
+            runRecognitionPass()
         }
     }
 

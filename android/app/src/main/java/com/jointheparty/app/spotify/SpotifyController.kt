@@ -52,6 +52,16 @@ interface SpotifyController {
     fun play(spotifyUri: String): Boolean
 
     /**
+     * Issues `PlayerApi.pause()`. Returns false if not connected.
+     *
+     * Needed because our own speaker output reaches our own microphone and
+     * drowns out the room: when Spotify auto-advances to a track the room is
+     * not playing, the only way to hear the room again is to stop competing
+     * with it.
+     */
+    fun pause(): Boolean
+
+    /**
      * Issues `PlayerApi.seekTo(positionMs)` and MUST echo
      * `sc_notify_seek_issued` (technical-requirements.md §1.2) so the
      * estimator suppresses measurements during the settle window. Returns

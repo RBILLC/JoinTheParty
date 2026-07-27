@@ -178,6 +178,13 @@ class AppRemoteSpotifyController(
         return true
     }
 
+    override fun pause(): Boolean {
+        val playerApi = remote?.playerApi ?: return false
+        com.jointheparty.app.debug.DebugLog.log("pause()")
+        mainHandler.post { playerApi.pause() }
+        return true
+    }
+
     private fun subscribeToPlayerState(spotifyAppRemote: SpotifyAppRemote) {
         // Real-SDK note (vendor swap): EventCallback is nested in
         // Subscription, and PlayerState/Track expose public Java fields.
