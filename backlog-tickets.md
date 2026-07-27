@@ -33,6 +33,7 @@
 | CORE-05 | 🟡 Pipeline done against stub APM (PM decision); un-stub + ≥15dB attenuation AC pending real webrtc-audio-processing | `b344da8` |
 | CORE-06 | ✅ Done — ±30ms guard (PM-confirmed), seek-refreshed reference, headphone bypass, C-API tested; energy condition deferred to real APM | `b344da8` |
 | INT-04 | 🟡 Route→AEC wiring + UI hint done (unit-tested); 10/10 speaker-mode field trials AC needs real APM + device | `b344da8` |
+| INT-06 | ⬜ Not started | — |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.
@@ -314,6 +315,31 @@
 - ≥ 3 environments × both platforms tested with metrics recorded; new fixtures added; defect list triaged into backlog.
 **Dependencies:** INT-01, INT-02, INT-04, CORE-07.
 
+### INT-06a · SessionGraph — process-scoped session ownership
+**Description:** Move the object graph `SessionViewModel.Companion.Factory` builds (SyncCore, ACRCloudProvider/EnginePcmWindowSource, HttpBackendClient, AudioTrackChirpPlayer, AppRemoteSpotifyController, NudgeStore) plus `AudioRouteObserver` into a process-scoped `SessionGraph` (`session/SessionGraph.kt`) anchored in a new `JoinThePartyApplication`; re-scope `SessionViewModel` onto SessionGraph's `CoroutineScope(SupervisorJob() + Dispatchers.Default)` — no more `viewModelScope` / `onCleared` → `engine.close()`; `MainActivity` reattaches to the live instance instead of `by viewModels { Factory }`. Single-owner rule for `engine.close()` per tech-req §2.5.
+**Acceptance criteria:**
+- Existing `SessionViewModel` JVM unit tests still pass unmodified against the injected scope.
+- Activity recreation (rotation) reattaches to the live session without losing phase or track.
+- `engine.close()` has exactly one caller (`SessionGraph`), invoked only once phase is terminal (`idle`/`error`, not transient `lost`) and `SessionForegroundService` has stopped (tech-req §2.5, arch §9).
+**Dependencies:** INT-02, UI-02.
+
+### INT-06b · SessionForegroundService + notification
+**Description:** Mic-type foreground service (`service/SessionForegroundService.kt`, `foregroundServiceType="microphone"`) owning lifetime + notification only, per tech-req §2.5 / arch §9: `startForegroundService` from the session flow when phase leaves `idle` (always foreground-tap-triggered — mic FGS can't start from background on API 34+); `stopSelf` when phase returns to `idle`/terminal `error`; `android:stopWithTask="false"` so a task swipe doesn't kill an active session. One silent `IMPORTANCE_LOW` "session" notification channel; `NotificationCompat` content per the §2.5 phase→text mapping (incl. track title/artist); Stop action → `ACTION_STOP` intent → `SessionViewModel.reset()`; notification updates on phase/track change only, never per-second position. Manifest gains `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MICROPHONE`, `POST_NOTIFICATIONS`, and the service declaration.
+**Acceptance criteria:**
+- Session survives screen-off and 10+ minutes backgrounded with mic capture live (field-verified).
+- Notification text reflects each phase transition per the §2.5 table, including track title/artist.
+- Stop action ends the session and removes the notification.
+- Task-swipe does not kill an active session.
+**Dependencies:** INT-06a.
+
+### INT-06c · Activity as pure viewer + permission flow
+**Description:** `MainActivity` requests `POST_NOTIFICATIONS` (API 33+) alongside `RECORD_AUDIO` in one flow; `AppRemoteSpotifyController.activityContext` handoff moves from `onCreate`/`onDestroy` to `onStart`/`onStop` (tech-req §2.5), set only while the Activity can render App Remote's consent UI; keep-screen-on workaround removed (grep-verified none remains, arch §9); backgrounded-consent failure surfaces `needsSpotify` with the notification's "Action needed" copy as the recovery path.
+**Acceptance criteria:**
+- Fresh install grants both permissions (`RECORD_AUDIO`, `POST_NOTIFICATIONS`) in one flow.
+- Denying notifications still allows a working session (notification suppressed, FGS runs) per the §2.5 permission matrix.
+- No Activity reference outlives `onStop` in `AppRemoteSpotifyController`.
+**Dependencies:** INT-06b.
+
 ---
 
 ## Dependency graph (summary)
@@ -332,6 +358,8 @@ SCAF-01 ─▶ SCAF-02 ─▶ SCAF-04 ─▶ UI-01
             ├─▶ CORE-04 ─▶ INT-03
             └─▶ CORE-05 ─▶ CORE-06 ─▶ INT-04
                               CORE-07 (gate, feeds INT-05)
+
+INT-02, UI-02 ─▶ INT-06a ─▶ INT-06b ─▶ INT-06c
 ```
 
 ## Critical path to MVP-on-device (INT-01, iOS)
