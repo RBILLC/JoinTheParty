@@ -153,6 +153,14 @@ struct sc_session {
         uint64_t room_anchor_ns = 0;
         bool room_anchor_confirmed = false;
         int consecutive_self_rejects = 0;
+        // A fix that broke the room timeline without matching our own
+        // position. It is held aside rather than acted on: if the NEXT fix
+        // continues ITS timeline the room genuinely moved and we adopt it,
+        // otherwise it was a one-off recognizer error and the established
+        // room timeline survives. Without this, a single bad offset wiped
+        // the confirmed anchor and disarmed the self-match guard.
+        int64_t cand_offset_ms = -1;
+        uint64_t cand_ns = 0;
         std::vector<float> scratch;
     } wk;
 
@@ -239,6 +247,7 @@ struct sc_session {
                 wk.room_anchor_offset_ms = -1;
                 wk.room_anchor_confirmed = false;
                 wk.consecutive_self_rejects = 0;
+                wk.cand_offset_ms = -1;
                 dispatch(SC_EVT_TRACK_LOST, nullptr);
                 break;
         }
@@ -302,6 +311,14 @@ struct sc_session {
                 const bool tracks_room =
                     anchor_usable &&
                     std::abs(off - predicted_room) <= kRoomContinuityGateMs;
+                const bool cand_usable =
+                    wk.cand_offset_ms >= 0 && t > wk.cand_ns &&
+                    t - wk.cand_ns < kRoomPredictionMaxAgeNs;
+                const bool tracks_cand =
+                    cand_usable &&
+                    std::abs(off - (static_cast<double>(wk.cand_offset_ms) +
+                                    static_cast<double>(t - wk.cand_ns) / 1e6)) <=
+                        kRoomContinuityGateMs;
 
                 if (anchor_usable && wk.room_anchor_confirmed && !tracks_room &&
                     wk.estimator.has_player_state() &&
@@ -327,12 +344,36 @@ struct sc_session {
                     return;
                 }
                 wk.policy.on_fix_accepted(t);
-                // Two consecutive fixes that agree on one continuous room
-                // timeline confirm the reference; anything else re-seeds it
-                // unconfirmed (song change, room skip, or a bad seed).
-                wk.room_anchor_confirmed = tracks_room;
-                wk.room_anchor_offset_ms = cmd.fix.match_offset_ms;
-                wk.room_anchor_ns = t;
+                // Maintain the room timeline. Field Test 5 (song 2) showed
+                // why this must NOT simply re-seed on every accepted fix:
+                // with the recognizer alternating between the room and our
+                // own audio, every other fix broke continuity, so the anchor
+                // was never confirmed, so the guard never rejected anything —
+                // and the engine settled 1.7 s ahead of the room while
+                // reporting −3 ms. The established timeline has to survive an
+                // isolated bad offset.
+                if (tracks_room) {
+                    wk.room_anchor_offset_ms = cmd.fix.match_offset_ms;
+                    wk.room_anchor_ns = t;
+                    wk.room_anchor_confirmed = true;
+                    wk.cand_offset_ms = -1;
+                } else if (tracks_cand) {
+                    // Two fixes now agree on a DIFFERENT continuous timeline:
+                    // the room really did move (new song, someone skipped).
+                    wk.room_anchor_offset_ms = cmd.fix.match_offset_ms;
+                    wk.room_anchor_ns = t;
+                    wk.room_anchor_confirmed = true;
+                    wk.cand_offset_ms = -1;
+                } else {
+                    // Hold it aside; keep whatever room timeline we had.
+                    wk.cand_offset_ms = cmd.fix.match_offset_ms;
+                    wk.cand_ns = t;
+                    if (!anchor_usable) {
+                        wk.room_anchor_offset_ms = cmd.fix.match_offset_ms;
+                        wk.room_anchor_ns = t;
+                        wk.room_anchor_confirmed = false;
+                    }
+                }
                 wk.consecutive_self_rejects = 0;
                 // The OBSERVATION belongs at capture time t (above), but the
                 // DECISION belongs at now: a fix is 0.8–1.9 s old by the time
