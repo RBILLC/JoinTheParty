@@ -5,7 +5,6 @@ import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
-import android.provider.Settings
 import androidx.compose.animation.core.AnimationState
 import androidx.compose.animation.core.animateDecay
 import androidx.compose.animation.core.exponentialDecay
@@ -49,6 +48,7 @@ import androidx.compose.ui.unit.sp
 import com.jointheparty.app.ui.theme.BilletTheme
 import com.jointheparty.app.ui.theme.BilletType
 import com.jointheparty.app.ui.theme.DT
+import com.jointheparty.app.ui.theme.isReducedMotionEnabled
 import com.jointheparty.app.ui.theme.machinedDepth
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.launch
@@ -412,10 +412,6 @@ private fun rubberBandPt(rawPt: Float, rangePt: Float): Float = when {
     rawPt < -rangePt -> -rangePt + (rawPt + rangePt) * RUBBER_BAND_RATE
     else -> rawPt
 }
-
-/** §5: "Reduced Motion ... wheel inertia off (detent-step only)." */
-private fun isReducedMotionEnabled(context: Context): Boolean =
-    Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f
 
 // ---- Layout / drawing constants -------------------------------------------
 

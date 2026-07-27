@@ -145,6 +145,16 @@ class SessionViewModel(
     val meterFrames: Flow<MeterFrame> = engine.meterFrames.map { it.toMeterFrame() }
 
     /**
+     * CAL-06: pass-through of [SyncEngine.inputLevel] — same high-frequency
+     * stream family as [meterFrames] (technical-requirements.md §2.1), so it
+     * is bypassed here exactly the same way: never collected into
+     * [syncState], never observed by the session screen root. Collect only
+     * inside the phase-word composable that drives its opacity in
+     * LISTENING/MATCHING (ui-ux §6.1 "Before the meter").
+     */
+    val inputLevel: Flow<Float> = engine.inputLevel()
+
+    /**
      * Field request: the song's current position, 1 Hz, projected between
      * player-state events. −1 while unknown. Collected only by the small
      * clock composable (same isolation idea as the meter stream).

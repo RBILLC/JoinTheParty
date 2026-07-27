@@ -1,6 +1,9 @@
 package com.jointheparty.app.ui.session
 
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -19,6 +22,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -30,6 +34,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
@@ -42,8 +48,10 @@ import com.jointheparty.app.ui.model.MeterFrame
 import com.jointheparty.app.ui.theme.BilletTheme
 import com.jointheparty.app.ui.theme.BilletType
 import com.jointheparty.app.ui.theme.DT
+import com.jointheparty.app.ui.theme.isReducedMotionEnabled
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 
 /**
  * UI-05: session screen assembly (ui-ux-design-system.md §4, §6.1–6.3;
@@ -62,8 +70,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
  *
  * Stateless by design: the Activity owns [SessionViewModel] and passes
  * projections in, so phase transitions, the engine, and the two-stream rule
- * (technical-requirements.md §2.3 — [meterFrames] is a bare pass-through,
- * never folded into [state]) all stay out of this file entirely.
+ * (technical-requirements.md §2.3 — [meterFrames] and [inputLevel] are both
+ * bare pass-throughs, never folded into [state]) all stay out of this file
+ * entirely.
  */
 @Composable
 fun SessionScreen(
@@ -84,6 +93,10 @@ fun SessionScreen(
     playbackPositionMs: Flow<Long> = MutableStateFlow(-1L),
     // UX audit #1: every in-session phase needs an exit back to IDLE.
     onLeaveSession: () -> Unit = {},
+    // CAL-06: CAL-05's smoothed mic level (0..1, high-frequency stream
+    // family — see meterFrames' doc comment above; default keeps
+    // previews/simple hosts terse).
+    inputLevel: Flow<Float> = MutableStateFlow(0f),
 ) {
     var showCalibration by remember { mutableStateOf(false) }
     Box(
@@ -110,6 +123,7 @@ fun SessionScreen(
                 )
                 PhaseGroup.WAITING -> WaitingContent(
                     phase = state.phase,
+                    level = inputLevel,
                     onCancel = onLeaveSession,
                 )
                 PhaseGroup.ACTIVE -> ActiveContent(
@@ -243,9 +257,11 @@ private fun IdleContent(
 /**
  * LISTENING / MATCHING: quiet phase text only — no meter, no track block, no
  * spinner or progress bar (Billet rejects gamified "working…" UI wholesale).
+ * [level] drives the phase word's opacity (CAL-06, §6.1) — collected inside
+ * [PhaseWord] alone, never here.
  */
 @Composable
-private fun WaitingContent(phase: SessionPhase, onCancel: () -> Unit = {}) {
+private fun WaitingContent(phase: SessionPhase, level: Flow<Float>, onCancel: () -> Unit = {}) {
     val word = when (phase) {
         SessionPhase.LISTENING -> "Listening…"
         SessionPhase.MATCHING -> "Matching…"
@@ -253,12 +269,7 @@ private fun WaitingContent(phase: SessionPhase, onCancel: () -> Unit = {}) {
     }
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                text = word,
-                style = BilletType.title,
-                color = DT.Colors.ink2,
-                textAlign = TextAlign.Center,
-            )
+            PhaseWord(word = word, level = level)
             // UX audit #1: the waiting states were inescapable.
             Text(
                 text = "Cancel",
@@ -270,6 +281,82 @@ private fun WaitingContent(phase: SessionPhase, onCancel: () -> Unit = {}) {
             )
         }
     }
+}
+
+/** Below this level the input is treated as "quiet" for Reduced Motion's two-value quantization. */
+private const val REDUCED_MOTION_LEVEL_THRESHOLD = 0.5f
+
+/** Opacity floor (silence) and the per-level multiplier, per §6.1 "Before the meter": `0.55 + 0.45 × level`. */
+private const val PHASE_WORD_OPACITY_FLOOR = 0.55f
+private const val PHASE_WORD_OPACITY_RANGE = 0.45f
+
+private fun phaseWordOpacity(level: Float): Float =
+    PHASE_WORD_OPACITY_FLOOR + PHASE_WORD_OPACITY_RANGE * level.coerceIn(0f, 1f)
+
+/**
+ * CAL-06: LISTENING/MATCHING's mic-reactive phase word (ui-ux §6.1 "Before
+ * the meter"). Text color stays a constant [DT.Colors.ink] — the "ink2 at
+ * rest, brightening toward ink" effect the spec describes is produced
+ * entirely by alpha compositing that fixed ink value over [DT.Colors.void]
+ * (never by swapping color tokens), which is also how the "no color other
+ * than ink/ink2/ink3" constraint stays trivially true: only `ink` is ever
+ * used here.
+ *
+ * Two-stream rule (technical-requirements.md §2.1/§2.3), same idiom as
+ * [SyncMeter]: [level] is collected HERE, in this leaf alone, written into
+ * an [Animatable] driven by the `settle` spring (ω=[DT.Motion.settleOmega]),
+ * and that animated value is read only inside [Modifier.graphicsLayer]'s
+ * lambda — a draw/layout-phase read, so a new sample invalidates this
+ * text's layer alone. Nothing above this composable (WaitingContent,
+ * SessionScreen's root) ever recomposes because the level ticked.
+ */
+@Composable
+private fun PhaseWord(word: String, level: Flow<Float>) {
+    val context = LocalContext.current
+    val reducedMotion = remember { isReducedMotionEnabled(context) }
+    val opacity = remember { Animatable(PHASE_WORD_OPACITY_FLOOR) }
+    var quantizedBright by remember { mutableStateOf(false) }
+
+    LaunchedEffect(level, reducedMotion) {
+        level.collect { raw ->
+            val clamped = raw.coerceIn(0f, 1f)
+            if (reducedMotion) {
+                // Reduced Motion (§5): no continuous tracking — the level
+                // quantizes to dim/bright and only crossfades (200ms, tween)
+                // when that quantized state actually flips.
+                val bright = clamped >= REDUCED_MOTION_LEVEL_THRESHOLD
+                if (bright != quantizedBright) {
+                    quantizedBright = bright
+                    launch {
+                        opacity.animateTo(
+                            targetValue = phaseWordOpacity(if (bright) 1f else 0f),
+                            animationSpec = tween(DT.Motion.reducedMotionCrossfadeMs.toInt()),
+                        )
+                    }
+                }
+            } else {
+                // Full motion: eased continuously through `settle` so a
+                // stray syllable doesn't flicker it (§6.1).
+                launch {
+                    opacity.animateTo(
+                        targetValue = phaseWordOpacity(clamped),
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioNoBouncy,
+                            stiffness = DT.Motion.settleOmega * DT.Motion.settleOmega,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    Text(
+        text = word,
+        style = BilletType.title,
+        color = DT.Colors.ink,
+        textAlign = TextAlign.Center,
+        modifier = Modifier.graphicsLayer { alpha = opacity.value },
+    )
 }
 
 /**
@@ -542,7 +629,7 @@ private fun SessionScreenIdlePreview() {
     }
 }
 
-@Preview(name = "Listening — quiet text only", showBackground = true, backgroundColor = 0xFF131110)
+@Preview(name = "Listening — silence (0.55 floor)", showBackground = true, backgroundColor = 0xFF131110)
 @Composable
 private fun SessionScreenListeningPreview() {
     BilletTheme {
@@ -554,6 +641,25 @@ private fun SessionScreenListeningPreview() {
             onTrimCommit = {},
             onGetSpotify = {},
             onSeePremiumPlans = {},
+            inputLevel = MutableStateFlow(0f),
+        )
+    }
+}
+
+/** CAL-06: level pinned near its ceiling — phase word brightening toward `ink`. */
+@Preview(name = "Listening — mic-bright", showBackground = true, backgroundColor = 0xFF131110)
+@Composable
+private fun SessionScreenListeningBrightPreview() {
+    BilletTheme {
+        SessionScreen(
+            state = SyncState(phase = SessionPhase.LISTENING),
+            meterFrames = MutableStateFlow(MeterFrame.Initial),
+            onJoinTap = {},
+            onTrimChange = {},
+            onTrimCommit = {},
+            onGetSpotify = {},
+            onSeePremiumPlans = {},
+            inputLevel = MutableStateFlow(1f),
         )
     }
 }

@@ -134,6 +134,7 @@ class MainActivity : ComponentActivity() {
                             spotifyLinked = spotifyLinkedState.value,
                             playbackPositionMs = viewModel.playbackPositionMs,
                             onLeaveSession = viewModel::reset,
+                            inputLevel = viewModel.inputLevel,
                         )
                     }
                 }
