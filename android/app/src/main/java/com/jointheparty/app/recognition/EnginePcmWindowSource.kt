@@ -63,7 +63,19 @@ class EnginePcmWindowSource(
 
     private companion object {
         const val ENGINE_RATE_HZ = 48_000
-        const val WINDOW_SECONDS = 10
+
+        /**
+         * Field Test 5: a song change took ~15 s to pick up, and most of that
+         * was this window. It always holds the MOST RECENT audio, so straight
+         * after the room changes track it is still mostly the OLD song — no
+         * match is possible until the new song dominates it. At 10 s that is
+         * ~6-8 s of dead time before the first identify can even succeed.
+         *
+         * 6 s stays well above ACRCloud's 3-5 s fingerprinting floor (we have
+         * matched reliably at peak levels as low as 0.12) while halving the
+         * contamination window, and it shrinks each upload to ~96 KB.
+         */
+        const val WINDOW_SECONDS = 6
         const val MIN_SECONDS = 3
         const val DECIMATION = 6  // 48 kHz → 8 kHz
     }

@@ -78,6 +78,9 @@ private const val ENGINE_DEADBAND_MS = 350
  */
 private const val REBASE_MIN_CONFIDENCE = 0.6f
 
+/** First identify attempt after losing the track (§ re-acquire speed). */
+private const val REACQUIRE_FIRST_PASS_MS = 1_000L
+
 /** Settle time after pausing our own output before the mic is worth sampling. */
 private const val AUTO_ADVANCE_QUIET_MS = 700L
 
@@ -904,7 +907,11 @@ class SessionViewModel(
                 samplingAttempts = 0
                 onMatchInFlight()
                 viewModelScope.launch(dispatcher) {
-                    delay(RECOGNITION_RETRY_MS / 2)
+                    // Field Test 5: this was RECOGNITION_RETRY_MS / 2 (3 s) of
+                    // dead time added to an already slow re-acquire. The
+                    // capture window gates how soon a match is possible, so
+                    // there is nothing to gain by also waiting here.
+                    delay(REACQUIRE_FIRST_PASS_MS)
                     runRecognitionPass()
                 }
             }
