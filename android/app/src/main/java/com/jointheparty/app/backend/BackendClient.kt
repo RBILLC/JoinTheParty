@@ -75,9 +75,9 @@ sealed interface TrackResolution {
  * built, wired, and unit-tested end-to-end today (unblocks INT-02) without
  * waiting on the AUTH-03/04 server work. Swap procedure: once the backend
  * is deployed, construct `HttpBackendClient(realBaseUrl)` — the one call
- * site (`SessionViewModel.Companion.Factory`) is the only place that needs
- * to change; [HttpBackendClient] itself, [ShazamKitProvider], and every
- * other caller are already written against the real HTTP path below.
+ * site (`SessionGraph`, INT-06a) is the only place that needs to change;
+ * [HttpBackendClient] itself, [ShazamKitProvider], and every other caller
+ * are already written against the real HTTP path below.
  */
 class HttpBackendClient(private val baseUrl: String?) : BackendClient {
 

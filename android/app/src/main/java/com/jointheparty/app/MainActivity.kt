@@ -9,7 +9,6 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -23,7 +22,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
-import com.jointheparty.app.audio.AudioRouteObserver
 import com.jointheparty.app.data.DataStoreAppPrefs
 import com.jointheparty.app.spotify.SpotifyAppDetector
 import com.jointheparty.app.spotify.auth.EncryptedTokenStore
@@ -38,17 +36,20 @@ import kotlinx.coroutines.launch
 
 /**
  * UI-05: hosts the session. The Activity owns platform concerns only —
- * mic permission, route observation — and hands projections/callbacks to
- * the stateless [SessionScreen]. All session logic lives in
- * [SessionViewModel]; all engine traffic below that.
+ * mic permission, App Remote's consent UI handoff — and hands
+ * projections/callbacks to the stateless [SessionScreen]. All session logic
+ * lives in [SessionViewModel]; all engine traffic below that. Route
+ * observation moved to [com.jointheparty.app.session.SessionGraph] (INT-06a,
+ * technical-requirements.md §2.5) — the session outlives this Activity.
  */
 class MainActivity : ComponentActivity() {
 
-    private val viewModel: SessionViewModel by viewModels {
-        SessionViewModel.Companion.Factory(applicationContext)
-    }
-
-    private var routeObserver: AudioRouteObserver? = null
+    // INT-06a: the graph — and this ViewModel — is process-scoped
+    // (JoinThePartyApplication.sessionGraph), not owned by this Activity's
+    // ViewModelStore, so recreation (rotation) reattaches to the same live
+    // instance instead of rebuilding the session.
+    private val viewModel: SessionViewModel
+        get() = (application as JoinThePartyApplication).sessionGraph.viewModel
 
     private val appPrefs by lazy { DataStoreAppPrefs(applicationContext) }
 
@@ -78,10 +79,6 @@ class MainActivity : ComponentActivity() {
 
         // App Remote presents its authorization UI through an Activity.
         viewModel.attachActivity(this)
-
-        routeObserver = AudioRouteObserver(this) { route, routeId, routeName ->
-            viewModel.onRouteChanged(routeId, routeName, route)
-        }.also { it.start() }
 
         // AUTH-02: complete the PKCE exchange when the Custom Tab redirects
         // back through AuthCallbackActivity → PendingCallback.
@@ -181,8 +178,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         viewModel.attachActivity(null)  // never outlive this Activity
-        routeObserver?.stop()
-        routeObserver = null
         super.onDestroy()
     }
 }

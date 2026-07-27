@@ -1,20 +1,11 @@
 package com.jointheparty.app.ui.session
 
-import android.content.Context
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.viewModelScope
 import com.jointheparty.app.backend.BackendClient
-import com.jointheparty.app.backend.HttpBackendClient
 import com.jointheparty.app.backend.TrackResolution
 import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.core.SyncEngine
-import com.jointheparty.app.data.DataStoreNudgeStore
-import com.jointheparty.app.audio.AudioTrackChirpPlayer
 import com.jointheparty.app.audio.ChirpPlayer
 import com.jointheparty.app.data.NudgeStore
-import com.jointheparty.app.recognition.ACRCloudProvider
-import com.jointheparty.app.recognition.EnginePcmWindowSource
 import com.jointheparty.app.recognition.RecognitionProvider
 import com.jointheparty.app.spotify.AppRemoteSpotifyController
 import com.jointheparty.app.spotify.SpotifyController
@@ -25,8 +16,10 @@ import com.jointheparty.app.ui.model.MeterFrame
 import com.jointheparty.app.ui.model.toMeterFrame
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -58,14 +51,6 @@ private const val RECOGNITION_RETRY_MS = 6_000L
 
 /** ~2 minutes of shell-driven sampling before giving up (quota guard). */
 private const val MAX_SAMPLING_ATTEMPTS = 20
-
-/**
- * Engine correction deadband for this shell (sc_config_t.deadband_ms):
- * above ACR's fix noise so corrections fire only on audibly-wrong error;
- * an audible skip every few seconds annoys more than sub-400 ms offset
- * between separated sources.
- */
-private const val ENGINE_DEADBAND_MS = 350
 
 /**
  * Below this confidence a wheel commit skips the error rebase (§4.4).
@@ -141,7 +126,14 @@ class SessionViewModel(
     private val chirp: ChirpPlayer? = null,
     // INT-02: the playback half of the loop. Null in unit tests.
     private val spotify: SpotifyController? = null,
-) : ViewModel() {
+    // INT-06a (technical-requirements.md §2.5): the session's lifetime
+    // anchor, owned by SessionGraph — replaces the former `viewModelScope`.
+    // Defaults from `dispatcher` (not a bare Dispatchers.Default) so the JVM
+    // unit tests, which construct positionally with a shared
+    // StandardTestDispatcher and never pass this parameter, get a scope
+    // driven by that same test scheduler.
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + dispatcher),
+) {
 
     private val _syncState = MutableStateFlow(SyncState())
     val syncState: StateFlow<SyncState> = _syncState.asStateFlow()
@@ -192,7 +184,7 @@ class SessionViewModel(
         // undispatched registers the collector synchronously, before this
         // constructor returns; every hop after its first suspension point
         // still runs on `dispatcher` as normal.
-        viewModelScope.launch(dispatcher, start = CoroutineStart.UNDISPATCHED) {
+        scope.launch(dispatcher, start = CoroutineStart.UNDISPATCHED) {
             engine.events.collect { event -> onEngineEvent(event) }
         }
     }
@@ -233,7 +225,7 @@ class SessionViewModel(
             // audio); firing instantly returned null and nothing retried —
             // the app sat in MATCHING forever. First pass at +4 s; misses
             // retry on a 6 s cadence while MATCHING (see runRecognitionPass).
-            viewModelScope.launch(dispatcher) {
+            scope.launch(dispatcher) {
                 delay(INITIAL_CAPTURE_FILL_MS)
                 runRecognitionPass()
             }
@@ -265,7 +257,7 @@ class SessionViewModel(
         aimCaptureMonoNs: Long?,
     ) {
         val controller = spotify ?: return
-        viewModelScope.launch(dispatcher) {
+        scope.launch(dispatcher) {
             when (val r = controller.connect()) {
                 SpotifyController.ConnectionResult.Connected -> {
                     // Re-acquiring the track we are ALREADY on must not call
@@ -365,7 +357,7 @@ class SessionViewModel(
 
     private fun playerStateWatcher() {
         val controller = spotify ?: return
-        viewModelScope.launch(dispatcher) {
+        scope.launch(dispatcher) {
             controller.playerStates.collect { state ->
                 if (_syncState.value.phase == SessionPhase.AIMING) {
                     onPlaybackStarted()
@@ -520,7 +512,7 @@ class SessionViewModel(
             )
             spotify?.seekTo(projected + deltaMs)
         }
-        viewModelScope.launch(dispatcher) {
+        scope.launch(dispatcher) {
             nudgeStore.saveTrim(routeId, trimMs)
             // Audit §4.2: the rebased setpoint is what makes the NEXT
             // session start aligned — persist it beside the wheel value.
@@ -530,7 +522,7 @@ class SessionViewModel(
 
     /** Route reconnect: load persisted trim + command-latency prior, apply both. */
     fun onRouteChanged(routeId: String, routeName: String?, route: SyncCore.Route) {
-        viewModelScope.launch(dispatcher) {
+        scope.launch(dispatcher) {
             val trim = nudgeStore.trimFor(routeId)
             // INT-03 fix: setOutputRoute's prior is the chirp-calibrated
             // OUTPUT-chain latency, not Spotify's command latency (which
@@ -597,7 +589,7 @@ class SessionViewModel(
             _syncState.update {
                 it.copy(calibration = CalibrationState.Success(event.latencyMs))
             }
-            viewModelScope.launch(dispatcher) {
+            scope.launch(dispatcher) {
                 // Persisted beside the route's trim; replayed into
                 // sc_set_output_route on every reconnect (onRouteChanged).
                 nudgeStore.saveOutputLatency(routeId, event.latencyMs)
@@ -707,7 +699,7 @@ class SessionViewModel(
         if (!recognitionInFlight.compareAndSet(false, true)) return
         samplingAttempts += 1
 
-        viewModelScope.launch(dispatcher) {
+        scope.launch(dispatcher) {
             var retry = false
             try {
                 val fix = recognizer.recognizeOnce()
@@ -792,7 +784,7 @@ class SessionViewModel(
             } finally {
                 recognitionInFlight.set(false)
                 if (retry) {
-                    viewModelScope.launch(dispatcher) {
+                    scope.launch(dispatcher) {
                         delay(RECOGNITION_RETRY_MS)
                         if (shouldKeepSampling()) runRecognitionPass()
                     }
@@ -903,7 +895,7 @@ class SessionViewModel(
         endOfTrackJob?.cancel()
         if (state.isPaused || state.durationMs <= 0) return
         val remaining = state.durationMs - state.positionMs - END_OF_TRACK_LEAD_MS
-        endOfTrackJob = viewModelScope.launch(dispatcher) {
+        endOfTrackJob = scope.launch(dispatcher) {
             delay(remaining.coerceAtLeast(0L))
             val uri = state.trackUri ?: return@launch
             if (_syncState.value.track?.spotifyUri != uri) return@launch
@@ -959,7 +951,7 @@ class SessionViewModel(
         firstEstimateSeen = false
         samplingAttempts = 0
         onMatchInFlight()
-        viewModelScope.launch(dispatcher) {
+        scope.launch(dispatcher) {
             // The pause has to actually take effect before the mic is worth
             // sampling, otherwise the first window still contains our audio.
             delay(AUTO_ADVANCE_QUIET_MS)
@@ -986,7 +978,7 @@ class SessionViewModel(
                 firstEstimateSeen = false
                 samplingAttempts = 0
                 onMatchInFlight()
-                viewModelScope.launch(dispatcher) {
+                scope.launch(dispatcher) {
                     // Field Test 5: this was RECOGNITION_RETRY_MS / 2 (3 s) of
                     // dead time added to an already slow re-acquire. The
                     // capture window gates how soon a match is possible, so
@@ -1047,44 +1039,4 @@ class SessionViewModel(
         }
     }
 
-    override fun onCleared() {
-        engine.close()
-    }
-
-    companion object {
-        /** Builds a [SessionViewModel] wired to a real [SyncCore] + DataStore. */
-        class Factory(private val context: Context) : ViewModelProvider.Factory {
-            @Suppress("UNCHECKED_CAST")
-            override fun <T : ViewModel> create(modelClass: Class<T>): T {
-                // AUTH-03/04: no backend is deployed yet, so this is the
-                // mock-mode HttpBackendClient(baseUrl = null) — see its
-                // class doc for the swap procedure once one exists.
-                val backendClient = HttpBackendClient(baseUrl = null)
-                val engine = SyncCore(deadbandMs = ENGINE_DEADBAND_MS)
-                // ACRCloud credentials come from the gitignored
-                // android/local.properties via BuildConfig (acr.host /
-                // acr.key / acr.secret) — see app/build.gradle.kts. Empty
-                // (unconfigured) keeps recognition safely inert.
-                val acrConfig = ACRCloudProvider.Config(
-                    host = com.jointheparty.app.BuildConfig.ACR_HOST,
-                    accessKey = com.jointheparty.app.BuildConfig.ACR_KEY,
-                    accessSecret = com.jointheparty.app.BuildConfig.ACR_SECRET,
-                )
-                return SessionViewModel(
-                    engine = engine,
-                    nudgeStore = DataStoreNudgeStore(context.applicationContext),
-                    recognition = ACRCloudProvider(
-                        config = acrConfig.takeIf { it.accessKey.isNotEmpty() },
-                        source = EnginePcmWindowSource(engine),
-                    ),
-                    backend = backendClient,
-                    chirp = AudioTrackChirpPlayer(),
-                    spotify = AppRemoteSpotifyController(
-                        context = context.applicationContext,
-                        engine = engine,
-                    ),
-                ) as T
-            }
-        }
-    }
 }

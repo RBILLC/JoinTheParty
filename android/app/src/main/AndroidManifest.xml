@@ -13,6 +13,7 @@
     </queries>
 
     <application
+        android:name=".JoinThePartyApplication"
         android:label="JoinTheParty"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
