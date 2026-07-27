@@ -566,8 +566,10 @@ class SessionViewModel(
 
     /**
      * INT-02: App Remote needs an Activity to present its consent UI (see
-     * AppRemoteSpotifyController.activityContext). MainActivity attaches
-     * itself while alive and detaches in onDestroy.
+     * AppRemoteSpotifyController.activityContext). INT-06c: MainActivity
+     * attaches itself in onStart and detaches in onStop — set only while
+     * the Activity is started, the window where App Remote's consent UI
+     * could actually render (tech-req §2.5).
      */
     fun attachActivity(activity: android.app.Activity?) {
         (spotify as? AppRemoteSpotifyController)?.activityContext = activity

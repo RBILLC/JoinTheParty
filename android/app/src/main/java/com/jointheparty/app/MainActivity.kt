@@ -5,6 +5,7 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -67,18 +68,20 @@ class MainActivity : ComponentActivity() {
     /** Field feedback: the IDLE screen must know Spotify is already linked. */
     private val spotifyLinkedState = androidx.compose.runtime.mutableStateOf(false)
 
-    private val micPermission = registerForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        if (granted) viewModel.startListening()
+    // INT-06c: RECORD_AUDIO and POST_NOTIFICATIONS (API 33+) are requested
+    // together in one flow. See joinTapped() for when each is included.
+    private val permissionRequest = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { results ->
+        if (results[Manifest.permission.RECORD_AUDIO] == true) viewModel.startListening()
         // Denied: stay in IDLE — the Join button remains the retry point.
+        // POST_NOTIFICATIONS denial is non-fatal (tech-req §2.5 permission
+        // matrix) — the FGS still runs, its notification is just
+        // suppressed — so it never gates startListening() here.
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // App Remote presents its authorization UI through an Activity.
-        viewModel.attachActivity(this)
 
         // AUTH-02: complete the PKCE exchange when the Custom Tab redirects
         // back through AuthCallbackActivity → PendingCallback.
@@ -169,15 +172,44 @@ class MainActivity : ComponentActivity() {
         ) {
             return
         }
-        val granted = ContextCompat.checkSelfPermission(
+        val micGranted = ContextCompat.checkSelfPermission(
             this, Manifest.permission.RECORD_AUDIO,
         ) == PackageManager.PERMISSION_GRANTED
-        if (granted) viewModel.startListening()
-        else micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        if (micGranted) {
+            // INT-06c: mic is the gating permission. Once it's granted we
+            // never re-ask for POST_NOTIFICATIONS on a later tap — a
+            // denied notification permission is non-fatal (§2.5) and must
+            // not block or nag the join flow.
+            viewModel.startListening()
+            return
+        }
+        // First-run one-shot combined ask: RECORD_AUDIO (missing here) plus
+        // POST_NOTIFICATIONS on API 33+ if it isn't already granted.
+        val permissions = buildList {
+            add(Manifest.permission.RECORD_AUDIO)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                ContextCompat.checkSelfPermission(
+                    this@MainActivity, Manifest.permission.POST_NOTIFICATIONS,
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }.toTypedArray()
+        permissionRequest.launch(permissions)
     }
 
-    override fun onDestroy() {
-        viewModel.attachActivity(null)  // never outlive this Activity
-        super.onDestroy()
+    override fun onStart() {
+        super.onStart()
+        // INT-06c: attach only while the Activity is started — the window
+        // where App Remote's consent UI could actually render (tech-req
+        // §2.5). A backgrounded reconnect that needs consent fails closed
+        // to needsSpotify; the service notification's "Action needed"
+        // copy is the recovery path.
+        viewModel.attachActivity(this)
+    }
+
+    override fun onStop() {
+        viewModel.attachActivity(null)
+        super.onStop()
     }
 }
