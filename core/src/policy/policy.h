@@ -38,6 +38,15 @@ struct PolicyConfig {
     double command_latency_max_ms = 2000.0;
     double deadband_ms = 25.0;
     double lost_threshold_ms = 2000.0;
+    // Field Test 4: never act on an estimate the measurements no longer
+    // support. While the self-match guard was rejecting fixes, the filter
+    // coasted for ~25 s and its confidence decayed to 0.19 — and the policy
+    // then issued −2.6 s corrections that audibly threw the phone out of
+    // sync ("3 beats behind"), even though every raw observation in that
+    // window read +177 ms. An accepted fix restores confidence to ~0.8
+    // immediately, so genuine corrections are unaffected; only unsupported
+    // ones are withheld. Seeking on a guess is worse than not seeking.
+    float min_confidence_to_correct = 0.35f;
     uint64_t settle_ns = 3'000'000'000ull;
     uint64_t seek_ack_timeout_ns = 5'000'000'000ull;
     uint64_t fix_interval_min_ns = 8'000'000'000ull;

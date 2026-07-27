@@ -598,8 +598,15 @@ class SessionViewModel(
                     event.seekToMs -
                         (it.positionMs + (System.nanoTime() - it.receivedMonoNs) / 1_000_000)
                 }
+                // e= and conf= are the engine state the correction was
+                // computed from. Field Test 4 burned a whole run because the
+                // trace showed only the jump: −2.6 s seeks that matched
+                // neither the raw observation nor the reported sync error,
+                // and there was no way to tell which input was lying.
                 com.jointheparty.app.debug.DebugLog.log(
-                    "CORRECTION → seek ${event.seekToMs}ms (jump ${jumpMs ?: "?"}ms)",
+                    "CORRECTION → seek ${event.seekToMs}ms (jump ${jumpMs ?: "?"}ms) " +
+                        "e=${"%.0f".format(lastEstimateErrorMs)} " +
+                        "conf=${"%.2f".format(lastEstimateConfidence)}",
                 )
                 spotify?.seekTo(event.seekToMs)
             }

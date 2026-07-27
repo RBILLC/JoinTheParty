@@ -53,6 +53,34 @@ void test_correction_outside_deadband() {
     CHECK(a.seek_to_ms == 100190);
 }
 
+// Field Test 4: while the self-match guard starved the filter, its estimate
+// coasted for ~25 s down to confidence 0.19 and the policy kept issuing
+// −2.6 s seeks off it — audible as "3 beats behind" — even though every raw
+// observation in that window read +177 ms. Unsupported estimates must not
+// move audio.
+void test_no_correction_on_stale_estimate() {
+    synccore::CorrectionPolicy pol;
+    auto stale = make_est(600.0);
+    stale.confidence = 0.19f;  // the value observed in the field trace
+    CHECK(pol.on_estimate(stale, 100000.0, 10 * kSec).kind ==
+          synccore::ActionKind::kNone);
+
+    // The same error, freshly measured, still corrects — the floor withholds
+    // guesses, not genuine corrections.
+    auto fresh = make_est(600.0);
+    fresh.confidence = 0.8f;
+    CHECK(pol.on_estimate(fresh, 100000.0, 20 * kSec).kind ==
+          synccore::ActionKind::kSeek);
+
+    // Track-lost is exempt: an error that large is worth acting on however
+    // we came to believe it.
+    synccore::CorrectionPolicy pol2;
+    auto lost = make_est(5000.0);
+    lost.confidence = 0.05f;
+    CHECK(pol2.on_estimate(lost, 100000.0, 10 * kSec).kind ==
+          synccore::ActionKind::kTrackLost);
+}
+
 void test_track_lost_threshold() {
     synccore::CorrectionPolicy pol;
     CHECK(pol.on_estimate(make_est(1999.0), 0.0, kSec).kind ==
@@ -234,6 +262,7 @@ int main() {
     test_no_correction_inside_deadband();
     test_correction_outside_deadband();
     test_track_lost_threshold();
+    test_no_correction_on_stale_estimate();
     test_settle_suppression_and_ack();
     test_ack_timeout_frees_policy();
     test_fix_cadence_adaptation();

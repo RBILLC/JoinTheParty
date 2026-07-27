@@ -78,6 +78,13 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
         fix_interval_ns_ = cfg_.fix_interval_base_ns;
     }
 
+    // A stale estimate is not evidence. Track-lost above still fires (a
+    // wildly wrong error is worth acting on however we learned it), but a
+    // micro-seek computed from a coasted state is a guess, and executing it
+    // both moves audio the listener can hear and feeds the latency learner
+    // a landing it cannot interpret.
+    if (est.confidence < cfg_.min_confidence_to_correct) return action;
+
     // Correct when out of the deadband now, or predicted to leave it before
     // the next measurement (§6.3 skew pre-emption).
     const double horizon_s =
