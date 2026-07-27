@@ -204,6 +204,10 @@ class AppRemoteSpotifyController(
                         positionMs = data.playbackPosition,
                         isPaused = data.isPaused,
                         receivedMonoNs = receivedMonoNs,
+                        // Spotify's own length for the track WE are playing —
+                        // exact, and the only duration we need: we are timing
+                        // OUR track's end, not guessing the room's version.
+                        durationMs = data.track?.duration ?: 0L,
                     )
                     lastKnownPlayerState = state
                     // Player states are event-driven (play/pause/seek), not

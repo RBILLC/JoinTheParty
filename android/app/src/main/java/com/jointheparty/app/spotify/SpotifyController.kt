@@ -34,6 +34,8 @@ interface SpotifyController {
         val positionMs: Long,
         val isPaused: Boolean,
         val receivedMonoNs: Long,
+        /** Track length, 0 when unknown. Drives the end-of-track pause. */
+        val durationMs: Long = 0,
     )
 
     /** Every player-state event App Remote delivers, in order. */

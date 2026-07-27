@@ -78,6 +78,13 @@ private const val ENGINE_DEADBAND_MS = 350
  */
 private const val REBASE_MIN_CONFIDENCE = 0.6f
 
+/**
+ * Pause this far before our track's end. Enough margin that Spotify never
+ * reaches the auto-advance, small enough that no audible music is lost —
+ * the last fraction of a second of a fading outro.
+ */
+private const val END_OF_TRACK_LEAD_MS = 400L
+
 /** First identify attempt after losing the track (§ re-acquire speed). */
 private const val REACQUIRE_FIRST_PASS_MS = 1_000L
 
@@ -368,6 +375,8 @@ class SessionViewModel(
                     state.trackUri != commanded && !state.isPaused
                 ) {
                     onSpotifyAutoAdvanced(controller, state.trackUri)
+                } else {
+                    scheduleEndOfTrackPause(controller, state)
                 }
             }
         }
@@ -465,6 +474,7 @@ class SessionViewModel(
             firstEstimateSeen = false
             samplingAttempts = 0
             autoAdvanceHandled = null
+            endOfTrackJob?.cancel()
             _syncState.update {
                 SyncState(routeId = it.routeId, routeName = it.routeName, nudgeMs = it.nudgeMs)
             }
@@ -799,6 +809,9 @@ class SessionViewModel(
     /** Track URI we have already reacted to auto-advancing onto (§ above). */
     private var autoAdvanceHandled: String? = null
 
+    /** Pending end-of-track pause; re-armed by every fresh player state. */
+    private var endOfTrackJob: kotlinx.coroutines.Job? = null
+
     private var lastEstimateErrorMs: Double = 0.0
 
     /** Freshness guard for the rebase (audit §4.4): a stale, low-confidence
@@ -868,6 +881,40 @@ class SessionViewModel(
     }
 
     /**
+     * Stop just before OUR track ends, so Spotify never gets the chance to
+     * pick the next one.
+     *
+     * `track.duration` is Spotify's own length for the track we are playing —
+     * exact, and the only duration this needs. It is deliberately NOT a guess
+     * about the room's version: if the room is playing a longer master we have
+     * no audio left for those extra seconds anyway, so pausing at our own end
+     * costs nothing that we could have played.
+     *
+     * This has to be a timer rather than a check on incoming player states,
+     * because App Remote only emits those on events (play/pause/seek/track
+     * change) — during steady playback nothing arrives for tens of seconds, so
+     * there would be no event near the end to react to. Every fresh state
+     * re-arms it, which also absorbs drift and our own corrections.
+     */
+    private fun scheduleEndOfTrackPause(
+        controller: SpotifyController,
+        state: SpotifyController.RemotePlayerState,
+    ) {
+        endOfTrackJob?.cancel()
+        if (state.isPaused || state.durationMs <= 0) return
+        val remaining = state.durationMs - state.positionMs - END_OF_TRACK_LEAD_MS
+        endOfTrackJob = viewModelScope.launch(dispatcher) {
+            delay(remaining.coerceAtLeast(0L))
+            val uri = state.trackUri ?: return@launch
+            if (_syncState.value.track?.spotifyUri != uri) return@launch
+            com.jointheparty.app.debug.DebugLog.log(
+                "track ending — pausing before Spotify picks the next one",
+            )
+            stopFollowingAndRelisten(controller, uri)
+        }
+    }
+
+    /**
      * Spotify reached the end of the track we asked for and moved on by
      * itself, to something the room is not playing.
      *
@@ -881,13 +928,29 @@ class SessionViewModel(
      *
      * The only way to hear the room again is to stop competing with it, so
      * pause first, drop the track, and re-listen exactly like a fresh join.
+     *
+     * This is the BACKSTOP. [scheduleEndOfTrackPause] should normally stop us
+     * before Spotify ever gets to choose, so reaching here means the timer was
+     * missed — no duration reported, or the track changed for some other
+     * reason (the user hit next in Spotify).
      */
     private fun onSpotifyAutoAdvanced(controller: SpotifyController, actualUri: String) {
         if (autoAdvanceHandled == actualUri) return  // one response per track
-        autoAdvanceHandled = actualUri
         com.jointheparty.app.debug.DebugLog.log(
             "Spotify auto-advanced to $actualUri — pausing to hear the room",
         )
+        stopFollowingAndRelisten(controller, actualUri)
+    }
+
+    /**
+     * Stop playing, forget the track, and go back to listening for the room —
+     * the shared tail of both the end-of-track timer and the auto-advance
+     * backstop. Our own speaker drowns out the room, so the pause has to land
+     * before the microphone is worth sampling again.
+     */
+    private fun stopFollowingAndRelisten(controller: SpotifyController, uri: String) {
+        autoAdvanceHandled = uri
+        endOfTrackJob?.cancel()
         controller.pause()
         _syncState.update { it.copy(track = null) }
         transition(SessionPhase.LOST)
