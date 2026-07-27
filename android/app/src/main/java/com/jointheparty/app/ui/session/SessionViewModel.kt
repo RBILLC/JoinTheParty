@@ -358,19 +358,37 @@ class SessionViewModel(
     private fun playerStateWatcher() {
         val controller = spotify ?: return
         scope.launch(dispatcher) {
+            // FIELD TEST 7: player states are EVENT-driven and this watcher
+            // starts only after the aim settles — when the first aim lands
+            // clean (no correction ever fires), the state announcing
+            // playback was emitted BEFORE this collector subscribed
+            // (SharedFlow, no replay) and steady playback emits nothing
+            // more. The session then sits in AIMING forever and the
+            // end-of-track pause is never armed. Seed with the last known
+            // state so "the first player state" exists even when it
+            // predates us; double-handling one state is harmless (the
+            // transition is phase-guarded, the pause timer re-arms).
+            controller.lastKnownPlayerState?.let { handlePlayerState(controller, it) }
             controller.playerStates.collect { state ->
-                if (_syncState.value.phase == SessionPhase.AIMING) {
-                    onPlaybackStarted()
-                }
-                val commanded = _syncState.value.track?.spotifyUri
-                if (commanded != null && state.trackUri != null &&
-                    state.trackUri != commanded && !state.isPaused
-                ) {
-                    onSpotifyAutoAdvanced(controller, state.trackUri)
-                } else {
-                    scheduleEndOfTrackPause(controller, state)
-                }
+                handlePlayerState(controller, state)
             }
+        }
+    }
+
+    private fun handlePlayerState(
+        controller: SpotifyController,
+        state: SpotifyController.RemotePlayerState,
+    ) {
+        if (_syncState.value.phase == SessionPhase.AIMING) {
+            onPlaybackStarted()
+        }
+        val commanded = _syncState.value.track?.spotifyUri
+        if (commanded != null && state.trackUri != null &&
+            state.trackUri != commanded && !state.isPaused
+        ) {
+            onSpotifyAutoAdvanced(controller, state.trackUri)
+        } else {
+            scheduleEndOfTrackPause(controller, state)
         }
     }
 
