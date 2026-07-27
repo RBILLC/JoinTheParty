@@ -112,13 +112,25 @@ decayed to 0.00, playing the wrong song and unable to discover the right one.
 *Fixed:* `1836b30` — a player state naming a track we did not command means
 Spotify auto-advanced; pause, drop the track, re-listen after a quiet window.
 
-**This can only be handled reactively.** App Remote exposes no way to disable
-autoplay, so it cannot be prevented — only detected. Residual cost is up to
-about a second of wrong-song audio before the pause lands. A *preemptive* pause
-at end-of-track was considered and rejected: Spotify's track duration and the
-room's version routinely differ (remaster vs original), so it would pause early
-and churn near the end of every song. Recovery from it is now also quiet,
-because the same-track guard resumes rather than restarting.
+**Now prevented, not just detected** (`cbcdd7d`). App Remote has no way to turn
+autoplay off, but `PlayerState.track.duration` is Spotify's own exact length for
+the track *we* are playing, so we schedule a pause 400 ms before our track ends
+and Spotify never gets to choose.
+
+Two things made this look impossible at first, both wrong:
+
+- *"The room's version may be a different length."* Irrelevant — we are timing
+  OUR track's end. If the room is playing a longer master we have no audio left
+  for those extra seconds anyway, so pausing at our own end costs nothing we
+  could have played.
+- *"There is no event near the end to react to."* True, and that is why it must
+  be a **timer**, not a check on incoming player states: App Remote emits those
+  only on events, so during steady playback nothing arrives for tens of seconds.
+  Every fresh state re-arms the timer, which absorbs drift and our corrections.
+
+The reactive path remains as a backstop for when the timer is missed (no
+duration reported, or the user hits next in Spotify). Recovery is also quiet
+now, because the same-track guard resumes rather than restarting.
 
 ### 5. The guard disarmed itself under noisy data
 The room-timeline anchor re-seeded on **every** accepted fix
