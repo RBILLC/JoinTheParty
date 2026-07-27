@@ -168,6 +168,43 @@ long run of `ff`. `18 a9 f0 ff ff ff ff ff ff ff 01` decodes to −2007.
 Spotify auth tokens and forces a re-authorisation through the UI — prefer
 reading the value and fixing the code.
 
+## Two ways to fool yourself with the microphone
+
+**A low lag reading with only ONE source playing is meaningless.** The analyzer
+reports the strongest secondary peak in its search range; with a single source
+that peak is room reverb, which sits at ~60–90 ms — indistinguishable from
+perfect sync. A run where the room's video ended read a beautiful 62 ms while
+nothing was synchronised at all. Always confirm both phones are actually
+playing (`rms_db` around −35 with two sources; check Phone A's screen) before
+believing a good number.
+
+**Keep `--max-lag-ms` at 2500.** Widening it to 4000 to chase large offsets
+made the analyzer lock onto harmonics of the music's own periodicity, producing
+spurious 3166 ms readings between valid ones. The narrower range is more
+trustworthy; if the true lag exceeds it you will see incoherent values rather
+than a plausible wrong one, which is the safer failure.
+
+## Keep the screens awake
+
+Phone B's screen locking silently invalidates a run: the Join tap lands on the
+keyguard, the app never starts a session, and the log comes back empty while
+Spotify keeps auto-advancing in the background. A secured lock screen cannot be
+dismissed over adb (`wm dismiss-keyguard` fails), so this needs a human.
+
+```
+adb -t 12 shell settings put system screen_off_timeout 1800000
+adb -t 10 shell settings put system screen_off_timeout 1800000
+```
+
+Always confirm the log is non-empty a few seconds after joining, before
+trusting anything downstream of it:
+
+```
+adb -t 12 logcat -s JTP > run.log &
+# ... join ...
+(Get-Item run.log).Length   # must be non-zero
+```
+
 ## Known traps
 
 - **`lag_analyzer.exe` needs the llvm-mingw `bin` on `PATH`** or it fails with
