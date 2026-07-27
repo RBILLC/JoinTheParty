@@ -215,9 +215,9 @@ JoinTheParty/
 ├── android/
 │   └── app/src/main/
 │       ├── java/.../JoinThePartyApplication.kt  # Application subclass; anchors SessionGraph
-│       ├── java/.../ui/           # Compose screens, nudge wheel
+│       ├── java/.../ui/           # Compose screens, nudge wheel, SessionViewModel
 │       ├── java/.../audio/        # Oboe capture, route observation
-│       ├── java/.../session/      # SessionGraph (process-scoped), SessionViewModel
+│       ├── java/.../session/      # SessionGraph (process-scoped session owner)
 │       ├── java/.../service/      # SessionForegroundService, notification
 │       ├── java/.../recognition/  # ShazamKit AAR provider (ACRCloud fallback)
 │       ├── java/.../spotify/      # App Remote controller, PKCE auth

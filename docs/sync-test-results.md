@@ -170,8 +170,12 @@ Read this section before quoting the headline number.
 
 ## Still open
 
-- **No foreground service (INT-06).** Pocketing the phone or locking the screen
-  kills the session. Biggest demo-vs-product gap.
+- ~~No foreground service (INT-06)~~ — **implemented, not yet field-verified**
+  (`729052a`/`c29c517`/`2f113a9`). A process-scoped `SessionGraph` now owns the
+  session and a mic-type `SessionForegroundService` holds it up while
+  backgrounded, with a phase/track notification and a Stop action. Needs a
+  device pass: screen-off survival ≥10 min, notification text through the
+  phases, Stop ends the session, task-swipe does not.
 - ~~`play(uri)` has no same-track guard~~ — **fixed, not yet field-verified.**
   `startPlayback` now compares the resolved URI against what Spotify already
   has loaded; if they match it resumes and aims instead of calling `play(uri)`,
