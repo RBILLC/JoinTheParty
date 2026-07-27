@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- INT-06b (technical-requirements.md §2.5): status-bar icon for
+     SessionForegroundService's notification. Monochrome white filled circle
+     — status-bar icons are drawn as a silhouette by the system (any color
+     info is discarded), so a plain glyph is all that's needed; deliberately
+     not one of the platform's ic_media_* icons (dated / not brand-specific).
+     24dp per Android's small-icon guidance. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#FFFFFF">
+
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M12,2 C6.48,2 2,6.48 2,12 C2,17.52 6.48,22 12,22 C17.52,22 22,17.52 22,12 C22,6.48 17.52,2 12,2 Z M12,17 C9.24,17 7,14.76 7,12 C7,9.24 9.24,7 12,7 C14.76,7 17,9.24 17,12 C17,14.76 14.76,17 12,17 Z" />
+</vector>

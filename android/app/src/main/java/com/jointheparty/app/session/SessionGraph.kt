@@ -8,12 +8,17 @@ import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.data.DataStoreNudgeStore
 import com.jointheparty.app.recognition.ACRCloudProvider
 import com.jointheparty.app.recognition.EnginePcmWindowSource
+import com.jointheparty.app.service.SessionForegroundService
 import com.jointheparty.app.spotify.AppRemoteSpotifyController
+import com.jointheparty.app.ui.session.SessionPhase
 import com.jointheparty.app.ui.session.SessionViewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 
 /**
  * INT-06a (technical-requirements.md §2.5): the process-scoped owner of the
@@ -36,6 +41,9 @@ class SessionGraph(context: Context) {
 
     /** The session's lifetime anchor, replacing `viewModelScope`. */
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /** Retained for [SessionForegroundService.start] below. */
+    private val appContext = context.applicationContext
 
     private val engine = SyncCore(deadbandMs = ENGINE_DEADBAND_MS)
 
@@ -85,6 +93,29 @@ class SessionGraph(context: Context) {
     private val routeObserver = AudioRouteObserver(context) { route, routeId, routeName ->
         viewModel.onRouteChanged(routeId, routeName, route)
     }.also { it.start() }
+
+    // INT-06b (technical-requirements.md §2.5): start SessionForegroundService
+    // on the IDLE/ERROR → any-active-phase edge. This is a push — the graph
+    // never calls stopService; the service observes the same syncState
+    // stream and stops itself on the way back to idle/error (see that
+    // class's doc for the split — exactly one stop decision point). The
+    // trigger is always a foreground Join tap, so the mic-type FGS
+    // background-start restriction (API 34+) is satisfied: this is never
+    // invoked while backgrounded.
+    private var lastPhaseWasInactive = true
+
+    init {
+        viewModel.syncState
+            .map { it.phase }
+            .onEach { phase ->
+                val nowInactive = phase == SessionPhase.IDLE || phase == SessionPhase.ERROR
+                if (lastPhaseWasInactive && !nowInactive) {
+                    SessionForegroundService.start(appContext)
+                }
+                lastPhaseWasInactive = nowInactive
+            }
+            .launchIn(scope)
+    }
 
     /**
      * Tears the graph down: cancels [scope], stops [routeObserver], and

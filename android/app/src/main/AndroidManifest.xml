@@ -7,6 +7,13 @@
     <!-- Nudge-wheel detents and the lock thunk (ui-ux §5). -->
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- INT-06b (technical-requirements.md §2.5): SessionForegroundService
+         keeps the mic session alive while backgrounded and posts its
+         status notification. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <!-- Spotify install detection (technical-requirements.md §3.1 step 7). -->
     <queries>
         <package android:name="com.spotify.music" />
@@ -44,6 +51,17 @@
                     android:host="callback" />
             </intent-filter>
         </activity>
+
+        <!-- INT-06b (technical-requirements.md §2.5): owns foreground
+             lifetime + notification only, never the session graph. Not
+             exported — only this app starts it. stopWithTask=false so a
+             task swipe doesn't kill an active session; the notification's
+             Stop action is the intended exit. -->
+        <service
+            android:name=".service.SessionForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="microphone"
+            android:stopWithTask="false" />
     </application>
 
 </manifest>
