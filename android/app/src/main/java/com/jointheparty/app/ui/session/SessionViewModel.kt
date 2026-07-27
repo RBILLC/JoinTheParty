@@ -459,7 +459,15 @@ class SessionViewModel(
             0.0
         }
         lastEstimateErrorMs = 0.0
-        engineNudgeMs += deltaMs + rebase
+        if (trimMs == 0) {
+            // Zeroing the wheel means "remove my adjustment" — including the
+            // bias absorbed into the setpoint. Without this the absorbed part
+            // is invisible and unclearable from the UI, which is how a −2 s
+            // setpoint survived a user who had deliberately zeroed the trim.
+            engineNudgeMs = 0.0
+        } else {
+            engineNudgeMs += deltaMs + rebase
+        }
         engine.setUserNudgeMs(engineNudgeMs.toInt())
         _syncState.update { it.copy(nudgeMs = trimMs) }
         val ps = spotify?.lastKnownPlayerState
