@@ -374,9 +374,9 @@ Copy and behavior are specified under Device detail, above, as a banner rather t
 | `toneMatchStrikeMs` | 100 | Duration of the cursor's `brassBright` flash per repetition. |
 | `byEarAccuracyMs` | 30 | The ± figure quoted in By ear success copy — single source for that claim. |
 | `trimPromotionSampleCount` | 3 | Repeats at ~the same offset before the promotion banner offers to adopt it. |
-| `trimPromotionToleranceMs` | 15 | "About the same offset" tolerance band for the count above. |
+| `trimPromotionToleranceMs` | 25 | "About the same offset" tolerance band for the count above. Not tighter: the trim comes from a human ear, whose repeatability is `byEarAccuracyMs` (±30) — demanding better agreement than the instrument's own precision means the promotion never fires. |
 | `driftMinSamples` | 3 | Referee measurements required to confirm drift, not just noise. |
-| `driftThresholdMs` | 40 | Deviation from the settled value that qualifies as drift. |
+| `driftThresholdMs` | 50 | Deviation from the settled value that qualifies as drift. Twice the 25 ms correction deadband, so ordinary referee scatter never raises the banner. |
 
 ---
 

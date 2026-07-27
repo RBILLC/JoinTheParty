@@ -34,6 +34,16 @@
 | CORE-06 | ✅ Done — ±30ms guard (PM-confirmed), seek-refreshed reference, headphone bypass, C-API tested; energy condition deferred to real APM | `b344da8` |
 | INT-04 | 🟡 Route→AEC wiring + UI hint done (unit-tested); 10/10 speaker-mode field trials AC needs real APM + device | `b344da8` |
 | INT-06 | 🟡 06a/06b/06c implemented; **field test 7 passed** FGS start, notification text, Stop action, screen-off + adb-loss survival. Pending: 10-min soak (only ~104 s of music), task-swipe. See docs/field-test-7-int06.md | `729052a` `c29c517` `2f113a9` `1161065` |
+| CAL-01 | ⬜ Not started | — |
+| CAL-02 | ⬜ Not started | — |
+| CAL-03 | ⬜ Not started | — |
+| CAL-04 | ⬜ Not started | — |
+| CAL-05 | ⬜ Not started | — |
+| CAL-06 | ⬜ Not started | — |
+| CAL-07 | ⬜ Not started | — |
+| CAL-08 | ⬜ Not started | — |
+| CAL-09 | ⬜ Not started | — |
+| CAL-10 | ⬜ Not started | — |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.
@@ -342,6 +352,113 @@
 
 ---
 
+## Epic 6 — Per-device calibration
+
+Calibration outgrew INT-03's single ticket once the chirp-path bug, the acoustic referee, per-device profile storage, and a full review surface were specced (tech-req §2.6, arch §10, ui-ux §6.5) — enough independent, separately-testable surface area to warrant its own epic rather than further INT-0x sub-lettering.
+
+### CAL-01 · Chirp plays the playback path
+**Description:** Fix `AudioTrackChirpPlayer` to traverse Spotify's own deep-buffer playback route instead of Android's fast-mixer path: request `PERFORMANCE_MODE_POWER_SAVING`, `CONTENT_TYPE_MUSIC`, stereo, 44.1 kHz, `MODE_STREAM`, large buffer. Chirp waveform (f0/f1/duration/fades) is unchanged so the correlator's reference still matches — this is a transport-only fix (tech-req §2.6, arch §10). This is the correctness bug: a chirp measured on the fast mixer reports a path music never takes. Also remove the stale `TODO(INT-03b)` comment block at `SessionViewModel.kt:571` documenting the now-fixed gap.
+**Acceptance criteria:**
+- Two-phone mic rig (docs/field-test-protocol.md): re-run the field-test-7 chirp measurement on the fixed player; mic-measured acoustic latency and the chirp's own `SC_EVT_CALIBRATION_RESULT.measured_latency_ms` agree within the correlator's stated ±5 ms band (`test_correlate.cpp`'s chirp-loopback tolerance) — replacing field-test-7's 207 ms (mic) vs. 3 ms (engine) discrepancy documented in docs/field-test-7-int06.md.
+- Before/after comparison (same route, same device) committed to `docs/`, citing the field-test-7-int06.md finding it supersedes.
+- `AudioTrack` construction verified (logged/dumped `AudioAttributes`/`AudioFormat`) to confirm `PERFORMANCE_MODE_POWER_SAVING` + stereo + 44.1 kHz + `MODE_STREAM` — not inferred from latency alone.
+- `TODO(INT-03b)` comment at `SessionViewModel.kt:571` removed; grep-verified no remaining reference to it in-tree.
+**Dependencies:** none.
+
+### CAL-02 · Shared FFT helper + ported analyzer
+**Description:** Factor the duplicated kissfft alloc/pad/forward/inverse sequence out of `core/src/correlate/correlate.cpp` and `core/tools/lag_analyzer.cpp` into one internal helper under `core/src/`. Port `lag_analyzer.cpp`'s `analyze_window`/`next_pow2` into a core-owned module under `core/src/correlate/` (tech-req §2.6), built on the new shared helper, so GCC-PHAT and the ported single-buffer autocorrelation share one FFT plumbing implementation instead of two copies.
+**Acceptance criteria:**
+- `lag_analyzer` CLI still builds; its registered ctest `lag_analyzer_selftest` (`lag_analyzer --selftest`, `core/CMakeLists.txt`) still passes unmodified in behavior.
+- New DSP tests (in `core/tests/test_correlate.cpp` or a new `test_lag_analyzer.cpp` registered the same way) covering the ported `analyze_window`: known-lag autocorrelation recovery within tolerance, using the existing synthetic-signal pattern — inline LCG PRNG per `test_correlate.cpp`'s `Lcg` struct, no fixture files, no WAV assets.
+- Both `correlate.cpp` and the ported module call the same shared helper (code inspection: the alloc/pad/forward/inverse sequence exists in exactly one place).
+- No regression: `test_gcc_phat_accuracy_20db`/`_6db` still pass at existing tolerances.
+**Dependencies:** none.
+
+### CAL-03 · Acoustic referee C ABI
+**Description:** Add `sc_status_t sc_sample_latency_residual(sc_session_t*)` (non-RT) and `SC_EVT_LATENCY_RESIDUAL { int32_t residual_ms; float peak_ratio; bool valid; }`. Runs CAL-02's ported `analyze_window` over `sc_copy_recent_capture`'s 12 s post-AEC capture history, `min_lag_ms=40, max_lag_ms=2500` (ceiling load-bearing — must not be widened; harmonics lock-on above it per docs/sync-test-results.md). `valid=false` unless `SC_EVT_SYNC_ESTIMATE.converged` is currently true (LOCKED) and `peak_ratio > 4.0`. Forces `sc_set_aec_mode(SC_AEC_OFF)` for the sampled window and restores the prior mode afterward. Reads capture history only — no new audio captured or played, never writes to `output_latency_prior_ms` (referee verifies, never steers — arch §10).
+**Acceptance criteria:**
+- C-ABI roundtrip test in `core/tests/test_correlate.cpp`, styled on `test_session_calibration_roundtrip`: synthetic capture with two embedded copies of a signal at a known lag (simulating room + own-output echo) → `sc_sample_latency_residual` → `SC_EVT_LATENCY_RESIDUAL.residual_ms` within ±5 ms of the injected lag, `valid=true`.
+- Gating test: calling `sc_sample_latency_residual` while unconverged (no prior `converged==true` estimate) yields `valid=false`, even with a clean high-`peak_ratio` signal present.
+- Single-source test: capture with only one copy of the signal (no echo) → `peak_ratio` below 4.0 → `valid=false` (mirrors docs/sync-test-results.md's ~85 ms reverb-only false-positive finding).
+- AEC-mode test: `sc_aec_mode_t` is `SC_AEC_OFF` for the sampled window's duration and restored to its prior value immediately after (test hook/log of mode-set calls).
+- `output_latency_prior_ms` is unchanged after any `sc_sample_latency_residual` call regardless of `valid`.
+**Dependencies:** CAL-02.
+
+### CAL-04 · Calibration profile store
+**Description:** Replace the orphaned flat `outlatency:<routeId>` Int DataStore key with `stringPreferencesKey("calibration_profile:<routeId>")` holding a `CalibrationProfile` JSON record (gson) per tech-req §2.6 — `schemaVersion`, `routeId`/`routeClass`/`deviceName`, `method` (MEASURED|BY_EAR|ESTIMATED), `latencyMs`, `confidence`, `sampleCount`, `acousticallyReachable`, `createdAtMs`/`updatedAtMs`, `refereeSamples` (bounded ring, cap 20), `drifted`. No migration path, per the `setpoint2` precedent. Shell-side referee aggregation lives here: calls `sc_sample_latency_residual` (CAL-03) periodically while locked, requires agreement across ≥3 valid windows before appending one sample to the ring, and sets `drifted=true` when a sample's residual exceeds ±50 ms of the profile's current `latencyMs`.
+**Acceptance criteria:**
+- Round-trip test: write a `CalibrationProfile`, read it back, field-for-field equality (gson serialize/deserialize).
+- One atomic write per profile update — a concurrent mid-write read never observes a half-populated JSON blob.
+- `refereeSamples` ring caps at 20; a 21st append evicts the oldest entry.
+- Aggregation test: 2 valid `SC_EVT_LATENCY_RESIDUAL` windows do not write a ring sample; a 3rd in agreement does; a 3rd that disagrees resets the agreement count instead of writing.
+- Drift test: a ring sample whose `residual_ms` differs from `latencyMs` by > 50 ms sets `drifted=true`; ≤ 50 ms leaves it false.
+- Old `outlatency:` key absent from the DataStore schema (grep/test); its presence in an existing installed DataStore file is silently ignored, not migrated.
+**Dependencies:** CAL-03.
+
+### CAL-05 · Input level signal
+**Description:** Add `sc_status_t sc_get_input_level(sc_session_t*, float* out_level)` per tech-req §2.1: a polled getter, normalized 0..1, attack ~10 ms / release ~300 ms exponential envelope, computed in the worker thread alongside the existing post-AEC `append_history` call (`synccore.cpp:210/214`), written to a `std::atomic<float>` (relaxed store/load) — no lock, no allocation, callable from any thread, reports silence when capture is idle. JNI binding + `SyncEngine.inputLevel(): Flow<Float>` polled at ≤15 Hz, joining the existing high-frequency stream family alongside `meterFrames` (never folded into `SyncState`, never observed by the session screen root).
+**Acceptance criteria:**
+- Unit test: known synthetic input envelope (step up, step down) → level converges toward the new value with the specified attack/release time constants within a stated tolerance (e.g. within 10% of expected exponential value at one time-constant elapsed).
+- `sc_get_input_level` returns ~0 when called before capture starts and after capture stops — no stale/garbage value.
+- Allocation-free, lock-free verified: instrumented-allocator test calling `sc_get_input_level` from a non-audio thread while capture runs, same style as CORE-01's `sc_push_capture` allocation test.
+- JNI round-trip test: `SyncEngine.inputLevel()` emits at ≤15 Hz and reflects a scripted capture-level change against a fake/test engine.
+- `sc_get_input_level` returns a live value before any `sc_submit_recognition_fix` and during `sc_begin_calibration` — not gated on a fix or convergence.
+**Dependencies:** none.
+
+### CAL-06 · Mic-reactive Listening/Matching
+**Description:** Implement the phase-word opacity treatment in Listening/Matching per ui-ux §6.1's "Before the meter" subsection: `ink2` at rest, brightening toward `ink` as CAL-05's input level rises, opacity `= 0.55 + 0.45 × level` (level 0..1), eased through `settle` (ω = `settleOmega`) so a stray syllable doesn't flicker it. No scale/bounce/glow/gradient; no color change outside ink/ink2/ink3 (`brass` stays reserved for sync heat). At silence the word holds its 0.55 floor. Reduced Motion: level quantizes to dim/bright, crossfading over `reducedMotionCrossfadeMs` (200 ms) only on state change. Closes docs/ux-audit-2026-07.md gap #8 (meter stream dormant through listening/matching with no signal the mic is hearing anything).
+**Acceptance criteria:**
+- Driven by scripted `inputLevel` sequences (silence, rising, falling): phase-word opacity tracks `0.55 + 0.45 × level` through the `settle`-damped transition, verified against the expected curve at sampled time points, not just start/end.
+- At sustained silence, opacity settles at 0.55, not lower.
+- No opacity/motion change carries into `AIMING`+ once `MeterFrame` exists — the treatment is inert once the meter appears.
+- Reduced Motion on: opacity takes only two values (dim/bright) across a scripted level sweep, crossfading 200 ms on transitions only.
+- No color other than ink/ink2/ink3 is ever applied to the phase word during these phases (token audit).
+**Dependencies:** CAL-05.
+
+### CAL-07 · Tone-match (by ear) calibration
+**Description:** Implement the `BY_EAR` flow per ui-ux §6.5: adjust-until-aligned (not tap-along) — a periodic tone (`toneMatchPeriodMs` 1200 ms) plays through the active route via CAL-01's fixed deep-buffer transport (a wrong-path tone gives a wrong-path offset, same failure mode as the original chirp bug), while the caliper scale (0–600 ms axis) doubles as the drag control: a cursor in the connected device's line color tracks the drag, striking full `brassBright` for `toneMatchStrikeMs` (100 ms) per tone repetition, paired with an `abClick` haptic tick. Dialled value becomes `latencyMs`, `method=BY_EAR`, stated accuracy ±30 ms (`byEarAccuracyMs`), never implied tighter. Extends `CalibrationSheet.kt`'s existing four-state shape (Idle/Running/Success/Failed) with §6.5's by-ear copy; reached automatically when the chirp's 8 s arm timeout elapses with no detection (no device-class check) and via a new Quiet "Try by ear instead" exit on the acoustic flow's Failed state; available on any route. Reduced Motion: strike flash replaced by a static engraved-style mark per cycle, `abClick` becomes the primary beat reference.
+**Acceptance criteria:**
+- Chirp-timeout-to-by-ear transition verified on every route type (not just headphones) — a `ChirpDetector` 8 s timeout with no detection auto-transitions the sheet with no device-class branch in the code.
+- Accuracy validated with the two-phone mic rig (docs/field-test-protocol.md): a dialled tone-match result on a known route compares to mic-measured ground truth within ±30 ms across a sample of trials.
+- Drag input and settled-line read-out are the same caliper component (one composable/view used in both modes), not two implementations.
+- Haptic audit: `abClick` fires once per tone repetition during Running; `lockThunk` is never invoked by this flow.
+- Reduced Motion: no `brassBright` flash occurs, replaced by the static mark; tone playback and `abClick` timing are unaffected.
+- Success copy states "±30 ms" sourced from `DT.Calibration.byEarAccuracyMs`, not a hardcoded literal.
+**Dependencies:** CAL-01.
+
+### CAL-08 · Device shelf + detail UI
+**Description:** Build the calibration review surface per ui-ux §6.5: device shelf (one row per known device — name, latency, provenance line, compact caliper strip `shelfStripHeightPt` 20dp) and device detail (hero `latencyMs` readout, full caliper well `detailScaleHeightPt` 72dp in a `recess` well, provenance line, "Calibrate again" secondary pill, drift banner, trim-promotion banner — never both at once). Caliper renders per §6.5's tick/settled-line vocabulary: real solid-hairline ticks for Measured/By ear, zero dashed-hairline ticks for Estimated; ticks compound under ordinary alpha blending (`tickAlpha` 0.35); settled line `brass` for the connected device, `ink2` otherwise, solid (real ticks) or dashed (Estimated) stroke. Empty state per §6.5's copy deck verbatim, "Calibrate phone speaker" primary action. Reached only from the single quiet entry point (ui-ux §4) — never on the session screen. The app has no list component or navigation framework, so shelf/detail/guided-calibration are panes the existing calibration sheet swaps, not separate pushed screens/routes.
+**Acceptance criteria:**
+- Shelf renders zero/one/many-sample cases per §6.5's rules — no line for "never seen," dashed zero-tick line for Estimated, single full-alpha tick for one sample, compounding ticks for many — reviewed against the wireframe's three example rows (Living room speaker / AirPods Pro / Kitchen speaker) with matching provenance qualifiers.
+- Copy audit: shelf qualifiers ("measured {relative time}" / "not measured yet" / "set by ear, {relative time}"), empty-state body/primary, and detail-pane provenance line match ui-ux §6.5's copy deck verbatim (string diff).
+- Exactly one `brass` settled line on screen at a time (connected device only); every other known device renders `ink2` (test with ≥2 known devices, one connected).
+- Detail-pane hero value never renders `brass` (always `ink`) — token audit.
+- Drift and trim-promotion banners are mutually exclusive — a state with both conditions true renders only one.
+- Sheet open + pane swaps use `heavy` (or `reducedMotionCrossfadeMs` crossfade under Reduced Motion); caliper ticks/settled line play one `settle` reveal on first pane appearance only, not re-triggered while the pane stays open (log-verified).
+**Dependencies:** CAL-04.
+
+### CAL-09 · First-contact gate
+**Description:** Implement the guided first-contact flow per ui-ux §6.5/tech-req §2.6: an unknown `routeId` (no stored profile) becoming the active output at session start gates playback with a guided prompt before playback starts (recognition proceeds unaffected) — two device-class copy variants (acoustic-capable: "Calibrate now" → guided acoustic flow; headphone-class: "Calibrate by ear" → guided tone-match flow), each with a Quiet "Not now" decline and fine-print "We'll use a generic default until you do." Declining writes a profile with `method=ESTIMATED`, `latencyMs=150`, `sampleCount=0` (so the UI re-offers next session), provenance qualifier "not measured yet" (never "estimated from…" anything).
+**Acceptance criteria:**
+- Copy audit: both device-class variants (title/body/primary/quiet/fine-caption) match ui-ux §6.5's "First-contact gate" section verbatim.
+- Decline path: unknown routeId, gate declined → `CalibrationProfile` with `method=ESTIMATED`, `latencyMs=150`, `sampleCount=0`; `output_latency_prior_ms` set to 150 on the session's `sc_config_t`/`sc_set_output_route` call.
+- Re-offer: a subsequent session on the same routeId with `sampleCount=0` re-shows the gate rather than treating it as handled.
+- Gate never blocks recognition: scripted test shows `listening`/`matching` phase progress is identical whether the gate is showing, accepted, or declined.
+- Device-class copy selection follows the same no-lookup rule as CAL-01/07 — acoustic offered first, falling back to by-ear only on chirp-timeout, never a device-class permission/API check (code inspection).
+**Dependencies:** CAL-04.
+
+### CAL-10 · Trim promotion
+**Description:** Implement wheel-trim promotion per tech-req §2.6/ui-ux §6.5: detect ≥3 wheel-trim commits on the same `routeId`, all within ±25 ms of their median, with `|median| > 30 ms` (above the 25 ms correction deadband) → surface the Device-detail trim-promotion banner ("You've nudged this by about {median} ms, three times running. Make that the calibration?"). Accept ("Use this offset"): fold the median into `latencyMs`, set `method=BY_EAR`, append it to the profile as a By-ear tick, reset the wheel trim to 0, show the "Folded into the calibration — the wheel's back at zero" confirmation. Decline ("Keep as is"): suppress the prompt for that `routeId` for a 7-day cooling-off period. Never adopts silently.
+**Acceptance criteria:**
+- Detection test: scripted wheel-commit sequences (varying counts/spreads/medians) trigger the banner exactly when ≥3 commits fall within ±25 ms of their median and `|median| > 30 ms`; do not trigger when either bound is violated (e.g. 3 commits ±40 ms apart, or a tight cluster with `|median| = 20 ms`).
+- Accept path: profile's `latencyMs` updates to the median, `method` becomes `BY_EAR`, a ring sample is appended, wheel trim resets to 0 — verified end-to-end against CAL-04's store.
+- Decline path: prompt does not re-appear for the same `routeId` within 7 days of decline (time-mocked test); re-appears after cooldown if the trigger condition still holds.
+- No silent adoption: no code path writes `latencyMs` from wheel data without the banner having been shown and accepted (state-machine audit).
+- Trim-promotion and drift banners are mutually exclusive (shared with CAL-08) — trim-promotion state never also sets `drifted=true`.
+**Dependencies:** CAL-04.
+
+---
+
 ## Dependency graph (summary)
 
 ```
@@ -360,6 +477,12 @@ SCAF-01 ─▶ SCAF-02 ─▶ SCAF-04 ─▶ UI-01
                               CORE-07 (gate, feeds INT-05)
 
 INT-02, UI-02 ─▶ INT-06a ─▶ INT-06b ─▶ INT-06c
+
+CAL-02 ─▶ CAL-03 ─▶ CAL-04 ─┬─▶ CAL-08
+                             ├─▶ CAL-09
+                             └─▶ CAL-10
+CAL-01 ─▶ CAL-07
+CAL-05 ─▶ CAL-06
 ```
 
 ## Critical path to MVP-on-device (INT-01, iOS)
