@@ -139,6 +139,42 @@ The same rig measures ~85 ms of room reverb with nothing playing, so the
 residual is at the noise floor. Engine and microphone now agree, which is the
 real result: the app's own telemetry finally means what it says.
 
+## Field Test 5 — the guard was armed only in the easy case
+
+Song 1 locked at 72 ms and held for a full track. Song 2 ("Zanzibar", reached
+by letting the room's video end and start the next) locked too — and settled
+**1.7 s ahead of the room while reporting sync err = −3 ms**. The listener
+heard it before the instruments did; the microphone then confirmed a median
+lag of 1687 ms across 88 windows.
+
+Reporting ≈0 error while badly out of sync is the self-match signature again,
+so the question was why the guard let it through. The anchor was re-seeded on
+*every* accepted fix, with `room_anchor_confirmed = tracks_room`. Song 2's
+recognition data alternated between the room and our own playback — 5 of 16
+intervals slipped — so every other fix broke continuity, the anchor was never
+confirmed two fixes running, and the guard therefore never rejected anything.
+It was armed exactly when the data was clean and disarmed exactly when it
+wasn't.
+
+Now a fix that breaks the room timeline *without* matching our own position is
+held aside as a candidate instead of overwriting the anchor. Only a second fix
+continuing that candidate's timeline adopts it — that is a real room change.
+An isolated recognizer error can no longer destroy an established timeline.
+
+Verified by re-joining against the same track mid-play:
+
+| Zanzibar, same room | median mic lag | windows > 200 ms |
+|---|---|---|
+| before | 1687 ms | 71 of 88 |
+| after | **71 ms** | 3 of 36 |
+
+Zero corrections and zero rejections after the fix.
+
+**The generalisable lesson:** a guard that needs clean data to stay armed is
+not a guard. Both times this one failed, it failed by disarming — first at
+convergence (the 30 s staleness cap), then under noisy data (the confirmation
+rule). Check what disarms a safety mechanism, not just what triggers it.
+
 ## Still open
 
 - **Output-latency bias.** Now small enough to be inside the measurement noise
