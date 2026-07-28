@@ -475,14 +475,16 @@ class SessionViewModelTest {
         }
         viewModel(engine, nudgeStore)
 
-        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 195, peakRatio = 5f, valid = true))
-        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 200, peakRatio = 5f, valid = true))
-        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 205, peakRatio = 5f, valid = true))
+        // FIELD FIX (field test 8): a healthy session's residual sits near
+        // the reverb floor — it is the ERROR, not the latency re-measured.
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 40, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 45, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 50, peakRatio = 5f, valid = true))
         advanceUntilIdle()
 
         val profile = nudgeStore.calibrationProfiles.getValue("speaker")
         assertEquals(1, profile.refereeSamples.size)
-        assertEquals(200, profile.refereeSamples.single().residualMs) // median of 195/200/205
+        assertEquals(45, profile.refereeSamples.single().residualMs) // median of 40/45/50
         assertEquals(2, profile.sampleCount) // 1 seeded + 1 committed
         assertFalse(profile.drifted)
     }
@@ -543,9 +545,11 @@ class SessionViewModelTest {
         }
         viewModel(engine, nudgeStore)
 
-        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 210, peakRatio = 5f, valid = true))
-        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 215, peakRatio = 5f, valid = true))
-        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 220, peakRatio = 5f, valid = true))
+        // FIELD FIX (field test 8): healthy = near-floor residual, and the
+        // profile's latencyMs is irrelevant to the comparison.
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 38, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 43, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 48, peakRatio = 5f, valid = true))
         advanceUntilIdle()
 
         assertFalse(nudgeStore.calibrationProfiles.getValue("speaker").drifted)
@@ -997,9 +1001,10 @@ class SessionViewModelTest {
         val profile = nudgeStore.calibrationProfiles.getValue("speaker")
         assertEquals(-180, profile.latencyMs)
         assertEquals(CalibrationProfile.Method.BY_EAR, profile.method)
-        assertEquals(1, profile.refereeSamples.size)
-        assertEquals(-180, profile.refereeSamples.single().residualMs)
-        assertFalse(profile.drifted) // freshly folded — never "drifted" from itself
+        // FIELD FIX (field test 8): a promoted trim is a latency value, not
+        // a residual — it must NOT enter the referee's error ring.
+        assertTrue(profile.refereeSamples.isEmpty())
+        assertFalse(profile.drifted) // freshly folded — a chosen value is never drift
         assertEquals(0, vm.syncState.value.nudgeMs)
         assertEquals(0, nudgeStore.trims.getValue("speaker"))
         assertEquals(0, engine.nudgeCalls.last())

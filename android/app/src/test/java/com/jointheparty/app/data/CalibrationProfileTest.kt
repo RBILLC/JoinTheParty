@@ -119,10 +119,20 @@ class CalibrationProfileTest {
             updatedAtMs = 0L,
         )
 
-        // Exactly at the 50 ms threshold: not drifted.
-        assertFalse(base.withRefereeSample(residualMs = 250, atMs = 1L).drifted)
-        // Beyond it: drifted.
-        assertTrue(base.withRefereeSample(residualMs = 251, atMs = 1L).drifted)
+        // FIELD FIX (field test 8): the residual IS the error — a healthy
+        // route reads near the reverb floor regardless of latencyMs. At or
+        // under the 50 ms threshold: not drifted (a live 43 ms floor
+        // reading on a 153 ms profile previously flagged drift, wrongly).
+        assertFalse(base.withRefereeSample(residualMs = 43, atMs = 1L).drifted)
+        assertFalse(base.withRefereeSample(residualMs = 50, atMs = 1L).drifted)
+        // Beyond it: drifted — this is a genuinely misaligned session.
+        assertTrue(base.withRefereeSample(residualMs = 51, atMs = 1L).drifted)
+        assertTrue(base.withRefereeSample(residualMs = 848, atMs = 1L).drifted)
+        // And it CLEARS on recovery: a one-off glitch must not brand the
+        // profile forever.
+        val glitched = base.withRefereeSample(residualMs = 300, atMs = 1L)
+        assertTrue(glitched.drifted)
+        assertFalse(glitched.withRefereeSample(residualMs = 44, atMs = 2L).drifted)
         assertTrue(base.withRefereeSample(residualMs = 149, atMs = 1L).drifted)
     }
 }

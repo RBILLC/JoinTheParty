@@ -770,6 +770,13 @@ class SessionViewModel(
     /** any → idle: user-initiated escape hatch, e.g. leaving the session. */
     fun reset() {
         if (transition(SessionPhase.IDLE)) {
+            // FIELD TEST 8: leaving the party must stop OUR music. This
+            // cancelled the end-of-track guardian below but left Spotify
+            // playing, so the track ran out unattended and Spotify
+            // auto-advanced to a song nobody asked for — the exact failure
+            // the guardian exists to prevent, recreated by the exit path
+            // that disarmed it.
+            spotify?.pause()
             engine.stopCapture()
             captureRunning = false
             calibrationOwnsCapture = false
@@ -1348,12 +1355,20 @@ class SessionViewModel(
         scope.launch(dispatcher) {
             val existing = nudgeStore.calibrationProfileFor(routeId) ?: return@launch
             val now = System.currentTimeMillis()
+            // FIELD FIX (field test 8): the promoted trim is a LATENCY
+            // value, not a residual — under corrected drift semantics
+            // (CalibrationProfile.withRefereeSample) recording it as a
+            // referee sample would both poison the error history and
+            // instantly flag drift on a number the user just chose. The
+            // fold touches the latency fields only; the referee ring stays
+            // what it is: measured residual errors.
             val folded = existing.copy(
                 method = CalibrationProfile.Method.BY_EAR,
                 latencyMs = medianMs,
                 confidence = BY_EAR_CALIBRATION_CONFIDENCE,
                 updatedAtMs = now,
-            ).withRefereeSample(medianMs, now)
+                drifted = false,
+            )
             nudgeStore.saveCalibrationProfile(folded)
             // The streak that triggered this promotion has been consumed —
             // clear it so re-opening the pane doesn't immediately offer the
@@ -1556,7 +1571,7 @@ class SessionViewModel(
             nudgeStore.saveCalibrationProfile(updated)
             com.jointheparty.app.debug.DebugLog.log(
                 "referee: committed ${committedMs}ms residual on $routeId" +
-                    if (updated.drifted) " — DRIFTED vs latencyMs=${updated.latencyMs}ms" else "",
+                    if (updated.drifted) " — DRIFTED (residual above threshold)" else "",
             )
         }
     }

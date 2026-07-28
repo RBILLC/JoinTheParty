@@ -78,7 +78,18 @@ data class CalibrationProfile(
         return copy(
             refereeSamples = ring,
             sampleCount = sampleCount + 1,
-            drifted = kotlin.math.abs(residualMs - latencyMs) > DRIFT_THRESHOLD_MS,
+            // FIELD FIX (field test 8, 2026-07-28): the residual IS the
+            // error, not a re-measurement of the latency. While LOCKED the
+            // position error is ~0, so the acoustic gap the referee reads is
+            // how much reality disagrees with the applied prior — a healthy
+            // route reads near the room's reverb floor, not near
+            // [latencyMs]. The shipped rule compared the residual AGAINST
+            // latencyMs (as the spec, wrongly, said): a perfect 43 ms floor
+            // reading on a 153 ms profile flagged drift, live, while the
+            // user confirmed sync by ear. Drift is simply a large residual,
+            // and it CLEARS when samples come back inside the threshold —
+            // a one-off glitch must not brand the profile forever.
+            drifted = kotlin.math.abs(residualMs) > DRIFT_THRESHOLD_MS,
             updatedAtMs = atMs,
         )
     }
