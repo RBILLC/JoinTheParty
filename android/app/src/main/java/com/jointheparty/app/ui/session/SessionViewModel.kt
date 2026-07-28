@@ -470,6 +470,25 @@ class SessionViewModel(
     ) {
         val controller = spotify ?: return
         scope.launch(dispatcher) {
+            // CAL-09: calibration gates PLAYBACK on a device we have never
+            // measured — never recognition, which reads the mic and is
+            // unaffected by output latency. So we keep listening and keep
+            // identifying the room; we just don't aim through an output whose
+            // delay is unknown, because that plays audibly wrong and then
+            // corrects, which is worse than starting a beat late.
+            //
+            // Waiting for the gate to clear rather than checking once: the
+            // scenario this exists for is a speaker paired MID-session, where
+            // route detection lands after the track is already resolved.
+            // Declining is one tap and writes the ESTIMATED default
+            // immediately, so this resumes as soon as the user answers either
+            // way — it cannot strand playback behind an unanswered prompt any
+            // longer than the user leaves it open.
+            if (_syncState.value.firstContactGate != null) {
+                com.jointheparty.app.debug.DebugLog.log("playback held: ${_syncState.value.routeId} not calibrated yet")
+                syncState.first { it.firstContactGate == null }
+                com.jointheparty.app.debug.DebugLog.log("gate resolved → aiming")
+            }
             when (val r = controller.connect()) {
                 SpotifyController.ConnectionResult.Connected -> {
                     // Re-acquiring the track we are ALREADY on must not call

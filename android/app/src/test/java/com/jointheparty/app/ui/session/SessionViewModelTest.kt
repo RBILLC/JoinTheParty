@@ -24,8 +24,10 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
+import com.jointheparty.app.spotify.SpotifyController
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -963,6 +965,38 @@ class SessionViewModelTest {
         lastFixMonoNs = 0L,
     )
 
+
+    @Test
+    fun firstContactGateHoldsPlaybackUntilResolved() = runTest(testDispatcher) {
+        // CAL-09: the gate must hold the AIM, not recognition. The scenario is
+        // a speaker paired mid-session, where the route lands after the track
+        // is already resolved -- so a one-shot check at resolve time would
+        // miss it entirely.
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        val vm = SessionViewModel(
+            engine, FakeNudgeStore(), testDispatcher,
+            spotify = spotify,
+        )
+        vm.startListening()
+        vm.onMatchInFlight()
+        // An unknown route raises the gate.
+        vm.onRouteChanged("bluetooth:New Speaker", "New Speaker", SyncCore.Route.BLUETOOTH)
+        advanceUntilIdle()
+        assertNotNull(vm.syncState.value.firstContactGate)
+
+        vm.onTrackResolved(track())
+        advanceUntilIdle()
+        assertEquals(
+            "playback must not aim through an unmeasured device",
+            emptyList<String>(), spotify.played,
+        )
+
+        vm.declineFirstContactGate()
+        advanceUntilIdle()
+        assertEquals(listOf("spotify:track:abc"), spotify.played)
+    }
+
     private fun track() = TrackInfo(
         spotifyUri = "spotify:track:abc",
         isrc = "USABC1234567",
@@ -1214,4 +1248,23 @@ private class FakeBackendClient(
         ShazamTokenResult.Success(token = "fake-token", expiresAtEpochMs = Long.MAX_VALUE)
 
     override suspend fun resolveIsrcToSpotifyUri(isrc: String): TrackResolution = resolution
+}
+
+/**
+ * CAL-09: minimal [SpotifyController] double. Only what the first-contact
+ * gate's playback-hold test needs — records whether `play` was reached.
+ */
+private class FakeSpotifyController : SpotifyController {
+    val played = mutableListOf<String>()
+    override val playerStates: kotlinx.coroutines.flow.Flow<SpotifyController.RemotePlayerState> =
+        kotlinx.coroutines.flow.MutableSharedFlow()
+    override val lastKnownPlayerState: SpotifyController.RemotePlayerState? = null
+    override val isConnected: Boolean = true
+    override suspend fun connect(): SpotifyController.ConnectionResult =
+        SpotifyController.ConnectionResult.Connected
+    override fun disconnect() = Unit
+    override fun play(spotifyUri: String): Boolean { played += spotifyUri; return true }
+    override fun pause(): Boolean = true
+    override fun resume(): Boolean = true
+    override fun seekTo(positionMs: Long): Boolean = true
 }
