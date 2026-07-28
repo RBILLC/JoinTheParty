@@ -44,15 +44,15 @@
 | CAL-08 | ✅ Done — device shelf + detail, provenance never rendered alike, one-warm-accent held structurally | `a2b864d` |
 | CAL-09 | ✅ Done — gate raised on an unknown route and it genuinely holds the aim (not recognition); decline writes ESTIMATED | `d4bbc4b` `3b4338b` |
 | CAL-10 | ✅ Done — 3 commits within 25 ms of median, above a 30 ms floor; always asks, folds in as BY_EAR and zeroes the wheel; 7-day decline via stored timestamp | `d4bbc4b` |
-| CFX-01 | ⬜ Not started | — |
-| CFX-02 | ⬜ Not started | — |
+| CFX-01 | ✅ Done — route snapshotted at measurement start; a route change cancels in-flight and the result is discarded, never relabelled | `2e610bd` |
+| CFX-02 | ✅ Done — recalibrate disabled with a reason when the viewed device isn't connected; empty-state action relabelled honestly | `2e610bd` |
 | CFX-03 | 🟡 Done — ReadOut/Input semantics (stateDescription + progressBarRangeInfo/setProgress a11y path), `· Connected` text tell shelf+detail; pending: TalkBack/device pass (no instrumentation tests in repo) | — |
-| CFX-04 | ⬜ Not started | — |
-| CFX-05 | ⬜ Not started | — |
-| CFX-06 | ⬜ Not started | — |
-| CFX-07 | ⬜ Not started | — |
-| CFX-08 | ⬜ Not started | — |
-| CFX-09 | ⬜ Not started | — |
+| CFX-04 | ✅ Done — sheet requires ACTIVE; gate/sheet mutual exclusion is structural, gate wins | `e82a518` |
+| CFX-05 | ✅ Done — single quiet "Devices" entry on IDLE | `e82a518` |
+| CFX-06 | ✅ Done — one route-neutral gate variant; Failed copy no longer assumes a speaker | `e82a518` |
+| CFX-07 | ✅ Done — `beginCalibration()==false` lands in Failed instead of a dead tap | `e82a518` |
+| CFX-08 | ✅ Done — drift "Later" dismisses in place, matching "Keep as is" | `e82a518` |
+| CFX-09 | ✅ Done — store sorts by `updatedAtMs`, shell promotes the connected device | `e82a518` |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.
