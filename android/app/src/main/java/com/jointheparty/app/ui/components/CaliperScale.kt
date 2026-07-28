@@ -17,6 +17,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.jointheparty.app.ui.theme.BilletTheme
 import com.jointheparty.app.ui.theme.BilletType
@@ -105,6 +106,13 @@ fun CaliperScale(
     mode: CaliperMode,
     modifier: Modifier = Modifier,
     showAxisLabels: Boolean = true,
+    // The drawn height of the scale itself. The shelf strip
+    // (DT.Calibration.shelfStripHeightPt) and the detail well
+    // (detailScaleHeightPt) are the same scale at different sizes — a
+    // thumbnail, not a crop. Constraining the caller's `modifier` instead
+    // would clip the ticks and the settled line off at the bottom rather
+    // than drawing them shorter.
+    caliperHeight: Dp = CALIPER_HEIGHT,
 ) {
     Column(modifier = modifier.fillMaxWidth()) {
         if (showAxisLabels) {
@@ -135,7 +143,7 @@ fun CaliperScale(
         Canvas(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(CALIPER_HEIGHT)
+                .height(caliperHeight)
                 .let { base ->
                     if (mode !is CaliperMode.Input) return@let base
                     base.pointerInput(Unit) {

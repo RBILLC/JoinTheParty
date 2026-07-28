@@ -43,6 +43,10 @@ data class SyncState(
     val routeName: String? = null,
     val lastRejectReason: SyncCore.RejectReason? = null,
     val calibration: CalibrationState = CalibrationState.Idle,
+    // CAL-08: which device-review pane (if any) the calibration sheet is
+    // showing. Plain state, not a stream — see [DeviceReviewPane]'s doc
+    // comment for the two-stream-rule reasoning.
+    val deviceReview: DeviceReviewPane = DeviceReviewPane.Hidden,
 )
 
 /** First pass waits for the PCM window to fill (source needs ≥3 s). */
@@ -162,6 +166,27 @@ sealed interface CalibrationState {
     data object ByEarIdle : CalibrationState
     data object ByEarRunning : CalibrationState
     data class ByEarSuccess(val latencyMs: Int) : CalibrationState
+}
+
+/**
+ * CAL-08 (ui-ux §6.5): the device shelf/detail review panes, layered
+ * independently of [CalibrationState] — browsing known devices never
+ * implies a measurement is in flight. [CalibrationSheet] renders whichever
+ * of these isn't [Hidden] IN PLACE of the guided-calibration content; both
+ * live in the same `ModalBottomSheet` instance (ui-ux §6.5: "shelf/detail/
+ * guided-calibration are panes the existing calibration sheet swaps, not
+ * separate pushed screens/routes").
+ *
+ * Two-stream rule (technical-requirements.md §2.1/§2.3): this is
+ * low-frequency, deliberately-opened state — a plain [NudgeStore] read on
+ * open/back, never a stream — so it belongs on [SyncState] exactly like
+ * [CalibrationState] does, nowhere near [SessionViewModel.meterFrames]/
+ * [SessionViewModel.inputLevel].
+ */
+sealed interface DeviceReviewPane {
+    data object Hidden : DeviceReviewPane
+    data class Shelf(val profiles: List<CalibrationProfile>) : DeviceReviewPane
+    data class Detail(val profile: CalibrationProfile) : DeviceReviewPane
 }
 
 data class TrackInfo(
@@ -825,6 +850,59 @@ class SessionViewModel(
         _syncState.value.routeId.startsWith("bluetooth") -> SyncCore.Route.BLUETOOTH
         _syncState.value.routeId == "wired" -> SyncCore.Route.WIRED
         else -> SyncCore.Route.SPEAKER
+    }
+
+    // ---- Device review: shelf/detail (CAL-08) ------------------------------
+
+    /**
+     * Opens the device shelf: loads every known route's profile from
+     * [nudgeStore] (CAL-04's list-all accessor). A plain one-shot suspend
+     * read, not a stream — this is low-frequency, deliberately-opened state
+     * (technical-requirements.md §2.1/§2.3's two-stream rule), so refetching
+     * on open/back is correct; nothing here needs to react live to a profile
+     * changing while the pane sits open.
+     */
+    fun openDeviceShelf() {
+        scope.launch(dispatcher) {
+            val profiles = nudgeStore.allCalibrationProfiles()
+            _syncState.update { it.copy(deviceReview = DeviceReviewPane.Shelf(profiles)) }
+        }
+    }
+
+    /** Shelf row tapped: look the routeId up in the shelf's already-loaded list and open its detail pane. */
+    fun selectDevice(routeId: String) {
+        val shelf = _syncState.value.deviceReview as? DeviceReviewPane.Shelf ?: return
+        val profile = shelf.profiles.firstOrNull { it.routeId == routeId } ?: return
+        _syncState.update { it.copy(deviceReview = DeviceReviewPane.Detail(profile)) }
+    }
+
+    /** Detail's back affordance: re-opens the shelf (a fresh read, same as [openDeviceShelf]). */
+    fun backToDeviceShelf() = openDeviceShelf()
+
+    /** Closes the review pane entirely — the sheet's dismiss, or a banner's "Later"/"Keep as is" exit. */
+    fun dismissDeviceReview() {
+        _syncState.update { it.copy(deviceReview = DeviceReviewPane.Hidden) }
+    }
+
+    /**
+     * Detail's "Calibrate again": closes the review pane and, only when the
+     * selected device IS the currently connected route, starts the existing
+     * guided-calibration flow ([startCalibration]). The acoustic chirp can
+     * only play through whatever route is actually active right now, so
+     * recalibrating a DIFFERENT known device from here would first need to
+     * switch the active output — that's route-selection machinery this
+     * ticket doesn't own (CAL-01/INT-02's territory); browsing a
+     * non-connected device's history is still useful on its own. Silently
+     * doing nothing on a mismatched routeId (rather than starting a
+     * measurement against the wrong device) is the honest choice — CAL-09/
+     * CAL-10 own the rest of this seam.
+     */
+    fun requestRecalibrate() {
+        val detail = _syncState.value.deviceReview as? DeviceReviewPane.Detail ?: return
+        dismissDeviceReview()
+        if (detail.profile.routeId == _syncState.value.routeId) {
+            startCalibration()
+        }
     }
 
     // ---- Acoustic referee (CAL-03/CAL-04) ----------------------------------

@@ -24,6 +24,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.jointheparty.app.ui.session.CalibrationState
+import com.jointheparty.app.ui.session.DeviceReviewPane
 import com.jointheparty.app.ui.theme.BilletTheme
 import com.jointheparty.app.ui.theme.BilletType
 import com.jointheparty.app.ui.theme.DT
@@ -56,6 +57,18 @@ fun CalibrationSheet(
     onStartByEar: () -> Unit = {},
     onCancelByEar: () -> Unit = {},
     onCommitByEar: (Int) -> Unit = {},
+    // CAL-08: the device shelf/detail panes this same sheet swaps to in
+    // place of the guided-calibration content above, per ui-ux §6.5 ("shelf/
+    // detail/guided-calibration are panes the existing calibration sheet
+    // swaps, not separate pushed screens/routes"). [DeviceReviewPane.Hidden]
+    // (the default) reproduces this composable's pre-CAL-08 behavior
+    // exactly — every existing call site/preview is unaffected.
+    deviceReview: DeviceReviewPane = DeviceReviewPane.Hidden,
+    connectedRouteId: String = "",
+    onSelectDevice: (String) -> Unit = {},
+    onBackToShelf: () -> Unit = {},
+    onRequestRecalibrate: () -> Unit = {},
+    onCalibratePhoneSpeaker: () -> Unit = {},
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -72,16 +85,86 @@ fun CalibrationSheet(
                 ),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text("CALIBRATE", style = BilletType.engraved, color = DT.Colors.ink3)
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = routeName ?: "Phone speaker",
-                style = BilletType.title,
-                color = DT.Colors.ink,
-            )
-            Spacer(Modifier.height(DT.Space.sectionGap))
+            when (deviceReview) {
+                is DeviceReviewPane.Shelf -> {
+                    Text("DEVICES", style = BilletType.engraved, color = DT.Colors.ink3)
+                    Spacer(Modifier.height(DT.Space.sectionGap))
+                    DeviceShelf(
+                        profiles = deviceReview.profiles,
+                        connectedRouteId = connectedRouteId,
+                        onSelectDevice = onSelectDevice,
+                        onCalibratePhoneSpeaker = onCalibratePhoneSpeaker,
+                    )
+                }
+                is DeviceReviewPane.Detail -> {
+                    // Back affordance (ui-ux §6.5's "shelf ⇄ detail... with
+                    // a back affordance"): plain engraved text, no icon
+                    // chrome, matching this sheet's existing eyebrow idiom.
+                    Text(
+                        text = "‹ DEVICES",
+                        style = BilletType.engraved,
+                        color = DT.Colors.ink3,
+                        modifier = Modifier.clickable(onClick = onBackToShelf),
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = deviceReview.profile.deviceName,
+                        style = BilletType.title,
+                        color = DT.Colors.ink,
+                    )
+                    Spacer(Modifier.height(DT.Space.sectionGap))
+                    DeviceDetail(
+                        profile = deviceReview.profile,
+                        connected = deviceReview.profile.routeId == connectedRouteId,
+                        onRecalibrate = onRequestRecalibrate,
+                        onDismissBanner = onBackToShelf,
+                    )
+                }
+                DeviceReviewPane.Hidden -> GuidedCalibrationContent(
+                    routeName = routeName,
+                    calibration = calibration,
+                    onStart = onStart,
+                    onCancel = onCancel,
+                    onDismiss = onDismiss,
+                    onTryByEar = onTryByEar,
+                    onStartByEar = onStartByEar,
+                    onCancelByEar = onCancelByEar,
+                    onCommitByEar = onCommitByEar,
+                )
+            }
+        }
+    }
+}
 
-            when (calibration) {
+/**
+ * The pre-CAL-08 sheet content — eyebrow `CALIBRATE`, route name as title,
+ * the four/six-state guided-calibration machine — unchanged in shape,
+ * factored out only so [CalibrationSheet] can swap it for the shelf/detail
+ * panes above.
+ */
+@Composable
+private fun GuidedCalibrationContent(
+    routeName: String?,
+    calibration: CalibrationState,
+    onStart: () -> Unit,
+    onCancel: () -> Unit,
+    onDismiss: () -> Unit,
+    onTryByEar: () -> Unit,
+    onStartByEar: () -> Unit,
+    onCancelByEar: () -> Unit,
+    onCommitByEar: (Int) -> Unit,
+) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("CALIBRATE", style = BilletType.engraved, color = DT.Colors.ink3)
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = routeName ?: "Phone speaker",
+            style = BilletType.title,
+            color = DT.Colors.ink,
+        )
+        Spacer(Modifier.height(DT.Space.sectionGap))
+
+        when (calibration) {
                 CalibrationState.Idle -> {
                     Text(
                         "Plays a short tone and measures how long this route " +
@@ -176,7 +259,6 @@ fun CalibrationSheet(
                 }
             }
         }
-    }
 }
 
 /**
@@ -243,9 +325,13 @@ private fun ToneMatchCaliper(onCommit: (Int) -> Unit) {
     )
 }
 
-/** Local pill matching §6.3 (SessionScreen's pills are private to it). */
+/**
+ * Local pill matching §6.3 (SessionScreen's pills are private to it).
+ * `internal`, not `private` — CAL-08's [DeviceShelf]/[DeviceDetail] reuse it
+ * unchanged rather than duplicating the pill idiom.
+ */
 @Composable
-private fun SheetPill(
+internal fun SheetPill(
     label: String,
     primary: Boolean,
     onTap: () -> Unit,
@@ -269,9 +355,12 @@ private fun SheetPill(
     )
 }
 
-/** Quiet variant (ui-ux §6.3): "Text-only, ink2" — tertiary dismissals/exits. */
+/**
+ * Quiet variant (ui-ux §6.3): "Text-only, ink2" — tertiary dismissals/exits.
+ * `internal` for the same reuse reason as [SheetPill] above.
+ */
 @Composable
-private fun QuietText(label: String, onTap: () -> Unit) {
+internal fun QuietText(label: String, onTap: () -> Unit) {
     Text(
         text = label,
         style = BilletType.label,

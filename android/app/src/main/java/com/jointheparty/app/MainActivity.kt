@@ -139,6 +139,11 @@ class MainActivity : ComponentActivity() {
                             playbackPositionMs = viewModel.playbackPositionMs,
                             onLeaveSession = viewModel::reset,
                             inputLevel = viewModel.inputLevel,
+                            onOpenDeviceShelf = viewModel::openDeviceShelf,
+                            onSelectDevice = viewModel::selectDevice,
+                            onBackToDeviceShelf = viewModel::backToDeviceShelf,
+                            onDismissDeviceReview = viewModel::dismissDeviceReview,
+                            onRequestRecalibrate = viewModel::requestRecalibrate,
                         )
                     }
                 }

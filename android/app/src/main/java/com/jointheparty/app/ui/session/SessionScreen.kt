@@ -102,8 +102,20 @@ fun SessionScreen(
     // family — see meterFrames' doc comment above; default keeps
     // previews/simple hosts terse).
     inputLevel: Flow<Float> = MutableStateFlow(0f),
+    // CAL-08: device shelf/detail review intents (defaults keep previews/
+    // simple hosts terse, same convention as the calibration intents above).
+    onOpenDeviceShelf: () -> Unit = {},
+    onSelectDevice: (String) -> Unit = {},
+    onBackToDeviceShelf: () -> Unit = {},
+    onDismissDeviceReview: () -> Unit = {},
+    onRequestRecalibrate: () -> Unit = {},
 ) {
     var showCalibration by remember { mutableStateOf(false) }
+    // CAL-08: separate from [showCalibration] so the sheet appears the
+    // instant "Devices" is tapped, not only once the ViewModel's async
+    // profile fetch lands in [state.deviceReview] — see onOpenDeviceShelf
+    // below.
+    var showDeviceReview by remember { mutableStateOf(false) }
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -137,6 +149,10 @@ fun SessionScreen(
                     onTrimChange = onTrimChange,
                     onTrimCommit = onTrimCommit,
                     onOpenCalibration = { showCalibration = true },
+                    onOpenDeviceShelf = {
+                        showDeviceReview = true
+                        onOpenDeviceShelf()
+                    },
                     playbackPositionMs = playbackPositionMs,
                     onLeaveSession = onLeaveSession,
                 )
@@ -154,7 +170,7 @@ fun SessionScreen(
         // release. Shows why recognition/playback is (not) progressing.
         DebugOverlay(modifier = Modifier.align(Alignment.TopStart))
 
-        if (showCalibration) {
+        if (showCalibration || showDeviceReview) {
             CalibrationSheet(
                 routeName = state.routeName,
                 calibration = state.calibration,
@@ -162,12 +178,45 @@ fun SessionScreen(
                 onCancel = onCancelCalibration,
                 onDismiss = {
                     showCalibration = false
+                    showDeviceReview = false
+                    onDismissDeviceReview()
                     onDismissCalibration()
                 },
                 onTryByEar = onTryByEar,
                 onStartByEar = onStartByEar,
                 onCancelByEar = onCancelByEar,
                 onCommitByEar = onCommitByEar,
+                // CAL-08: the shelf/detail panes only ever render while
+                // showDeviceReview is true — once it's false this stays
+                // DeviceReviewPane.Hidden regardless of what the ViewModel
+                // is still holding, so the guided-calibration content below
+                // is what a bare showCalibration=true entry sees.
+                deviceReview = if (showDeviceReview) state.deviceReview else DeviceReviewPane.Hidden,
+                connectedRouteId = state.routeId,
+                onSelectDevice = onSelectDevice,
+                onBackToShelf = onBackToDeviceShelf,
+                onRequestRecalibrate = {
+                    // Detail's "Calibrate again": the review pane closes
+                    // itself (the ViewModel sets deviceReview = Hidden),
+                    // but the sheet must stay open to show the guided flow
+                    // that opens in its place.
+                    showDeviceReview = false
+                    showCalibration = true
+                    onRequestRecalibrate()
+                },
+                onCalibratePhoneSpeaker = {
+                    // Empty-state primary (ui-ux §6.5): "the one device
+                    // that's always available." This ticket doesn't own
+                    // route-selection, so it starts guided calibration on
+                    // whatever route is already active rather than forcing
+                    // a switch to the phone's built-in speaker — see
+                    // SessionViewModel.requestRecalibrate's doc comment for
+                    // the same limitation.
+                    showDeviceReview = false
+                    showCalibration = true
+                    onDismissDeviceReview()
+                    onStartCalibration()
+                },
             )
         }
     }
@@ -380,6 +429,7 @@ private fun ActiveContent(
     onTrimChange: (Int) -> Unit,
     onTrimCommit: (Int) -> Unit,
     onOpenCalibration: () -> Unit = {},
+    onOpenDeviceShelf: () -> Unit = {},
     playbackPositionMs: Flow<Long> = MutableStateFlow(-1L),
     onLeaveSession: () -> Unit = {},
 ) {
@@ -423,12 +473,23 @@ private fun ActiveContent(
                 color = DT.Colors.ink3,
                 modifier = Modifier.clickable(onClick = onLeaveSession),
             )
-            Text(
-                text = "Calibrate",
-                style = BilletType.label,
-                color = DT.Colors.ink3,
-                modifier = Modifier.clickable(onClick = onOpenCalibration),
-            )
+            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                // CAL-08: the shelf's quiet entry — same register as
+                // "Calibrate" beside it (ui-ux §4's "single quiet entry
+                // point"), no icon chrome, no separate settings screen.
+                Text(
+                    text = "Devices",
+                    style = BilletType.label,
+                    color = DT.Colors.ink3,
+                    modifier = Modifier.clickable(onClick = onOpenDeviceShelf),
+                )
+                Text(
+                    text = "Calibrate",
+                    style = BilletType.label,
+                    color = DT.Colors.ink3,
+                    modifier = Modifier.clickable(onClick = onOpenCalibration),
+                )
+            }
         }
     }
 }

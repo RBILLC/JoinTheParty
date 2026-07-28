@@ -541,6 +541,131 @@ class SessionViewModelTest {
         assertTrue(nudgeStore.calibrationProfiles.getValue("wired").refereeSamples.isEmpty())
     }
 
+    // ---- CAL-08: device shelf/detail review --------------------------------
+
+    @Test
+    fun openDeviceShelfLoadsEveryKnownProfileFromTheStore() = runTest(testDispatcher) {
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 204)
+            calibrationProfiles["bluetooth:AirPods Pro"] =
+                calibrationProfile("bluetooth:AirPods Pro", latencyMs = 182, method = CalibrationProfile.Method.ESTIMATED)
+        }
+        val vm = viewModel(nudgeStore = nudgeStore)
+        assertEquals(DeviceReviewPane.Hidden, vm.syncState.value.deviceReview)
+
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+
+        val shelf = vm.syncState.value.deviceReview as DeviceReviewPane.Shelf
+        assertEquals(2, shelf.profiles.size)
+        assertTrue(shelf.profiles.any { it.routeId == "speaker" })
+        assertTrue(shelf.profiles.any { it.routeId == "bluetooth:AirPods Pro" })
+    }
+
+    @Test
+    fun selectDeviceOpensDetailForAKnownShelfRow() = runTest(testDispatcher) {
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 204)
+        }
+        val vm = viewModel(nudgeStore = nudgeStore)
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+
+        vm.selectDevice("speaker")
+
+        val detail = vm.syncState.value.deviceReview as DeviceReviewPane.Detail
+        assertEquals("speaker", detail.profile.routeId)
+        assertEquals(204, detail.profile.latencyMs)
+    }
+
+    @Test
+    fun selectDeviceIgnoresARouteIdNotOnTheLoadedShelf() = runTest(testDispatcher) {
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 204)
+        }
+        val vm = viewModel(nudgeStore = nudgeStore)
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+
+        vm.selectDevice("bluetooth:unknown")
+
+        // Unchanged — still the shelf, not a Detail pane for a device that
+        // was never in the loaded list.
+        assertTrue(vm.syncState.value.deviceReview is DeviceReviewPane.Shelf)
+    }
+
+    @Test
+    fun backToDeviceShelfReturnsFromDetailToTheShelf() = runTest(testDispatcher) {
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 204)
+        }
+        val vm = viewModel(nudgeStore = nudgeStore)
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+        vm.selectDevice("speaker")
+        assertTrue(vm.syncState.value.deviceReview is DeviceReviewPane.Detail)
+
+        vm.backToDeviceShelf()
+        advanceUntilIdle()
+
+        assertTrue(vm.syncState.value.deviceReview is DeviceReviewPane.Shelf)
+    }
+
+    @Test
+    fun dismissDeviceReviewHidesWhicheverPaneWasShowing() = runTest(testDispatcher) {
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 204)
+        }
+        val vm = viewModel(nudgeStore = nudgeStore)
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+        vm.selectDevice("speaker")
+
+        vm.dismissDeviceReview()
+
+        assertEquals(DeviceReviewPane.Hidden, vm.syncState.value.deviceReview)
+    }
+
+    @Test
+    fun requestRecalibrateOnTheConnectedDeviceClosesReviewAndStartsGuidedCalibration() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 204)
+        }
+        val vm = viewModel(engine, nudgeStore)
+        // Default routeId is "speaker" — the profile below IS the connected device.
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+        vm.selectDevice("speaker")
+
+        vm.requestRecalibrate()
+
+        assertEquals(DeviceReviewPane.Hidden, vm.syncState.value.deviceReview)
+        assertEquals(CalibrationState.Running, vm.syncState.value.calibration)
+        assertEquals(1, engine.calibrationBegun)
+    }
+
+    @Test
+    fun requestRecalibrateOnANonConnectedDeviceOnlyClosesReview() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["bluetooth:AirPods Pro"] =
+                calibrationProfile("bluetooth:AirPods Pro", latencyMs = 182)
+        }
+        val vm = viewModel(engine, nudgeStore)
+        // Default routeId is "speaker" — the selected device is NOT connected.
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+        vm.selectDevice("bluetooth:AirPods Pro")
+
+        vm.requestRecalibrate()
+
+        assertEquals(DeviceReviewPane.Hidden, vm.syncState.value.deviceReview)
+        // No measurement was started against the wrong device.
+        assertEquals(CalibrationState.Idle, vm.syncState.value.calibration)
+        assertEquals(0, engine.calibrationBegun)
+    }
+
     private suspend fun TestScope.driveToLocked(vm: SessionViewModel, engine: FakeSyncEngine) {
         vm.startListening()
         vm.onMatchInFlight()
