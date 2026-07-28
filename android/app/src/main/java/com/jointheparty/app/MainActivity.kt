@@ -140,10 +140,16 @@ class MainActivity : ComponentActivity() {
                             onLeaveSession = viewModel::reset,
                             inputLevel = viewModel.inputLevel,
                             onOpenDeviceShelf = viewModel::openDeviceShelf,
-                            onSelectDevice = viewModel::selectDevice,
+                            onSelectDevice = { routeId -> viewModel.selectDevice(routeId) },
                             onBackToDeviceShelf = viewModel::backToDeviceShelf,
                             onDismissDeviceReview = viewModel::dismissDeviceReview,
                             onRequestRecalibrate = viewModel::requestRecalibrate,
+                            onAcceptFirstContactGate = viewModel::acceptFirstContactGate,
+                            onDeclineFirstContactGate = viewModel::declineFirstContactGate,
+                            onAcceptTrimPromotion = viewModel::acceptTrimPromotion,
+                            onDeclineTrimPromotion = { routeId ->
+                                viewModel.declineTrimPromotion(routeId)
+                            },
                         )
                     }
                 }

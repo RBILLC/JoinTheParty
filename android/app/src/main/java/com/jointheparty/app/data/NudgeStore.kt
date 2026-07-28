@@ -3,6 +3,7 @@ package com.jointheparty.app.data
 import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.first
@@ -53,6 +54,34 @@ interface NudgeStore {
     // CAL-08's device shelf needs "every known device"; no consumer yet in
     // CAL-04, but the store's shape shouldn't need revisiting to add one.
     suspend fun allCalibrationProfiles(): List<CalibrationProfile>
+
+    // CAL-10 (technical-requirements.md §2.6 "Trim promotion"): recent
+    // wheel-COMMIT values for this route, oldest first, so the ≥3-in-a-row
+    // detection survives an app restart — a user re-dialling the SAME
+    // device to about the same offset across separate sessions, not just
+    // within one, is the realistic case this is for. Bounded ring, same
+    // "cap it, don't grow forever" shape as [CalibrationProfile
+    // .refereeSamples]; capped in [DataStoreNudgeStore] alone since the
+    // cap is a storage concern, not a detection one (detection only ever
+    // looks at the last [com.jointheparty.app.ui.theme.DT.Calibration
+    // .trimPromotionSampleCount] anyway).
+    suspend fun trimCommitHistoryFor(routeId: String): List<Int>
+    suspend fun appendTrimCommit(routeId: String, trimMs: Int)
+
+    // Cleared once a promotion is ACCEPTED (the streak has been consumed
+    // into the profile) — deliberately NOT cleared on decline, so "the
+    // trigger condition still holds" after the 7-day cooling-off period
+    // (below) has something to still hold.
+    suspend fun clearTrimCommitHistory(routeId: String)
+
+    // CAL-10 cooling-off: wall-clock stamp of the last "Keep as is"
+    // decline for this route. A STORED TIMESTAMP compared on read is the
+    // whole mechanism — never a running timer (the CAL-04 hang precedent:
+    // see SessionViewModel.maybeSampleReferee's doc comment) — so
+    // suppression and its expiry are both just arithmetic against
+    // whatever `nowMs` the caller passes in.
+    suspend fun trimPromotionDeclinedAtMs(routeId: String): Long?
+    suspend fun saveTrimPromotionDeclinedAtMs(routeId: String, atMs: Long)
 }
 
 class DataStoreNudgeStore(private val context: Context) : NudgeStore {
@@ -103,10 +132,41 @@ class DataStoreNudgeStore(private val context: Context) : NudgeStore {
             }
             .first()
 
+    override suspend fun trimCommitHistoryFor(routeId: String): List<Int> =
+        context.nudgeDataStore.data
+            .map { parseTrimCommitHistory(it[trimCommitHistoryKey(routeId)]) }
+            .first()
+
+    override suspend fun appendTrimCommit(routeId: String, trimMs: Int) {
+        context.nudgeDataStore.edit { prefs ->
+            val updated =
+                (parseTrimCommitHistory(prefs[trimCommitHistoryKey(routeId)]) + trimMs)
+                    .takeLast(TRIM_COMMIT_HISTORY_CAP)
+            prefs[trimCommitHistoryKey(routeId)] = updated.joinToString(",")
+        }
+    }
+
+    override suspend fun clearTrimCommitHistory(routeId: String) {
+        context.nudgeDataStore.edit { it.remove(trimCommitHistoryKey(routeId)) }
+    }
+
+    override suspend fun trimPromotionDeclinedAtMs(routeId: String): Long? =
+        context.nudgeDataStore.data.map { it[trimPromotionDeclinedAtKey(routeId)] }.first()
+
+    override suspend fun saveTrimPromotionDeclinedAtMs(routeId: String, atMs: Long) {
+        context.nudgeDataStore.edit { it[trimPromotionDeclinedAtKey(routeId)] = atMs }
+    }
+
+    private fun parseTrimCommitHistory(raw: String?): List<Int> =
+        raw?.takeIf { it.isNotBlank() }?.split(",")?.mapNotNull { it.toIntOrNull() } ?: emptyList()
+
     private fun trimKey(routeId: String) = intPreferencesKey("trim:$routeId")
     private fun latencyKey(routeId: String) = intPreferencesKey("latency:$routeId")
     private fun calibrationProfileKey(routeId: String) =
         stringPreferencesKey("$CALIBRATION_PROFILE_KEY_PREFIX$routeId")
+    private fun trimCommitHistoryKey(routeId: String) = stringPreferencesKey("trim_commits:$routeId")
+    private fun trimPromotionDeclinedAtKey(routeId: String) =
+        longPreferencesKey("trim_promotion_declined_at:$routeId")
     // "setpoint2": Field Test 4 found a stored value of −2007 ms on the
     // speaker route, written by the wheel-rebase runaway before that bug was
     // fixed. The app restored it every session and dutifully played two
@@ -122,5 +182,10 @@ class DataStoreNudgeStore(private val context: Context) : NudgeStore {
         const val MAX_SETPOINT_MS = 1500
 
         const val CALIBRATION_PROFILE_KEY_PREFIX = "calibration_profile:"
+
+        // CAL-10: comfortably more than trimPromotionSampleCount (3) so an
+        // intervening off-median commit doesn't immediately evict the
+        // agreeing trio it split, without growing the store unbounded.
+        const val TRIM_COMMIT_HISTORY_CAP = 10
     }
 }

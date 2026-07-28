@@ -11,12 +11,14 @@ import com.jointheparty.app.data.NudgeStore
 import com.jointheparty.app.recognition.RecognitionProvider
 import com.jointheparty.app.spotify.AppRemoteSpotifyController
 import com.jointheparty.app.spotify.SpotifyController
+import com.jointheparty.app.ui.theme.DT
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import com.jointheparty.app.ui.model.MeterFrame
 import com.jointheparty.app.ui.model.toMeterFrame
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -47,6 +49,10 @@ data class SyncState(
     // showing. Plain state, not a stream — see [DeviceReviewPane]'s doc
     // comment for the two-stream-rule reasoning.
     val deviceReview: DeviceReviewPane = DeviceReviewPane.Hidden,
+    // CAL-09: non-null exactly while an unknown route's first-contact gate
+    // is up. See [FirstContactGateState]'s doc comment for the load-bearing
+    // "gates playback's aim, never recognition" distinction.
+    val firstContactGate: FirstContactGateState? = null,
 )
 
 /** First pass waits for the PCM window to fill (source needs ≥3 s). */
@@ -143,6 +149,62 @@ private const val MEASURED_CALIBRATION_CONFIDENCE = 1.0f
  */
 private const val BY_EAR_CALIBRATION_CONFIDENCE = 0.7f
 
+/**
+ * CAL-09 (technical-requirements.md §2.6 "ESTIMATED default"): "Centered on
+ * the common case (Bluetooth SBC/AAC and the deep-buffer speaker path), one
+ * value for every route class — v1 does not attempt per-codec detection."
+ * Written when the first-contact gate is declined.
+ */
+private const val ESTIMATED_DEFAULT_LATENCY_MS = 150
+
+/**
+ * CAL-10 cooling-off period (technical-requirements.md §2.6 "Trim
+ * promotion"): 7 days, compared against a stored decline timestamp — see
+ * [SessionViewModel.declineTrimPromotion]'s doc comment for why this is
+ * never a running timer.
+ */
+private const val TRIM_PROMOTION_COOLDOWN_MS = 7L * 24 * 60 * 60 * 1000
+
+/**
+ * CAL-10 promotion floor (technical-requirements.md §2.6 / ui-ux §6.5's
+ * `DT.Calibration` table): `|median|` must clear this to promote — above
+ * the engine's own [REFEREE_AGREEMENT_TOLERANCE_MS]-style 25 ms correction
+ * deadband, so a promotion is never offered for scatter the estimator
+ * wouldn't even act on in the first place.
+ */
+private const val TRIM_PROMOTION_FLOOR_MS = 30
+
+/**
+ * CAL-10 detection rule (technical-requirements.md §2.6 "Trim promotion"):
+ * the most recent [DT.Calibration.trimPromotionSampleCount] (3) wheel
+ * commits must ALL fall within [DT.Calibration.trimPromotionToleranceMs]
+ * (25 ms) of their own median, AND that median's magnitude must clear
+ * [TRIM_PROMOTION_FLOOR_MS] (30 ms) — a strict `>`, not `>=`: a median
+ * sitting exactly at the floor is exactly as unpromotable as one below it.
+ *
+ * The 25 ms tolerance is deliberately not tighter than the engine's own
+ * correction deadband: the trim comes from a human ear, whose own
+ * repeatability is only ±[DT.Calibration.byEarAccuracyMs] (30 ms) —
+ * demanding the wheel agree with itself more precisely than the very
+ * instrument doing the judging would mean this rule could never fire
+ * (`DT.Calibration.trimPromotionToleranceMs`'s own token doc, ui-ux §6.5).
+ *
+ * `internal`, not `private`, and a plain function rather than a method —
+ * same reasoning as [com.jointheparty.app.ui.components.provenanceLabel]:
+ * lets the threshold math be pinned directly by a JVM test, no
+ * ViewModel/store/coroutine scaffolding required.
+ */
+internal fun trimPromotionMedian(commits: List<Int>): Int? {
+    val sampleCount = DT.Calibration.trimPromotionSampleCount.roundToInt()
+    if (commits.size < sampleCount) return null
+    val window = commits.takeLast(sampleCount)
+    val median = window.sorted()[window.size / 2]
+    val tolerance = DT.Calibration.trimPromotionToleranceMs.roundToInt()
+    if (window.any { kotlin.math.abs(it - median) > tolerance }) return null
+    if (kotlin.math.abs(median) <= TRIM_PROMOTION_FLOOR_MS) return null
+    return median
+}
+
 /** INT-03/CAL-07: calibration lifecycle for the active route (arch §6.4, ui-ux §6.5). */
 sealed interface CalibrationState {
     data object Idle : CalibrationState
@@ -186,8 +248,47 @@ sealed interface CalibrationState {
 sealed interface DeviceReviewPane {
     data object Hidden : DeviceReviewPane
     data class Shelf(val profiles: List<CalibrationProfile>) : DeviceReviewPane
-    data class Detail(val profile: CalibrationProfile) : DeviceReviewPane
+
+    /**
+     * @param trimPromotionMedianMs CAL-10 seam: non-null exactly when this
+     * device's recent wheel-commit history qualifies for promotion,
+     * computed once on open (see [SessionViewModel.selectDevice]) — never a
+     * live recompute while the pane sits open (two-stream rule, matching
+     * [openDeviceShelf]'s own "a plain one-shot suspend read, not a
+     * stream"). Rendered through [com.jointheparty.app.ui.components
+     * .DeviceDetail]'s existing `TrimPromotionBannerState` seam.
+     * @param trimPromotionAccepted mirrors `TrimPromotionBannerState
+     * .accepted` — true once "Use this offset" is tapped, so the "Folded
+     * into the calibration" confirmation replaces the accept/decline
+     * actions IN PLACE rather than needing a fresh shelf/detail reload.
+     */
+    data class Detail(
+        val profile: CalibrationProfile,
+        val trimPromotionMedianMs: Int? = null,
+        val trimPromotionAccepted: Boolean = false,
+    ) : DeviceReviewPane
 }
+
+/**
+ * CAL-09 (ui-ux §6.5 "First-contact gate" / tech-req §2.6 "Scope"): which
+ * gate copy to show for an unknown routeId.
+ *
+ * THE LOAD-BEARING DISTINCTION (tech-req §2.6's own "Scope" paragraph):
+ * this gates PLAYBACK'S AIM ONLY, never recognition. Recognition reads the
+ * mic, not the speaker — an unknown/uncalibrated device identifies the
+ * room's song exactly as well as a calibrated one; it just can't aim the
+ * initial seek at the right spot yet, and that's the ONLY thing declining
+ * costs. [SessionViewModel.startListening]/[SessionViewModel
+ * .runRecognitionPass] never read [SyncState.firstContactGate] anywhere —
+ * that omission (not a guard that skips it) IS the enforcement.
+ */
+enum class FirstContactVariant { ACOUSTIC, HEADPHONE }
+
+data class FirstContactGateState(
+    val routeId: String,
+    val deviceName: String,
+    val variant: FirstContactVariant,
+)
 
 data class TrackInfo(
     val spotifyUri: String,
@@ -648,6 +749,16 @@ class SessionViewModel(
             // Audit §4.2: the rebased setpoint is what makes the NEXT
             // session start aligned — persist it beside the wheel value.
             nudgeStore.saveEngineSetpoint(routeId, engineNudgeMs.toInt())
+            // CAL-10: feeds trim-promotion detection, checked lazily when
+            // Device detail opens (selectDevice) — never live during the
+            // session, matching ui-ux §6.5's "no push, no toast, no badge
+            // count" restraint. A user-driven reset to 0 is appended like
+            // any other commit, which is fine: it naturally breaks an
+            // in-progress "same offset three times" streak rather than
+            // silently not counting. [acceptTrimPromotion]'s OWN wheel
+            // reset bypasses this function entirely (see its doc comment)
+            // and clears the history outright instead.
+            nudgeStore.appendTrimCommit(routeId, trimMs)
         }
     }
 
@@ -666,7 +777,8 @@ class SessionViewModel(
             // that latency now lives on the route's CalibrationProfile;
             // -1 (engine default) when the route has never been calibrated
             // — the same fallback the old flat key produced.
-            val outputLatencyPrior = nudgeStore.calibrationProfileFor(routeId)?.latencyMs ?: -1
+            val profile = nudgeStore.calibrationProfileFor(routeId)
+            val outputLatencyPrior = profile?.latencyMs ?: -1
             // Audit §4.2: restore the rebased setpoint when one exists —
             // the session starts already-aligned; the wheel still displays
             // the plain trim.
@@ -681,7 +793,21 @@ class SessionViewModel(
                 if (route == SyncCore.Route.SPEAKER) SyncCore.AecMode.FULL
                 else SyncCore.AecMode.OFF,
             )
-            _syncState.update { it.copy(routeId = routeId, routeName = routeName, nudgeMs = trim) }
+            // CAL-09: trigger is "no stored profile" — extended to
+            // "sampleCount==0" so a previously-declined ESTIMATED profile
+            // (see declineFirstContactGate) re-offers next time this route
+            // becomes active too ("handled" only ever means a real
+            // MEASURED/BY_EAR sample landed). This never delays or guards
+            // anything above — recognition's bootstrap lives entirely in
+            // startListening(), which doesn't read this field.
+            val gate = if (profile == null || profile.sampleCount == 0) {
+                FirstContactGateState(routeId, routeName ?: routeId, firstContactVariant(route))
+            } else {
+                null
+            }
+            _syncState.update {
+                it.copy(routeId = routeId, routeName = routeName, nudgeMs = trim, firstContactGate = gate)
+            }
         }
     }
 
@@ -846,10 +972,91 @@ class SessionViewModel(
         }
     }
 
-    private fun currentRoute(): SyncCore.Route = when {
-        _syncState.value.routeId.startsWith("bluetooth") -> SyncCore.Route.BLUETOOTH
-        _syncState.value.routeId == "wired" -> SyncCore.Route.WIRED
+    /** Classifies an arbitrary routeId string — the same prefix rule [currentRoute] uses for the active one. */
+    private fun routeClassFor(routeId: String): SyncCore.Route = when {
+        routeId.startsWith("bluetooth") -> SyncCore.Route.BLUETOOTH
+        routeId == "wired" -> SyncCore.Route.WIRED
         else -> SyncCore.Route.SPEAKER
+    }
+
+    private fun currentRoute(): SyncCore.Route = routeClassFor(_syncState.value.routeId)
+
+    // ---- First-contact gate (CAL-09) ---------------------------------------
+
+    /**
+     * CAL-09 gate-copy selection (ui-ux §6.5's own examples: "Acoustic-
+     * capable device (phone speaker, Bluetooth speaker)"). Branches on the
+     * ALREADY-KNOWN [SyncCore.Route] [onRouteChanged] was called with — the
+     * exact same information [onRouteChanged] already uses to pick the AEC
+     * mode a few lines above it — never a NEW device-class permission or
+     * API lookup (what tech-req §2.6 and this ticket's own acceptance
+     * criteria forbid). SPEAKER/BLUETOOTH get the acoustic-capable copy,
+     * matching "acoustic offered first" (tech-req §2.6's method table:
+     * MEASURED is attempted for every route, "wired/Bluetooth attempted
+     * first"); WIRED — the one [SyncCore.Route] the spec's acoustic-capable
+     * examples never name, and the connection least likely to ever host a
+     * party speaker — gets the headphone-class copy instead.
+     */
+    private fun firstContactVariant(route: SyncCore.Route): FirstContactVariant =
+        if (route == SyncCore.Route.WIRED) FirstContactVariant.HEADPHONE else FirstContactVariant.ACOUSTIC
+
+    /**
+     * "Calibrate now" / "Calibrate by ear": dismiss the gate and enter
+     * whichever guided flow CAL-01/CAL-07 already built. This ticket adds
+     * no new calibration mechanism — only the prompt that offers one.
+     */
+    fun acceptFirstContactGate() {
+        val gate = _syncState.value.firstContactGate ?: return
+        _syncState.update { it.copy(firstContactGate = null) }
+        when (gate.variant) {
+            FirstContactVariant.ACOUSTIC -> startCalibration()
+            FirstContactVariant.HEADPHONE -> {
+                tryByEarInstead()
+                startByEarCalibration()
+            }
+        }
+    }
+
+    /**
+     * "Not now" (ui-ux §6.5): declining must not read as failure. Writes an
+     * ESTIMATED profile at the generic default (tech-req §2.6) with
+     * `sampleCount=0` so [onRouteChanged] re-offers the gate next time this
+     * routeId becomes active — "handled" only ever means a real measurement
+     * landed, never a decline. Applies the same default to the LIVE engine
+     * right away too, mirroring [onCalibrationResult]/[commitByEar]'s
+     * "apply to the engine immediately, not just persist it" — the device
+     * must be usable THIS session, not just after a future recalibration.
+     */
+    fun declineFirstContactGate() {
+        val gate = _syncState.value.firstContactGate ?: return
+        _syncState.update { it.copy(firstContactGate = null) }
+        val routeClass = routeClassFor(gate.routeId)
+        scope.launch(dispatcher) {
+            val existing = nudgeStore.calibrationProfileFor(gate.routeId)
+            val now = System.currentTimeMillis()
+            nudgeStore.saveCalibrationProfile(
+                CalibrationProfile(
+                    routeId = gate.routeId,
+                    routeClass = routeClass.name,
+                    deviceName = gate.deviceName,
+                    method = CalibrationProfile.Method.ESTIMATED,
+                    latencyMs = ESTIMATED_DEFAULT_LATENCY_MS,
+                    confidence = 0f,
+                    sampleCount = 0,
+                    acousticallyReachable = existing?.acousticallyReachable ?: false,
+                    createdAtMs = existing?.createdAtMs ?: now,
+                    updatedAtMs = now,
+                    refereeSamples = existing?.refereeSamples ?: emptyList(),
+                    drifted = false,
+                ),
+            )
+        }
+        // Only steer the LIVE engine if this route is still the one
+        // actually connected — a gate answered after the route already
+        // moved on must not misapply a stale prior to whatever plays now.
+        if (gate.routeId == _syncState.value.routeId) {
+            engine.setOutputRoute(routeClass, ESTIMATED_DEFAULT_LATENCY_MS)
+        }
     }
 
     // ---- Device review: shelf/detail (CAL-08) ------------------------------
@@ -869,11 +1076,112 @@ class SessionViewModel(
         }
     }
 
-    /** Shelf row tapped: look the routeId up in the shelf's already-loaded list and open its detail pane. */
-    fun selectDevice(routeId: String) {
+    /**
+     * Shelf row tapped: look the routeId up in the shelf's already-loaded
+     * list and open its detail pane.
+     *
+     * CAL-10: trim-promotion eligibility is computed once, right here, on
+     * open — a second suspend read alongside the synchronous profile
+     * lookup above, same "plain one-shot read, not a stream" shape
+     * [openDeviceShelf] already uses. [nowMs] defaults to the wall clock
+     * like [com.jointheparty.app.ui.components.DeviceDetail]'s own
+     * parameter of the same name, letting a test drive the 7-day
+     * cooling-off check without sleeping.
+     */
+    fun selectDevice(routeId: String, nowMs: Long = System.currentTimeMillis()) {
         val shelf = _syncState.value.deviceReview as? DeviceReviewPane.Shelf ?: return
         val profile = shelf.profiles.firstOrNull { it.routeId == routeId } ?: return
         _syncState.update { it.copy(deviceReview = DeviceReviewPane.Detail(profile)) }
+        scope.launch(dispatcher) {
+            val declinedAtMs = nudgeStore.trimPromotionDeclinedAtMs(routeId)
+            val suppressed = declinedAtMs != null && nowMs - declinedAtMs < TRIM_PROMOTION_COOLDOWN_MS
+            val median = if (suppressed) null else trimPromotionMedian(nudgeStore.trimCommitHistoryFor(routeId))
+            if (median == null) return@launch
+            _syncState.update { state ->
+                val detail = state.deviceReview as? DeviceReviewPane.Detail
+                if (detail == null || detail.profile.routeId != routeId) return@update state
+                state.copy(deviceReview = detail.copy(trimPromotionMedianMs = median))
+            }
+        }
+    }
+
+    /**
+     * "Use this offset" (ui-ux §6.5 Device detail / tech-req §2.6 "Trim
+     * promotion"). Folds [medianMs] the same way [commitByEar] folds a
+     * fresh tone-match result (method=BY_EAR, latencyMs=medianMs, pushed to
+     * the engine's output-route prior immediately), plus two things unique
+     * to a promotion: the median is ALSO appended to the caliper's own tick
+     * ring via [CalibrationProfile.withRefereeSample] — "stored as a By ear
+     * tick, same as any tone-match result... the caliper doesn't care how a
+     * tick was produced, only whether it agrees with its neighbors"
+     * (ui-ux §6.5) — and the WHEEL itself resets to zero (tech-req §2.6:
+     * "keeps the wheel's centre meaningful").
+     *
+     * The wheel reset is a DIRECT store+engine write, not a replay of
+     * [onNudgeCommitted]'s rebase/seek logic: that logic exists to correct
+     * audible error the ear just heard, and the SAME correction is what's
+     * being folded into the profile here, so replaying it would double-
+     * apply it as an audible jump back toward zero.
+     */
+    fun acceptTrimPromotion(routeId: String, medianMs: Int) {
+        val routeClass = routeClassFor(routeId)
+        scope.launch(dispatcher) {
+            val existing = nudgeStore.calibrationProfileFor(routeId) ?: return@launch
+            val now = System.currentTimeMillis()
+            val folded = existing.copy(
+                method = CalibrationProfile.Method.BY_EAR,
+                latencyMs = medianMs,
+                confidence = BY_EAR_CALIBRATION_CONFIDENCE,
+                updatedAtMs = now,
+            ).withRefereeSample(medianMs, now)
+            nudgeStore.saveCalibrationProfile(folded)
+            // The streak that triggered this promotion has been consumed —
+            // clear it so re-opening the pane doesn't immediately offer the
+            // very same offset again (unlike a decline, which deliberately
+            // leaves the history alone; see declineTrimPromotion).
+            nudgeStore.clearTrimCommitHistory(routeId)
+            nudgeStore.saveTrim(routeId, 0)
+            nudgeStore.saveEngineSetpoint(routeId, 0)
+            _syncState.update { state ->
+                val detail = state.deviceReview as? DeviceReviewPane.Detail
+                if (detail == null || detail.profile.routeId != routeId) return@update state
+                state.copy(deviceReview = detail.copy(profile = folded, trimPromotionAccepted = true))
+            }
+        }
+        // Only steer the LIVE wheel/engine if this route is still the one
+        // actually connected — mirrors declineFirstContactGate's same
+        // staleness guard.
+        if (routeId == _syncState.value.routeId) {
+            engineNudgeMs = 0.0
+            engine.setUserNudgeMs(0)
+            engine.setOutputRoute(routeClass, medianMs)
+            _syncState.update { it.copy(nudgeMs = 0) }
+        }
+    }
+
+    /**
+     * "Keep as is": never adopt silently — this is the alternative that
+     * keeps it that way. Suppresses the banner for
+     * [TRIM_PROMOTION_COOLDOWN_MS] (7 days) by writing ONE timestamp,
+     * compared on every future [selectDevice] read — no running timer (the
+     * CAL-04 hang precedent — see [maybeSampleReferee]'s doc comment).
+     * Deliberately does NOT clear the commit history: unlike
+     * [acceptTrimPromotion], which consumes the streak into the profile,
+     * a decline just postpones the ask — "re-appears after cooldown if the
+     * trigger condition still holds" needs that history to still be there.
+     */
+    fun declineTrimPromotion(routeId: String, nowMs: Long = System.currentTimeMillis()) {
+        scope.launch(dispatcher) {
+            nudgeStore.saveTrimPromotionDeclinedAtMs(routeId, nowMs)
+        }
+        _syncState.update { state ->
+            val detail = state.deviceReview as? DeviceReviewPane.Detail
+            if (detail == null || detail.profile.routeId != routeId) return@update state
+            // "Keep as is" just closes the banner — the plain provenance
+            // line takes its place, same as dismissDeviceReview does for
+            // drift's "Later" (ui-ux: neither decline reads as failure).
+            state.copy(deviceReview = detail.copy(trimPromotionMedianMs = null))
+        }
     }
 
     /** Detail's back affordance: re-opens the shelf (a fresh read, same as [openDeviceShelf]). */

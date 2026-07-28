@@ -42,6 +42,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.ui.components.CalibrationSheet
+import com.jointheparty.app.ui.components.FirstContactGateSheet
 import com.jointheparty.app.ui.components.NudgeWheel
 import com.jointheparty.app.ui.components.SyncMeter
 import com.jointheparty.app.ui.model.MeterFrame
@@ -109,6 +110,14 @@ fun SessionScreen(
     onBackToDeviceShelf: () -> Unit = {},
     onDismissDeviceReview: () -> Unit = {},
     onRequestRecalibrate: () -> Unit = {},
+    // CAL-09: first-contact gate intents (defaults keep previews/simple
+    // hosts terse, same convention as the calibration intents above).
+    onAcceptFirstContactGate: () -> Unit = {},
+    onDeclineFirstContactGate: () -> Unit = {},
+    // CAL-10: trim-promotion intents, threaded down through CalibrationSheet
+    // to DeviceDetail's seam.
+    onAcceptTrimPromotion: (routeId: String, medianMs: Int) -> Unit = { _, _ -> },
+    onDeclineTrimPromotion: (routeId: String) -> Unit = {},
 ) {
     var showCalibration by remember { mutableStateOf(false) }
     // CAL-08: separate from [showCalibration] so the sheet appears the
@@ -217,6 +226,20 @@ fun SessionScreen(
                     onDismissDeviceReview()
                     onStartCalibration()
                 },
+                onAcceptTrimPromotion = onAcceptTrimPromotion,
+                onDeclineTrimPromotion = onDeclineTrimPromotion,
+            )
+        }
+
+        // CAL-09: independent of showCalibration/showDeviceReview above —
+        // the gate is raised by SessionViewModel.onRouteChanged, not a
+        // quiet-entry-point tap, and can appear the instant a route
+        // connects regardless of whether either sheet is open.
+        state.firstContactGate?.let { gate ->
+            FirstContactGateSheet(
+                gate = gate,
+                onAccept = onAcceptFirstContactGate,
+                onDecline = onDeclineFirstContactGate,
             )
         }
     }

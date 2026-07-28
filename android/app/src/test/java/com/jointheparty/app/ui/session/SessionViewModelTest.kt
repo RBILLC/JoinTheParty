@@ -666,6 +666,286 @@ class SessionViewModelTest {
         assertEquals(0, engine.calibrationBegun)
     }
 
+    // ---- CAL-09: first-contact gate ----------------------------------------
+
+    @Test
+    fun firstContactGateFiresForAnUnknownRouteButNotForAKnownOne() = runTest(testDispatcher) {
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 204)
+        }
+        val vm = viewModel(nudgeStore = nudgeStore)
+
+        vm.onRouteChanged("bluetooth:AirPods Pro", "AirPods Pro", SyncCore.Route.BLUETOOTH)
+        advanceUntilIdle()
+        val gate = vm.syncState.value.firstContactGate
+        assertEquals("bluetooth:AirPods Pro", gate?.routeId)
+        assertEquals(FirstContactVariant.ACOUSTIC, gate?.variant)
+
+        // "speaker" already has a real (sampleCount=1) profile — handled.
+        vm.onRouteChanged("speaker", null, SyncCore.Route.SPEAKER)
+        advanceUntilIdle()
+        assertNull(vm.syncState.value.firstContactGate)
+    }
+
+    @Test
+    fun firstContactGateUsesTheHeadphoneClassVariantForWiredRoutes() = runTest(testDispatcher) {
+        val vm = viewModel()
+
+        vm.onRouteChanged("wired", "Wired headphones", SyncCore.Route.WIRED)
+        advanceUntilIdle()
+
+        assertEquals(FirstContactVariant.HEADPHONE, vm.syncState.value.firstContactGate?.variant)
+    }
+
+    @Test
+    fun decliningFirstContactGateWritesAnEstimatedProfileAppliedToTheEngineImmediately() =
+        runTest(testDispatcher) {
+            val engine = FakeSyncEngine()
+            val nudgeStore = FakeNudgeStore()
+            val vm = viewModel(engine, nudgeStore)
+            vm.onRouteChanged("bluetooth:AirPods Pro", "AirPods Pro", SyncCore.Route.BLUETOOTH)
+            advanceUntilIdle()
+
+            vm.declineFirstContactGate()
+            advanceUntilIdle()
+
+            assertNull(vm.syncState.value.firstContactGate)
+            val profile = nudgeStore.calibrationProfiles["bluetooth:AirPods Pro"]
+            assertEquals(150, profile?.latencyMs)
+            assertEquals(CalibrationProfile.Method.ESTIMATED, profile?.method)
+            assertEquals(0, profile?.sampleCount)
+            assertEquals(SyncCore.Route.BLUETOOTH to 150, engine.routeCalls.last())
+        }
+
+    @Test
+    fun firstContactGateReoffersOnTheNextRouteChangeAfterDecline() = runTest(testDispatcher) {
+        val nudgeStore = FakeNudgeStore()
+        val vm = viewModel(nudgeStore = nudgeStore)
+        vm.onRouteChanged("wired", "Wired headphones", SyncCore.Route.WIRED)
+        advanceUntilIdle()
+        vm.declineFirstContactGate()
+        advanceUntilIdle()
+        assertNull(vm.syncState.value.firstContactGate)
+
+        // A later reconnect on the SAME routeId re-offers — the declined
+        // profile's sampleCount is still 0, "handled" never included it.
+        vm.onRouteChanged("wired", "Wired headphones", SyncCore.Route.WIRED)
+        advanceUntilIdle()
+
+        assertEquals("wired", vm.syncState.value.firstContactGate?.routeId)
+    }
+
+    @Test
+    fun acceptingTheAcousticVariantStartsTheGuidedAcousticFlow() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val vm = viewModel(engine)
+        vm.onRouteChanged("speaker", null, SyncCore.Route.SPEAKER)
+        advanceUntilIdle()
+
+        vm.acceptFirstContactGate()
+
+        assertNull(vm.syncState.value.firstContactGate)
+        assertEquals(CalibrationState.Running, vm.syncState.value.calibration)
+        assertEquals(1, engine.calibrationBegun)
+    }
+
+    @Test
+    fun acceptingTheHeadphoneVariantStartsTheToneMatchFlow() = runTest(testDispatcher) {
+        val tonePlayer = FakeTonePlayer()
+        val vm = viewModel(tonePlayer = tonePlayer)
+        vm.onRouteChanged("wired", "Wired headphones", SyncCore.Route.WIRED)
+        advanceUntilIdle()
+
+        vm.acceptFirstContactGate()
+
+        assertNull(vm.syncState.value.firstContactGate)
+        assertEquals(CalibrationState.ByEarRunning, vm.syncState.value.calibration)
+        assertEquals(1, tonePlayer.startCount)
+    }
+
+    @Test
+    fun listeningAndMatchingProgressWhileTheGateIsStillShowing() = runTest(testDispatcher) {
+        val vm = SessionViewModel(FakeSyncEngine(), FakeNudgeStore(), testDispatcher, FakeRecognitionProvider(null))
+        vm.onRouteChanged("bluetooth:AirPods Pro", "AirPods Pro", SyncCore.Route.BLUETOOTH)
+        advanceUntilIdle()
+        assertTrue(vm.syncState.value.firstContactGate != null)
+
+        vm.startListening()
+
+        assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
+    }
+
+    @Test
+    fun listeningAndMatchingProgressAfterTheGateIsAccepted() = runTest(testDispatcher) {
+        val vm = SessionViewModel(FakeSyncEngine(), FakeNudgeStore(), testDispatcher, FakeRecognitionProvider(null))
+        vm.onRouteChanged("bluetooth:AirPods Pro", "AirPods Pro", SyncCore.Route.BLUETOOTH)
+        advanceUntilIdle()
+        vm.acceptFirstContactGate()
+
+        vm.startListening()
+
+        assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
+    }
+
+    @Test
+    fun listeningAndMatchingProgressAfterTheGateIsDeclined() = runTest(testDispatcher) {
+        val vm = SessionViewModel(FakeSyncEngine(), FakeNudgeStore(), testDispatcher, FakeRecognitionProvider(null))
+        vm.onRouteChanged("bluetooth:AirPods Pro", "AirPods Pro", SyncCore.Route.BLUETOOTH)
+        advanceUntilIdle()
+        vm.declineFirstContactGate()
+        advanceUntilIdle()
+
+        vm.startListening()
+
+        assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
+    }
+
+    // ---- CAL-10: trim promotion detection (pure function) ------------------
+
+    @Test
+    fun fewerThanThreeCommitsNeverPromote() {
+        assertNull(trimPromotionMedian(listOf(-180, -185)))
+    }
+
+    @Test
+    fun threeAgreeingCommitsBeyondTheFloorPromote() {
+        assertEquals(-180, trimPromotionMedian(listOf(-180, -185, -178)))
+    }
+
+    @Test
+    fun commitsOutsideToleranceDoNotPromote() {
+        // Sorted median -180; both neighbours sit 30ms away — over the 25ms tolerance.
+        assertNull(trimPromotionMedian(listOf(-150, -180, -210)))
+    }
+
+    @Test
+    fun medianAtOrBelowTheFloorDoesNotPromote() {
+        assertNull(trimPromotionMedian(listOf(18, 20, 22))) // median 20ms
+        assertNull(trimPromotionMedian(listOf(28, 30, 32))) // median exactly 30ms — not ABOVE the floor
+    }
+
+    @Test
+    fun onlyTheMostRecentThreeCommitsAreConsidered() {
+        // A stale, wildly-off first entry must not poison a fresh agreeing trio.
+        assertEquals(-180, trimPromotionMedian(listOf(9999, -180, -185, -178)))
+    }
+
+    // ---- CAL-10: trim promotion end-to-end ---------------------------------
+
+    @Test
+    fun deviceDetailSurfacesTheBannerOnlyOnceThreeCommitsAgree() = runTest(testDispatcher) {
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 200)
+        }
+        val vm = viewModel(nudgeStore = nudgeStore)
+        vm.onRouteChanged("speaker", null, SyncCore.Route.SPEAKER)
+        advanceUntilIdle()
+        vm.onNudgeCommitted(-180)
+        vm.onNudgeCommitted(-183)
+        advanceUntilIdle()
+
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+        vm.selectDevice("speaker")
+        advanceUntilIdle()
+        assertNull((vm.syncState.value.deviceReview as DeviceReviewPane.Detail).trimPromotionMedianMs)
+
+        vm.onNudgeCommitted(-178)
+        advanceUntilIdle()
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+        vm.selectDevice("speaker")
+        advanceUntilIdle()
+
+        assertEquals(-180, (vm.syncState.value.deviceReview as DeviceReviewPane.Detail).trimPromotionMedianMs)
+    }
+
+    @Test
+    fun acceptingTrimPromotionFoldsTheMedianSetsByEarAndZeroesTheWheel() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 200)
+        }
+        val vm = viewModel(engine, nudgeStore)
+        vm.onRouteChanged("speaker", null, SyncCore.Route.SPEAKER)
+        advanceUntilIdle()
+        vm.onNudgeCommitted(-180)
+        vm.onNudgeCommitted(-183)
+        vm.onNudgeCommitted(-178)
+        advanceUntilIdle()
+
+        vm.acceptTrimPromotion("speaker", -180)
+        advanceUntilIdle()
+
+        val profile = nudgeStore.calibrationProfiles.getValue("speaker")
+        assertEquals(-180, profile.latencyMs)
+        assertEquals(CalibrationProfile.Method.BY_EAR, profile.method)
+        assertEquals(1, profile.refereeSamples.size)
+        assertEquals(-180, profile.refereeSamples.single().residualMs)
+        assertFalse(profile.drifted) // freshly folded — never "drifted" from itself
+        assertEquals(0, vm.syncState.value.nudgeMs)
+        assertEquals(0, nudgeStore.trims.getValue("speaker"))
+        assertEquals(0, engine.nudgeCalls.last())
+        assertEquals(SyncCore.Route.SPEAKER to -180, engine.routeCalls.last())
+        // The consumed streak doesn't linger to immediately re-trigger.
+        assertTrue(nudgeStore.trimCommitHistories["speaker"].isNullOrEmpty())
+    }
+
+    @Test
+    fun decliningTrimPromotionClosesTheOpenBannerInPlace() = runTest(testDispatcher) {
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 200)
+        }
+        val vm = viewModel(nudgeStore = nudgeStore)
+        vm.onRouteChanged("speaker", null, SyncCore.Route.SPEAKER)
+        advanceUntilIdle()
+        vm.onNudgeCommitted(-180)
+        vm.onNudgeCommitted(-183)
+        vm.onNudgeCommitted(-178)
+        advanceUntilIdle()
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+        vm.selectDevice("speaker")
+        advanceUntilIdle()
+        assertEquals(-180, (vm.syncState.value.deviceReview as DeviceReviewPane.Detail).trimPromotionMedianMs)
+
+        vm.declineTrimPromotion("speaker")
+
+        assertNull((vm.syncState.value.deviceReview as DeviceReviewPane.Detail).trimPromotionMedianMs)
+    }
+
+    @Test
+    fun decliningTrimPromotionSuppressesForTheCooldownWindowThenExpires() = runTest(testDispatcher) {
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 200)
+        }
+        val vm = viewModel(nudgeStore = nudgeStore)
+        vm.onRouteChanged("speaker", null, SyncCore.Route.SPEAKER)
+        advanceUntilIdle()
+        vm.onNudgeCommitted(-180)
+        vm.onNudgeCommitted(-183)
+        vm.onNudgeCommitted(-178)
+        advanceUntilIdle()
+
+        val declinedAtMs = 1_000_000_000L
+        vm.declineTrimPromotion("speaker", declinedAtMs)
+        advanceUntilIdle()
+
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+        // 6 days later — still inside the 7-day cooling-off period.
+        vm.selectDevice("speaker", nowMs = declinedAtMs + 6L * 86_400_000L)
+        advanceUntilIdle()
+        assertNull((vm.syncState.value.deviceReview as DeviceReviewPane.Detail).trimPromotionMedianMs)
+
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+        // 8 days later — cooldown expired, the trigger condition still holds.
+        vm.selectDevice("speaker", nowMs = declinedAtMs + 8L * 86_400_000L)
+        advanceUntilIdle()
+        assertEquals(-180, (vm.syncState.value.deviceReview as DeviceReviewPane.Detail).trimPromotionMedianMs)
+    }
+
     private suspend fun TestScope.driveToLocked(vm: SessionViewModel, engine: FakeSyncEngine) {
         vm.startListening()
         vm.onMatchInFlight()
@@ -886,6 +1166,28 @@ private class FakeNudgeStore : NudgeStore {
 
     override suspend fun saveEngineSetpoint(routeId: String, ms: Int) {
         setpoints[routeId] = ms
+    }
+
+    /** CAL-10: recent wheel-commit history, oldest first — mirrors [DataStoreNudgeStore]'s persisted ring. */
+    val trimCommitHistories = mutableMapOf<String, MutableList<Int>>()
+
+    override suspend fun trimCommitHistoryFor(routeId: String): List<Int> =
+        trimCommitHistories[routeId]?.toList() ?: emptyList()
+
+    override suspend fun appendTrimCommit(routeId: String, trimMs: Int) {
+        trimCommitHistories.getOrPut(routeId) { mutableListOf() }.add(trimMs)
+    }
+
+    override suspend fun clearTrimCommitHistory(routeId: String) {
+        trimCommitHistories.remove(routeId)
+    }
+
+    val trimPromotionDeclinedAt = mutableMapOf<String, Long>()
+
+    override suspend fun trimPromotionDeclinedAtMs(routeId: String): Long? = trimPromotionDeclinedAt[routeId]
+
+    override suspend fun saveTrimPromotionDeclinedAtMs(routeId: String, atMs: Long) {
+        trimPromotionDeclinedAt[routeId] = atMs
     }
 }
 

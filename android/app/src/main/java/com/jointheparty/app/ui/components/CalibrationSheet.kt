@@ -69,6 +69,12 @@ fun CalibrationSheet(
     onBackToShelf: () -> Unit = {},
     onRequestRecalibrate: () -> Unit = {},
     onCalibratePhoneSpeaker: () -> Unit = {},
+    // CAL-10: trim-promotion accept/decline, threaded down to
+    // [DeviceDetail]'s existing `TrimPromotionBannerState` seam below.
+    // Defaults keep previews/simple hosts terse, same convention as the
+    // CAL-08 intents above.
+    onAcceptTrimPromotion: (routeId: String, medianMs: Int) -> Unit = { _, _ -> },
+    onDeclineTrimPromotion: (routeId: String) -> Unit = {},
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -118,6 +124,18 @@ fun CalibrationSheet(
                         connected = deviceReview.profile.routeId == connectedRouteId,
                         onRecalibrate = onRequestRecalibrate,
                         onDismissBanner = onBackToShelf,
+                        // CAL-10 seam (CAL-08 left this null): non-null
+                        // exactly when SessionViewModel.selectDevice found
+                        // this device's recent commits eligible — see
+                        // DeviceReviewPane.Detail's doc comment.
+                        trimPromotion = deviceReview.trimPromotionMedianMs?.let { median ->
+                            TrimPromotionBannerState(
+                                medianMs = median,
+                                onAccept = { onAcceptTrimPromotion(deviceReview.profile.routeId, median) },
+                                onDecline = { onDeclineTrimPromotion(deviceReview.profile.routeId) },
+                                accepted = deviceReview.trimPromotionAccepted,
+                            )
+                        },
                     )
                 }
                 DeviceReviewPane.Hidden -> GuidedCalibrationContent(
