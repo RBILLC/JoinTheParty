@@ -102,6 +102,10 @@ def swift(tokens: dict) -> str:
     for name, v in tokens["meter"].items():
         a(f"        static let {name}: Double = {v}")
     a("    }")
+    a("    enum Calibration {")
+    for name, v in tokens["calibration"].items():
+        a(f"        static let {name}: Double = {v}")
+    a("    }")
     a("}")
     a("")
     a("extension Color {")
@@ -183,6 +187,10 @@ def kotlin(tokens: dict) -> str:
     a("    }")
     a("    object Meter {")
     for name, v in tokens["meter"].items():
+        a(f"        const val {name} = {float(v)}f")
+    a("    }")
+    a("    object Calibration {")
+    for name, v in tokens["calibration"].items():
         a(f"        const val {name} = {float(v)}f")
     a("    }")
     a("}")

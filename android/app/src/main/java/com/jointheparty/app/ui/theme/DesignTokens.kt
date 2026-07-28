@@ -82,4 +82,20 @@ object DT {
         const val deadbandMs = 25.0f
         const val logMapRefMs = 250.0f
     }
+    object Calibration {
+        const val scaleRangeMs = 600.0f
+        const val tickStrokeWidthPt = 1.0f
+        const val tickAlpha = 0.35f
+        const val settledLineStrokeWidthPt = 2.0f
+        const val maxRetainedSamples = 20.0f
+        const val shelfStripHeightPt = 20.0f
+        const val detailScaleHeightPt = 72.0f
+        const val toneMatchPeriodMs = 1200.0f
+        const val toneMatchStrikeMs = 100.0f
+        const val byEarAccuracyMs = 30.0f
+        const val trimPromotionSampleCount = 3.0f
+        const val trimPromotionToleranceMs = 25.0f
+        const val driftMinSamples = 3.0f
+        const val driftThresholdMs = 50.0f
+    }
 }

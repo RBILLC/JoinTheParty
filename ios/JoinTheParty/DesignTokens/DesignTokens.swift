@@ -84,6 +84,22 @@ enum DT {
         static let deadbandMs: Double = 25
         static let logMapRefMs: Double = 250
     }
+    enum Calibration {
+        static let scaleRangeMs: Double = 600
+        static let tickStrokeWidthPt: Double = 1
+        static let tickAlpha: Double = 0.35
+        static let settledLineStrokeWidthPt: Double = 2
+        static let maxRetainedSamples: Double = 20
+        static let shelfStripHeightPt: Double = 20
+        static let detailScaleHeightPt: Double = 72
+        static let toneMatchPeriodMs: Double = 1200
+        static let toneMatchStrikeMs: Double = 100
+        static let byEarAccuracyMs: Double = 30
+        static let trimPromotionSampleCount: Double = 3
+        static let trimPromotionToleranceMs: Double = 25
+        static let driftMinSamples: Double = 3
+        static let driftThresholdMs: Double = 50
+    }
 }
 
 extension Color {

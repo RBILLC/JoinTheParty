@@ -367,7 +367,7 @@ Copy and behavior are specified under Device detail, above, as a banner rather t
 | `tickStrokeWidthPt` | 1 | Individual measurement tick. |
 | `tickAlpha` | 0.35 | Per-tick opacity; compounds under ordinary blending where samples agree. |
 | `settledLineStrokeWidthPt` | 2 | Settled value / drag cursor stroke — matches the meter's fused-line weight (§6.1). |
-| `maxRetainedSamples` | 12 | Ring buffer of ticks kept per device, any provenance. |
+| `maxRetainedSamples` | 20 | Ring buffer of ticks kept per device, any provenance. Matches the profile record's `refereeSamples` cap (tech-req §2.6) — the drawn ticks and the stored samples are the same ring, so the two must not diverge. |
 | `shelfStripHeightPt` | 20 | Compact caliper on the device shelf. |
 | `detailScaleHeightPt` | 72 | Full caliper well on Device detail. |
 | `toneMatchPeriodMs` | 1200 | Tone/strike repetition interval during By ear calibration. |
