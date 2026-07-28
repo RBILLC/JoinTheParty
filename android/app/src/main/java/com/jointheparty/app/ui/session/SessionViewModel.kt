@@ -470,6 +470,12 @@ class SessionViewModel(
             gateDismissedThisSession = true
         }
         val capStarted = engine.startCapture()
+        // The session owns the mic from here; a calibration started later is
+        // a guest and must not close it (see releaseCalibrationCapture).
+        if (capStarted) {
+            captureRunning = true
+            calibrationOwnsCapture = false
+        }
         com.jointheparty.app.debug.DebugLog.log(
             "join → startCapture=${if (capStarted) "ok" else "FAILED (mic/format)"}; " +
                 "recognizer=${if (recognition != null) "ACRCloud" else "none"}",
@@ -765,6 +771,8 @@ class SessionViewModel(
     fun reset() {
         if (transition(SessionPhase.IDLE)) {
             engine.stopCapture()
+            captureRunning = false
+            calibrationOwnsCapture = false
             consecutiveLosses = 0
             gateDismissedThisSession = false
             firstEstimateSeen = false
@@ -912,6 +920,24 @@ class SessionViewModel(
 
     private var capturedCalibrationRoute: CapturedCalibrationRoute? = null
 
+    /** Mirrors the engine's capture state so calibration can tell whether it must open the mic itself. */
+    private var captureRunning = false
+
+    /** True when THIS calibration started capture, so only it may stop it again. */
+    private var calibrationOwnsCapture = false
+
+    /**
+     * Hands the mic back if this measurement was the one that opened it.
+     * A session already listening keeps its capture untouched — calibration
+     * is a guest there, not the owner.
+     */
+    private fun releaseCalibrationCapture() {
+        if (!calibrationOwnsCapture) return
+        calibrationOwnsCapture = false
+        captureRunning = false
+        engine.stopCapture()
+    }
+
     private fun captureCalibrationRoute() {
         capturedCalibrationRoute = CapturedCalibrationRoute(
             routeId = _syncState.value.routeId,
@@ -955,7 +981,28 @@ class SessionViewModel(
      */
     fun startCalibration() {
         if (_syncState.value.calibration == CalibrationState.Running) return
+        // FIELD FIX (device test, 2026-07-28): the chirp detector only polls
+        // while the worker is draining capture, so with the mic stopped it
+        // neither hears the chirp NOR ever reaches its own 8 s timeout — the
+        // sheet sat on "Listening for the chirp…" indefinitely. Capture was
+        // previously started only by startListening() (the Join tap), which
+        // made calibrating before joining a party — the entire point of the
+        // idle entry point — impossible in practice.
+        //
+        // Start it here when it isn't already running, and remember that we
+        // did so this measurement can hand the mic back afterwards rather
+        // than leaving it open on an idle screen.
+        if (!captureRunning) {
+            if (!engine.startCapture()) {
+                com.jointheparty.app.debug.DebugLog.log("calibrate → startCapture FAILED (mic/format)")
+                _syncState.update { it.copy(calibration = CalibrationState.Failed) }
+                return
+            }
+            captureRunning = true
+            calibrationOwnsCapture = true
+        }
         if (!engine.beginCalibration()) {
+            releaseCalibrationCapture()
             _syncState.update { it.copy(calibration = CalibrationState.Failed) }
             return
         }
@@ -983,6 +1030,7 @@ class SessionViewModel(
 
     fun cancelCalibration() {
         engine.cancelCalibration()
+        releaseCalibrationCapture()
         capturedCalibrationRoute = null // CFX-01: cancelling clears the captured route
         _syncState.update { it.copy(calibration = CalibrationState.Idle) }
     }
@@ -996,6 +1044,7 @@ class SessionViewModel(
      */
     fun acknowledgeCalibration() {
         tonePlayer?.stop()
+        releaseCalibrationCapture()
         capturedCalibrationRoute = null // CFX-01: dismissing clears the captured route
         _syncState.update { it.copy(calibration = CalibrationState.Idle) }
     }
@@ -1092,6 +1141,8 @@ class SessionViewModel(
     }
 
     private fun onCalibrationResult(event: SyncCore.Event.CalibrationResult) {
+        // Measurement over either way — hand the mic back if we opened it.
+        releaseCalibrationCapture()
         // CFX-01: consume the snapshot captured at startCalibration() —
         // never re-read the live route here. See commitByEar's matching
         // comment for why both the proactive (onRouteChanged) and this

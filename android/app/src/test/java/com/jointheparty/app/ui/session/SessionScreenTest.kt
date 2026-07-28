@@ -51,8 +51,18 @@ class SessionScreenTest {
     }
 
     @Test
-    fun sheetClosesWhenThePhaseIsIdleOrWaiting() {
-        assertFalse(shouldShowCalibrationSheet(true, SessionPhase.IDLE, firstContactGate = null))
+    fun sheetIsHostedAtIdleSoCalibrationIsReachableBeforeAParty() {
+        // FIELD FIX (device test): this previously asserted IDLE -> false,
+        // which is what the spec said and what defeated CFX-05 on device.
+        // The gate fires at IDLE, so a sheet that cannot render there means
+        // accepting it starts a measurement nobody can see.
+        assertTrue(shouldShowCalibrationSheet(true, SessionPhase.IDLE, firstContactGate = null))
+    }
+
+    @Test
+    fun sheetClosesWhileWaitingOnTheRoom() {
+        // LISTENING/MATCHING deliberately hold a bare, quiet screen; a sheet
+        // over them would cover the one thing the user is waiting on.
         assertFalse(shouldShowCalibrationSheet(true, SessionPhase.LISTENING, firstContactGate = null))
         assertFalse(shouldShowCalibrationSheet(true, SessionPhase.MATCHING, firstContactGate = null))
     }

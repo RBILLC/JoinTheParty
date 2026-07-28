@@ -146,7 +146,8 @@ fun SessionScreen(
     // wiring (below) so the ViewModel's calibration/deviceReview state is
     // cleared the same way a manual dismiss would clear it.
     LaunchedEffect(phaseGroup) {
-        if (phaseGroup != PhaseGroup.ACTIVE && (showCalibration || showDeviceReview)) {
+        val hosts = phaseGroup == PhaseGroup.ACTIVE || phaseGroup == PhaseGroup.IDLE
+        if (!hosts && (showCalibration || showDeviceReview)) {
             showCalibration = false
             showDeviceReview = false
             onDismissDeviceReview()
@@ -230,7 +231,13 @@ fun SessionScreen(
         // the gate below is rendered completely independently, so this
         // condition excluding gate!=null is what makes the two sheets
         // structurally exclusive rather than a coincidence of layout.
-        if (shouldShowCalibrationSheet(showCalibration || showDeviceReview, state.phase, state.firstContactGate)) {
+        if (shouldShowCalibrationSheet(
+                sheetRequested = showCalibration || showDeviceReview ||
+                    state.calibration.isInProgress(),
+                phase = state.phase,
+                firstContactGate = state.firstContactGate,
+            )
+        ) {
             CalibrationSheet(
                 routeName = state.routeName,
                 calibration = state.calibration,
@@ -336,7 +343,61 @@ internal fun shouldShowCalibrationSheet(
     sheetRequested: Boolean,
     phase: SessionPhase,
     firstContactGate: FirstContactGateState?,
-): Boolean = sheetRequested && firstContactGate == null && phase.toPhaseGroup() == PhaseGroup.ACTIVE
+): Boolean = sheetRequested && firstContactGate == null && phase.allowsCalibrationSheet()
+
+/**
+ * A calibration the user can't see isn't a calibration.
+ *
+ * FIELD FIX (device test, 2026-07-28): accepting the first-contact gate
+ * calls `startCalibration()` on the ViewModel, but nothing set
+ * `showCalibration` — that flag is only flipped by the "Calibrate" entry
+ * point. So "Calibrate now" dismissed the gate, armed a measurement, and
+ * returned the user to a bare idle screen with no sheet, no chirp
+ * feedback, and no result. This predates the CFX wave; the audit missed it
+ * because it traced states rather than driving the app.
+ *
+ * The screen-local flags mean "the user asked to open this"; an in-flight
+ * measurement is a second, independent reason the sheet must be on screen.
+ * Deriving it from the ViewModel's own state means any future path that
+ * starts a calibration presents it, without having to remember to set a
+ * flag too.
+ */
+private fun CalibrationState.isInProgress(): Boolean = when (this) {
+    CalibrationState.Idle -> false
+    CalibrationState.Running,
+    CalibrationState.Failed,
+    CalibrationState.Cancelled,
+    CalibrationState.ByEarIdle,
+    CalibrationState.ByEarRunning,
+    -> true
+    is CalibrationState.Success, is CalibrationState.ByEarSuccess -> true
+}
+
+/**
+ * IDLE and ACTIVE both host the sheet; everything else closes it.
+ *
+ * FIELD FIX (device test, 2026-07-28): this was `== PhaseGroup.ACTIVE`,
+ * which silently defeated CFX-05. The first-contact gate fires at IDLE (the
+ * route observer runs when the graph is built), so accepting it started a
+ * measurement the sheet could never render — on device, "Calibrate now"
+ * dismissed the gate and returned to a bare idle screen with nothing
+ * running and no profile written. IDLE is precisely where calibrating is
+ * most useful, which is why CFX-05 put an entry point there; excluding it
+ * made that entry point lead nowhere.
+ *
+ * The unit suite did not catch this because it asserted the rule as
+ * specified — "IDLE/WAITING → false" was a passing case. The spec was
+ * wrong, so the test encoded the bug.
+ *
+ * What CFX-04 actually needed to prevent is a sheet floating over a session
+ * that has moved on without it: LOST, and the concierge phases where the
+ * user must act elsewhere before calibration means anything.
+ */
+private fun SessionPhase.allowsCalibrationSheet(): Boolean =
+    when (toPhaseGroup()) {
+        PhaseGroup.IDLE, PhaseGroup.ACTIVE -> true
+        PhaseGroup.WAITING, PhaseGroup.LOST, PhaseGroup.CONCIERGE -> false
+    }
 
 /**
  * CFX-05 (tech-req §2.6 "Entry points"): the open-shelf action shared by
