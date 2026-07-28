@@ -90,27 +90,94 @@ class AudioTrackChirpPlayer : ChirpPlayer {
                 trackBuilder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_POWER_SAVING)
             }
 
-            val track = trackBuilder.build()
+            val track = try {
+                trackBuilder.build()
+            } catch (t: Throwable) {
+                // A fire-and-forget thread swallows this silently otherwise:
+                // the chirp simply never happens and calibration can only
+                // time out with no clue why.
+                com.jointheparty.app.debug.DebugLog.log("chirp: build failed — $t")
+                return@thread
+            }
 
             try {
                 // MODE_STREAM requires play() before the first write() —
                 // unlike MODE_STATIC, there's no buffer to preload before
                 // starting. write() blocks until the data is queued.
+                // startThresholdInFrames is readable on API 31+ — logged so
+                // the device itself confirms the diagnosis below rather than
+                // us asserting it.
+                val thresholdFrames =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        track.startThresholdInFrames
+                    } else {
+                        -1
+                    }
+                com.jointheparty.app.debug.DebugLog.log(
+                    "chirp: state=${track.state} rate=${track.sampleRate} " +
+                        "capacity=${track.bufferSizeInFrames} threshold=$thresholdFrames " +
+                        "frames=${pcm.size / CHANNEL_COUNT}",
+                )
                 track.play()
-                track.write(pcm, 0, pcm.size)
+                val wrote = track.write(pcm, 0, pcm.size)
 
-                // Drain wait sized from the buffer, not hardcoded: the
-                // chirp itself is DURATION_S long, plus however much of the
-                // deep buffer is still queued behind it needs to play out
-                // before release() is safe. Worst case the whole buffer is
-                // still full when write() returns, so wait for the chirp
-                // duration plus the buffer's own playout time (with a
-                // margin for scheduling jitter) rather than a number tuned
-                // to one buffer size.
-                val bufferPlayoutMs = (bufferBytes.toDouble() * 1000.0) /
-                    (SAMPLE_RATE * CHANNEL_COUNT * BYTES_PER_SAMPLE)
-                val drainMs = (DURATION_S * 1000.0 + bufferPlayoutMs * DRAIN_MARGIN_FACTOR).toLong()
-                Thread.sleep(drainMs)
+                // FIELD FIX (device test, 2026-07-28, second finding): a
+                // MODE_STREAM track does not begin rendering until the
+                // frames written reach its start threshold, which DEFAULTS
+                // TO THE BUFFER CAPACITY. Instrumented run showed exactly
+                // that: wrote=17640, playState=3 (playing), yet
+                // head=0/8820 after a full 2 s — every frame accepted,
+                // nothing rendered, total silence at the mic. Our own
+                // CAL-01 change caused it: the 8x buffer that biases the
+                // platform toward the deep-buffer path also raised the
+                // default threshold far beyond a 200 ms chirp, so the
+                // track could never start by construction.
+                //
+                // Pad the write with silence up to the track's REPORTED
+                // capacity (bufferSizeInFrames — measured, not the
+                // requested size). Reaching capacity satisfies the default
+                // threshold on every API level, no API-31 branch needed.
+                // The padding is silence, so nothing audible changes.
+                val chirpFrames = pcm.size / CHANNEL_COUNT
+                val capacityFrames = track.bufferSizeInFrames
+                val padShorts = (capacityFrames - chirpFrames).coerceAtLeast(0) * CHANNEL_COUNT
+                if (padShorts > 0) {
+                    track.write(ShortArray(padShorts), 0, padShorts)
+                }
+                com.jointheparty.app.debug.DebugLog.log(
+                    "chirp: wrote=$wrote padShorts=$padShorts playState=${track.playState}",
+                )
+
+                // FIELD FIX (device test, 2026-07-28): wait for the frames
+                // to actually LEAVE, don't estimate how long that takes.
+                //
+                // The first version slept for the content duration plus the
+                // buffer's own playout time. That is not the same as the
+                // pipeline's end-to-end latency: on the deep-buffer path we
+                // deliberately request (CAL-01) there is another ~150-200 ms
+                // downstream of the track, and `release()` discards whatever
+                // has not reached the speaker yet. The result was total
+                // silence — logcat showed "stop(): called with 8820 frames
+                // delivered", i.e. the whole chirp written and then thrown
+                // away, so neither the room nor the phone's own mic ever
+                // heard it and calibration could only ever time out.
+                //
+                // getPlaybackHeadPosition() counts frames the track has
+                // actually rendered, so polling it until it reaches the
+                // frame count is a measurement rather than a guess. The
+                // timeout is a backstop for a stalled or routed-away track;
+                // it must exceed any plausible pipeline latency, which is
+                // exactly the quantity the old sleep was trying to predict.
+                val deadline = System.nanoTime() + DRAIN_TIMEOUT_MS * 1_000_000L
+                while (track.playbackHeadPosition < chirpFrames &&
+                    System.nanoTime() < deadline
+                ) {
+                    Thread.sleep(DRAIN_POLL_MS)
+                }
+                com.jointheparty.app.debug.DebugLog.log(
+                    "chirp: head=${track.playbackHeadPosition}/$chirpFrames " +
+                        "playState=${track.playState}",
+                )
             } finally {
                 track.release()
             }
@@ -145,6 +212,8 @@ class AudioTrackChirpPlayer : ChirpPlayer {
         const val CHANNEL_COUNT = 2
         const val BYTES_PER_SAMPLE = 2
         const val BUFFER_SIZE_FACTOR = 8
-        const val DRAIN_MARGIN_FACTOR = 1.25
+        /** Backstop if the track stalls or is routed away mid-play. */
+        const val DRAIN_TIMEOUT_MS = 2_000L
+        const val DRAIN_POLL_MS = 10L
     }
 }
