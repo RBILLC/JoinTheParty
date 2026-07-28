@@ -132,6 +132,15 @@ sc_status_t sc_notify_local_playback(sc_session_t*, int64_t commanded_position_m
  * providers need (a match offset references the sample's end). Thread-safe,
  * non-RT (brief mutex against the worker's history writer; never touches
  * the RT ring). The engine retains ~12 s of history. */
+/* Clears the retained capture history (and the smoothed input level). Call
+ * when the shell (re)opens its capture stream: the ring otherwise survives a
+ * capture stop/start, so the first recognition window of a NEW session can
+ * contain the tail of the PREVIOUS session's audio — field test 8 watched a
+ * fresh join match the prior session's song from exactly that stale tail and
+ * confidently play the wrong track. Same disease as arming calibration on a
+ * stale clock: consuming input recorded before the epoch it belongs to. */
+sc_status_t sc_reset_capture_history(sc_session_t*);
+
 int32_t sc_copy_recent_capture(sc_session_t*, float* out, int32_t max_frames,
                                uint64_t* out_end_mono_ns);
 

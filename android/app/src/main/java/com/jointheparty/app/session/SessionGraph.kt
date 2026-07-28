@@ -141,6 +141,18 @@ class SessionGraph(context: Context) {
          * error; an audible skip every few seconds annoys more than
          * sub-400 ms offset between separated sources.
          */
+        // FIELD TEST 8, measured twice and settled: 350 stays.
+        //
+        // The tension: at 350 a session can declare LOCKED sitting ~290 ms
+        // off, which the ear reads as constant echo ('Dreams', user-
+        // confirmed). Dropping to 150 was tried live and was WORSE — eight
+        // corrections in 77 s, drift estimate pegged, and the loop chased
+        // the song's own beat periodicity into an on-beat-but-3-beats-late
+        // hole. Each correction re-seeds recognition against two copies of
+        // the same song, so uncorroborated corrections at tight thresholds
+        // feed themselves. The accuracy gap is real but belongs to CTL-02
+        // (corroborated corrections / post-lock refinement), not to this
+        // constant.
         private const val ENGINE_DEADBAND_MS = 350
     }
 }

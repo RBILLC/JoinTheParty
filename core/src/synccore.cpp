@@ -830,6 +830,21 @@ sc_status_t sc_push_reference(sc_session_t* s, const float* mono, int32_t frames
     return SC_OK;
 }
 
+sc_status_t sc_reset_capture_history(sc_session_t* s) {
+    if (!s) return SC_ERR_INVALID_ARG;
+    {
+        std::lock_guard<std::mutex> lock(s->history_mtx);
+        std::fill(s->history.begin(), s->history.end(), 0.0f);
+        s->history_write = 0;
+        s->history_wrapped = false;
+        s->history_end_ns.store(0, std::memory_order_relaxed);
+    }
+    // The level meter is a property of the CURRENT capture stream; a new
+    // stream must not inherit the old one's envelope.
+    s->input_level.store(0.0f, std::memory_order_relaxed);
+    return SC_OK;
+}
+
 int32_t sc_copy_recent_capture(sc_session_t* s, float* out, int32_t max_frames,
                                uint64_t* out_end_mono_ns) {
     if (!s || !out || max_frames <= 0) return 0;

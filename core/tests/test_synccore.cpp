@@ -576,7 +576,47 @@ void test_concurrent_capture_and_control() {
 
 }  // namespace
 
+// FIELD TEST 8 regression: the capture history must not survive a session
+// epoch change — a fresh join matched the PREVIOUS session's song from the
+// ring's stale tail. sc_reset_capture_history is the shell's "new stream"
+// signal.
+void test_reset_capture_history_clears_the_ring() {
+    sc_config_t cfg{};
+    cfg.sample_rate_hz = 48000;
+    cfg.channels = 1;
+    cfg.initial_route = SC_ROUTE_SPEAKER;
+    cfg.output_latency_prior_ms = -1;
+    cfg.command_latency_prior_ms = -1;
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+
+    std::vector<float> loud(480, 0.5f);
+    uint64_t ts = 1'000'000'000ull;
+    for (int i = 0; i < 100; ++i, ts += 10'000'000ull)
+        sc_push_capture(s, loud.data(), 480, ts);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    std::vector<float> out(48000, -1.0f);
+    uint64_t end_ns = 0;
+    CHECK(sc_copy_recent_capture(s, out.data(), 48000, &end_ns) > 0);
+
+    CHECK(sc_reset_capture_history(s) == SC_OK);
+    CHECK(sc_copy_recent_capture(s, out.data(), 48000, &end_ns) == 0);
+    float lvl = -1.0f;
+    CHECK(sc_get_input_level(s, &lvl) == SC_OK);
+    CHECK(lvl == 0.0f);
+
+    // New epoch's audio flows normally afterwards.
+    for (int i = 0; i < 50; ++i, ts += 10'000'000ull)
+        sc_push_capture(s, loud.data(), 480, ts);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    CHECK(sc_copy_recent_capture(s, out.data(), 48000, &end_ns) > 0);
+
+    sc_destroy(s);
+}
+
 int main() {
+    test_reset_capture_history_clears_the_ring();
     test_config_validation();
     test_create_destroy_cycles();
     test_events_and_payloads();

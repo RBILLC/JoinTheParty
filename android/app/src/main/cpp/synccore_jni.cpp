@@ -174,6 +174,11 @@ Java_com_jointheparty_app_core_SyncCore_nativeStartCapture(JNIEnv*, jobject,
                                                             jlong handle) {
     auto* h = handle_of(handle);
     if (!h || !h->capture) return JNI_FALSE;
+    // FIELD TEST 8: the capture history ring survives a stop/start, so a new
+    // session's first recognition window contained the PREVIOUS session's
+    // audio tail — a fresh join matched and played the prior song. A new
+    // stream is a new epoch: clear before frames flow.
+    sc_reset_capture_history(h->session);
     return h->capture->start() ? JNI_TRUE : JNI_FALSE;
 }
 
