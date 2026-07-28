@@ -53,6 +53,8 @@
 | CFX-07 | ✅ Done — `beginCalibration()==false` lands in Failed instead of a dead tap | `e82a518` |
 | CFX-08 | ✅ Done — drift "Later" dismisses in place, matching "Keep as is" | `e82a518` |
 | CFX-09 | ✅ Done — store sorts by `updatedAtMs`, shell promotes the connected device | `e82a518` |
+| CTL-01 | ⬜ Not started — referee validity collapse while LOCKED as the self-match sentinel (FT8's headline defect; see docs/field-test-8-results.md) | — |
+| CTL-02 | ⬜ Not started — corrections above a size threshold need a corroborating second fix or post-seek verification (FT8's 1259 ms overshoot) | — |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.
