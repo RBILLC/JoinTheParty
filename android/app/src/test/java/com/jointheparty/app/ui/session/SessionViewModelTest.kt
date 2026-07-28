@@ -5,6 +5,7 @@ import com.jointheparty.app.backend.ShazamTokenResult
 import com.jointheparty.app.backend.TrackResolution
 import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.core.SyncEngine
+import com.jointheparty.app.data.CalibrationProfile
 import com.jointheparty.app.data.NudgeStore
 import com.jointheparty.app.recognition.RecognitionProvider
 import kotlinx.coroutines.Dispatchers
@@ -23,7 +24,9 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
@@ -190,7 +193,10 @@ class SessionViewModelTest {
         engine.emit(SyncCore.Event.CalibrationResult(latencyMs = 182, valid = true))
         advanceUntilIdle()
         assertEquals(CalibrationState.Success(182), vm.syncState.value.calibration)
-        assertEquals(182, nudgeStore.outputLatencies["bluetooth:AirPods Pro"])
+        val profile = nudgeStore.calibrationProfiles["bluetooth:AirPods Pro"]
+        assertEquals(182, profile?.latencyMs)
+        assertEquals(CalibrationProfile.Method.MEASURED, profile?.method)
+        assertEquals(true, profile?.acousticallyReachable)
         // Applied to the engine immediately, not just persisted.
         assertEquals(SyncCore.Route.BLUETOOTH to 182, engine.routeCalls.last())
 
@@ -226,9 +232,13 @@ class SessionViewModelTest {
         val engine = FakeSyncEngine()
         val nudgeStore = FakeNudgeStore().apply {
             trims["bluetooth:AirPods Pro"] = -60
-            // INT-03: setOutputRoute's prior is the calibrated OUTPUT
-            // latency, not the Spotify command latency.
-            outputLatencies["bluetooth:AirPods Pro"] = 310
+            // INT-03/CAL-04: setOutputRoute's prior is the calibrated
+            // OUTPUT latency (now on the route's CalibrationProfile), not
+            // the Spotify command latency.
+            calibrationProfiles["bluetooth:AirPods Pro"] = calibrationProfile(
+                routeId = "bluetooth:AirPods Pro",
+                latencyMs = 310,
+            )
         }
         val vm = viewModel(engine, nudgeStore)
 
@@ -277,6 +287,147 @@ class SessionViewModelTest {
         assertEquals("USABC1234567", vm.syncState.value.track?.isrc)
     }
 
+    // ---- CAL-04: acoustic referee aggregation ------------------------------
+
+    @Test
+    fun invalidResidualEventsAreIgnored() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 200)
+        }
+        val vm = viewModel(engine, nudgeStore)
+
+        repeat(5) {
+            engine.emit(SyncCore.Event.LatencyResidual(residualMs = 200, peakRatio = 1f, valid = false))
+        }
+        advanceUntilIdle()
+
+        val profile = nudgeStore.calibrationProfiles.getValue("speaker")
+        assertTrue(profile.refereeSamples.isEmpty())
+        assertEquals(1, profile.sampleCount) // unchanged from the seeded profile
+        assertEquals(SessionPhase.IDLE, vm.syncState.value.phase) // phase untouched, too
+    }
+
+    @Test
+    fun fewerThanThreeAgreeingResidualsRecordNothing() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 200)
+        }
+        viewModel(engine, nudgeStore)
+
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 200, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 205, peakRatio = 5f, valid = true))
+        advanceUntilIdle()
+
+        val profile = nudgeStore.calibrationProfiles.getValue("speaker")
+        assertTrue(profile.refereeSamples.isEmpty())
+        assertEquals(1, profile.sampleCount)
+    }
+
+    @Test
+    fun threeAgreeingResidualsCommitOneSample() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 200)
+        }
+        viewModel(engine, nudgeStore)
+
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 195, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 200, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 205, peakRatio = 5f, valid = true))
+        advanceUntilIdle()
+
+        val profile = nudgeStore.calibrationProfiles.getValue("speaker")
+        assertEquals(1, profile.refereeSamples.size)
+        assertEquals(200, profile.refereeSamples.single().residualMs) // median of 195/200/205
+        assertEquals(2, profile.sampleCount) // 1 seeded + 1 committed
+        assertFalse(profile.drifted)
+    }
+
+    @Test
+    fun disagreeingThirdResidualResetsAgreementCountInsteadOfCommitting() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 200)
+        }
+        viewModel(engine, nudgeStore)
+
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 200, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 205, peakRatio = 5f, valid = true))
+        // >25ms from the pending pair — resets the agreement count instead
+        // of committing a spurious median.
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 500, peakRatio = 5f, valid = true))
+        advanceUntilIdle()
+        assertTrue(nudgeStore.calibrationProfiles.getValue("speaker").refereeSamples.isEmpty())
+
+        // The disagreeing sample became the new window's first entry — two
+        // more agreeing with IT commit.
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 505, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 510, peakRatio = 5f, valid = true))
+        advanceUntilIdle()
+
+        val profile = nudgeStore.calibrationProfiles.getValue("speaker")
+        assertEquals(1, profile.refereeSamples.size)
+        assertEquals(505, profile.refereeSamples.single().residualMs) // median of 500/505/510
+    }
+
+    @Test
+    fun agreeingResidualsBeyondDriftThresholdSetDrifted() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 200)
+        }
+        viewModel(engine, nudgeStore)
+
+        // Committed median (300) is 100ms from the stored latencyMs (200)
+        // — over the 50ms drift threshold.
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 295, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 300, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 305, peakRatio = 5f, valid = true))
+        advanceUntilIdle()
+
+        val profile = nudgeStore.calibrationProfiles.getValue("speaker")
+        assertTrue(profile.drifted)
+        // The referee only ever appends/flags — it must NEVER move latencyMs.
+        assertEquals(200, profile.latencyMs)
+    }
+
+    @Test
+    fun agreeingResidualsWithinDriftThresholdLeaveDriftedFalse() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 200)
+        }
+        viewModel(engine, nudgeStore)
+
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 210, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 215, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 220, peakRatio = 5f, valid = true))
+        advanceUntilIdle()
+
+        assertFalse(nudgeStore.calibrationProfiles.getValue("speaker").drifted)
+    }
+
+    @Test
+    fun residualsNeverCommitOnARouteThatIsNotAcousticallyReachable() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["wired"] =
+                calibrationProfile("wired", latencyMs = 150, acousticallyReachable = false)
+        }
+        val vm = viewModel(engine, nudgeStore)
+        vm.onRouteChanged("wired", null, SyncCore.Route.WIRED)
+        advanceUntilIdle()
+
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 150, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 152, peakRatio = 5f, valid = true))
+        engine.emit(SyncCore.Event.LatencyResidual(residualMs = 148, peakRatio = 5f, valid = true))
+        advanceUntilIdle()
+
+        assertTrue(nudgeStore.calibrationProfiles.getValue("wired").refereeSamples.isEmpty())
+    }
+
     private suspend fun TestScope.driveToLocked(vm: SessionViewModel, engine: FakeSyncEngine) {
         vm.startListening()
         vm.onMatchInFlight()
@@ -300,6 +451,30 @@ class SessionViewModelTest {
         title = "Song",
         artist = "Artist",
         durationMs = 200_000L,
+    )
+
+    /** CAL-04 test helper: a minimal, well-formed profile to seed [FakeNudgeStore] with. */
+    private fun calibrationProfile(
+        routeId: String,
+        latencyMs: Int,
+        method: CalibrationProfile.Method = CalibrationProfile.Method.MEASURED,
+        acousticallyReachable: Boolean = true,
+        sampleCount: Int = 1,
+    ) = CalibrationProfile(
+        routeId = routeId,
+        routeClass = when {
+            routeId.startsWith("bluetooth") -> "BLUETOOTH"
+            routeId == "wired" -> "WIRED"
+            else -> "SPEAKER"
+        },
+        deviceName = routeId,
+        method = method,
+        latencyMs = latencyMs,
+        confidence = 1.0f,
+        sampleCount = sampleCount,
+        acousticallyReachable = acousticallyReachable,
+        createdAtMs = 0L,
+        updatedAtMs = 0L,
     )
 }
 
@@ -439,14 +614,17 @@ private class FakeNudgeStore : NudgeStore {
         latencies[routeId] = ms
     }
 
-    val outputLatencies = mutableMapOf<String, Int>()
+    val calibrationProfiles = mutableMapOf<String, CalibrationProfile>()
 
-    override suspend fun outputLatencyFor(routeId: String): Int =
-        outputLatencies[routeId] ?: -1
+    override suspend fun calibrationProfileFor(routeId: String): CalibrationProfile? =
+        calibrationProfiles[routeId]
 
-    override suspend fun saveOutputLatency(routeId: String, ms: Int) {
-        outputLatencies[routeId] = ms
+    override suspend fun saveCalibrationProfile(profile: CalibrationProfile) {
+        calibrationProfiles[profile.routeId] = profile
     }
+
+    override suspend fun allCalibrationProfiles(): List<CalibrationProfile> =
+        calibrationProfiles.values.toList()
 
     val setpoints = mutableMapOf<String, Int>()
 

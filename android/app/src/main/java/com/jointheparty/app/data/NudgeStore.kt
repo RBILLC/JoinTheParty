@@ -3,6 +3,7 @@ package com.jointheparty.app.data
 import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -35,13 +36,23 @@ interface NudgeStore {
     suspend fun engineSetpointFor(routeId: String): Int?
     suspend fun saveEngineSetpoint(routeId: String, ms: Int)
 
-    // INT-03: chirp-calibrated output-chain latency per route (arch §6.4).
-    // Distinct from the *command* latency above: output latency is how long
-    // sound takes to become audible on this route (DAC/BT buffering) and
-    // feeds sc_set_output_route's prior; command latency is Spotify's
-    // seek-in-flight time and seeds sc_create. -1 = never calibrated.
-    suspend fun outputLatencyFor(routeId: String): Int
-    suspend fun saveOutputLatency(routeId: String, ms: Int)
+    // CAL-04 (technical-requirements.md §2.6): the per-route calibration
+    // record, superseding INT-03's flat `outlatency:<routeId>` Int key
+    // (output-chain latency — how long sound takes to become audible on
+    // this route — now lives at [CalibrationProfile.latencyMs] instead).
+    // The old key is left orphaned, same precedent as `setpoint2` above: no
+    // migration, its bytes are simply never read again.
+    //
+    // Null means "no profile for this route yet" — deliberately covers
+    // both "never calibrated" and "the stored blob didn't parse" the same
+    // way, so a corrupt write degrades to the same fallback path a fresh
+    // route takes (see [CalibrationProfile.fromJson]).
+    suspend fun calibrationProfileFor(routeId: String): CalibrationProfile?
+    suspend fun saveCalibrationProfile(profile: CalibrationProfile)
+
+    // CAL-08's device shelf needs "every known device"; no consumer yet in
+    // CAL-04, but the store's shape shouldn't need revisiting to add one.
+    suspend fun allCalibrationProfiles(): List<CalibrationProfile>
 }
 
 class DataStoreNudgeStore(private val context: Context) : NudgeStore {
@@ -71,16 +82,31 @@ class DataStoreNudgeStore(private val context: Context) : NudgeStore {
         }
     }
 
-    override suspend fun outputLatencyFor(routeId: String): Int =
-        context.nudgeDataStore.data.map { it[outputLatencyKey(routeId)] ?: -1 }.first()
+    override suspend fun calibrationProfileFor(routeId: String): CalibrationProfile? =
+        context.nudgeDataStore.data
+            .map { CalibrationProfile.fromJson(it[calibrationProfileKey(routeId)]) }
+            .first()
 
-    override suspend fun saveOutputLatency(routeId: String, ms: Int) {
-        context.nudgeDataStore.edit { it[outputLatencyKey(routeId)] = ms }
+    override suspend fun saveCalibrationProfile(profile: CalibrationProfile) {
+        // One `edit{}` call writing one key — the atomic-write guarantee
+        // [CalibrationProfile]'s doc comment relies on.
+        context.nudgeDataStore.edit { it[calibrationProfileKey(profile.routeId)] = profile.toJson() }
     }
+
+    override suspend fun allCalibrationProfiles(): List<CalibrationProfile> =
+        context.nudgeDataStore.data
+            .map { prefs ->
+                prefs.asMap().entries.mapNotNull { (key, value) ->
+                    if (!key.name.startsWith(CALIBRATION_PROFILE_KEY_PREFIX)) return@mapNotNull null
+                    CalibrationProfile.fromJson(value as? String)
+                }
+            }
+            .first()
 
     private fun trimKey(routeId: String) = intPreferencesKey("trim:$routeId")
     private fun latencyKey(routeId: String) = intPreferencesKey("latency:$routeId")
-    private fun outputLatencyKey(routeId: String) = intPreferencesKey("outlatency:$routeId")
+    private fun calibrationProfileKey(routeId: String) =
+        stringPreferencesKey("$CALIBRATION_PROFILE_KEY_PREFIX$routeId")
     // "setpoint2": Field Test 4 found a stored value of −2007 ms on the
     // speaker route, written by the wheel-rebase runaway before that bug was
     // fixed. The app restored it every session and dutifully played two
@@ -94,5 +120,7 @@ class DataStoreNudgeStore(private val context: Context) : NudgeStore {
         // a correction, it is a runaway. Clamped on both save and restore so
         // a bad write can never outlive the session that made it.
         const val MAX_SETPOINT_MS = 1500
+
+        const val CALIBRATION_PROFILE_KEY_PREFIX = "calibration_profile:"
     }
 }

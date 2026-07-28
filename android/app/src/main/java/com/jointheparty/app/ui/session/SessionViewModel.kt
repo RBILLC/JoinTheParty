@@ -5,6 +5,7 @@ import com.jointheparty.app.backend.TrackResolution
 import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.core.SyncEngine
 import com.jointheparty.app.audio.ChirpPlayer
+import com.jointheparty.app.data.CalibrationProfile
 import com.jointheparty.app.data.NudgeStore
 import com.jointheparty.app.recognition.RecognitionProvider
 import com.jointheparty.app.spotify.AppRemoteSpotifyController
@@ -83,6 +84,49 @@ private const val REBASE_MAX_MS = 600.0
 private const val MAX_AIM_ATTEMPTS = 4
 private const val AIM_VERIFY_DELAY_MS = 900L
 private const val AIM_TOLERANCE_MS = 3_000L
+
+/**
+ * CAL-04: cadence for [SessionViewModel.maybeSampleReferee]. The referee
+ * (`sc_sample_latency_residual`) autocorrelates a 12 s post-AEC capture
+ * history (technical-requirements.md §2.6) — sampling much faster than that
+ * window mostly re-analyzes the same audio for no new information, and each
+ * call also flips AEC off and back on for the sampled window (CAL-03), so a
+ * tight cadence adds churn without adding signal. 20 s sits in the
+ * spec-suggested 15–30 s band: fresh enough that 3 agreeing windows (the
+ * agreement rule below) land within a normal few-minute LOCKED stretch,
+ * without meaningfully taxing the AEC toggle or CPU.
+ */
+private const val REFEREE_SAMPLE_INTERVAL_MS = 20_000L
+
+/**
+ * CAL-04 aggregation rule (technical-requirements.md §2.6): a residual is
+ * only committed to a profile once this many consecutive valid windows
+ * agree. `peak_ratio > 4.0` alone is an extreme-value statistic over the
+ * ~118k-lag search range `sc_sample_latency_residual` scans (40..2500 ms at
+ * 48 kHz) — across that many candidate lags a spurious peak clears a fixed
+ * ratio threshold on noise often enough that a single pass isn't
+ * trustworthy evidence. A spurious peak lands at a DIFFERENT lag on each
+ * independent 12 s window (it's tracking whatever transient happened to
+ * correlate that window), while a genuine echo of our own output sits at
+ * the same acoustic lag every time — so agreement across windows, not
+ * peak_ratio by itself, is what actually protects the profile from a
+ * one-off false positive.
+ */
+private const val REFEREE_AGREEMENT_COUNT = 3
+
+/**
+ * Tolerance for two referee residuals to count as "the same measurement"
+ * (CAL-04). Matches the 25 ms trim-promotion tolerance (tech-req §2.6,
+ * CAL-10) and the engine's own correction deadband — the resolution below
+ * which the estimator itself no longer distinguishes error.
+ */
+private const val REFEREE_AGREEMENT_TOLERANCE_MS = 25
+
+/** Seed confidence for a fresh chirp-measured profile (CAL-04): a GCC-PHAT
+ * round-trip is a direct correlator measurement, the strongest evidence
+ * source calibration has — as opposed to BY_EAR (human alignment, ±30 ms
+ * stated accuracy) or ESTIMATED (no measurement at all). */
+private const val MEASURED_CALIBRATION_CONFIDENCE = 1.0f
 
 /** INT-03: chirp-calibration lifecycle for the active route (arch §6.4). */
 sealed interface CalibrationState {
@@ -495,6 +539,8 @@ class SessionViewModel(
             samplingAttempts = 0
             autoAdvanceHandled = null
             endOfTrackJob?.cancel()
+            refereePendingRouteId = null
+            refereePendingResidualsMs.clear()
             _syncState.update {
                 SyncState(routeId = it.routeId, routeName = it.routeName, nudgeMs = it.nudgeMs)
             }
@@ -550,12 +596,20 @@ class SessionViewModel(
 
     /** Route reconnect: load persisted trim + command-latency prior, apply both. */
     fun onRouteChanged(routeId: String, routeName: String?, route: SyncCore.Route) {
+        // CAL-04: a fresh route also starts a fresh referee agreement
+        // window — residuals accumulated against the PREVIOUS route must
+        // never be attributed to this one.
+        refereePendingRouteId = null
+        refereePendingResidualsMs.clear()
         scope.launch(dispatcher) {
             val trim = nudgeStore.trimFor(routeId)
             // INT-03 fix: setOutputRoute's prior is the chirp-calibrated
             // OUTPUT-chain latency, not Spotify's command latency (which
-            // seeds sc_create instead — see NudgeStore's doc note).
-            val outputLatencyPrior = nudgeStore.outputLatencyFor(routeId)
+            // seeds sc_create instead — see NudgeStore's doc note). CAL-04:
+            // that latency now lives on the route's CalibrationProfile;
+            // -1 (engine default) when the route has never been calibrated
+            // — the same fallback the old flat key produced.
+            val outputLatencyPrior = nudgeStore.calibrationProfileFor(routeId)?.latencyMs ?: -1
             // Audit §4.2: restore the rebased setpoint when one exists —
             // the session starts already-aligned; the wheel still displays
             // the plain trim.
@@ -614,15 +668,40 @@ class SessionViewModel(
     private fun onCalibrationResult(event: SyncCore.Event.CalibrationResult) {
         if (event.valid) {
             val routeId = _syncState.value.routeId
+            val routeName = _syncState.value.routeName
+            val routeClass = currentRoute()
             _syncState.update {
                 it.copy(calibration = CalibrationState.Success(event.latencyMs))
             }
             scope.launch(dispatcher) {
+                // CAL-04: a successful chirp round-trip is a MEASURED
+                // profile, not just the old flat output-latency key — it
+                // also marks the route acoustically reachable (letting the
+                // referee sample it later) and stamps timestamps. Preserve
+                // an existing profile's creation time / referee history
+                // across re-calibration; a fresh chirp result supersedes
+                // any prior drift flag.
+                val existing = nudgeStore.calibrationProfileFor(routeId)
+                val now = System.currentTimeMillis()
+                val profile = CalibrationProfile(
+                    routeId = routeId,
+                    routeClass = routeClass.name,
+                    deviceName = routeName ?: routeId,
+                    method = CalibrationProfile.Method.MEASURED,
+                    latencyMs = event.latencyMs,
+                    confidence = MEASURED_CALIBRATION_CONFIDENCE,
+                    sampleCount = (existing?.sampleCount ?: 0) + 1,
+                    acousticallyReachable = true,
+                    createdAtMs = existing?.createdAtMs ?: now,
+                    updatedAtMs = now,
+                    refereeSamples = existing?.refereeSamples ?: emptyList(),
+                    drifted = false,
+                )
                 // Persisted beside the route's trim; replayed into
                 // sc_set_output_route on every reconnect (onRouteChanged).
-                nudgeStore.saveOutputLatency(routeId, event.latencyMs)
+                nudgeStore.saveCalibrationProfile(profile)
             }
-            engine.setOutputRoute(currentRoute(), event.latencyMs)
+            engine.setOutputRoute(routeClass, event.latencyMs)
         } else {
             _syncState.update { it.copy(calibration = CalibrationState.Failed) }
         }
@@ -632,6 +711,110 @@ class SessionViewModel(
         _syncState.value.routeId.startsWith("bluetooth") -> SyncCore.Route.BLUETOOTH
         _syncState.value.routeId == "wired" -> SyncCore.Route.WIRED
         else -> SyncCore.Route.SPEAKER
+    }
+
+    // ---- Acoustic referee (CAL-03/CAL-04) ----------------------------------
+
+    /** [refereePendingResidualsMs] accumulates for this routeId only — see [onRouteChanged]. */
+    private var refereePendingRouteId: String? = null
+
+    /** Recent valid residuals awaiting [REFEREE_AGREEMENT_COUNT]-way agreement. */
+    private val refereePendingResidualsMs = mutableListOf<Int>()
+
+    /** Monotonic stamp of the last referee request; see [maybeSampleReferee]. */
+    private var lastRefereeSampleNs = 0L
+
+    /**
+     * CAL-04: while the session is LOCKED, periodically asks the engine for
+     * one acoustic-referee residual ([SyncEngine.sampleLatencyResidual] →
+     * [SyncCore.Event.LatencyResidual]). Gated on the current route's
+     * profile being [CalibrationProfile.acousticallyReachable] — the same
+     * "cached optimisation to skip headphone routes early" the field
+     * exists for (technical-requirements.md §2.6); a route with no profile
+     * at all has nothing to compare a residual against either, so it's
+     * skipped the same way.
+     *
+     * Driven by the estimate stream rather than its own timer. An earlier
+     * version launched `while (true) { delay(interval) }` on entering
+     * LOCKED, which hung every JVM test: the scope runs on the tests'
+     * `StandardTestDispatcher`, so `advanceUntilIdle()` kept advancing
+     * virtual time into an always-pending delay and never returned.
+     * (`playbackPositionMs` has the same loop shape and is harmless only
+     * because it is a COLD flow — nothing runs unless something collects
+     * it.) Deriving the cadence from estimates that already arrive means
+     * there is no free-running timer to spin on, and tests advance it
+     * exactly as far as the estimates they emit.
+     */
+    private fun maybeSampleReferee() {
+        val nowNs = System.nanoTime()
+        if (nowNs - lastRefereeSampleNs < REFEREE_SAMPLE_INTERVAL_MS * 1_000_000L) return
+        lastRefereeSampleNs = nowNs
+        scope.launch(dispatcher) {
+            val routeId = _syncState.value.routeId
+            if (nudgeStore.calibrationProfileFor(routeId)?.acousticallyReachable == true) {
+                engine.sampleLatencyResidual()
+            }
+        }
+    }
+
+    /**
+     * CAL-04 shell-side referee aggregation (technical-requirements.md
+     * §2.6). See [REFEREE_AGREEMENT_COUNT]'s doc comment for WHY agreement
+     * across windows — not `peak_ratio` alone — is the actual protection
+     * against a spurious reading.
+     *
+     * The pending-residuals bookkeeping below runs synchronously on the
+     * single events-collector coroutine (same threading assumption
+     * [onSyncEstimate]'s plain-var updates already rely on), so no lock is
+     * needed for [refereePendingResidualsMs]; only the DataStore read/write
+     * once a sample commits needs a coroutine.
+     *
+     * The referee never changes the live output-latency prior: this
+     * function only ever calls [CalibrationProfile.withRefereeSample],
+     * which touches bookkeeping (the ring, `sampleCount`, `drifted`,
+     * `updatedAtMs`) and never `latencyMs`. Nothing here calls
+     * `engine.setOutputRoute` or touches the wheel/nudge state.
+     */
+    private fun onLatencyResidual(event: SyncCore.Event.LatencyResidual) {
+        if (!event.valid) return
+
+        val routeId = _syncState.value.routeId
+        if (refereePendingRouteId != routeId) {
+            refereePendingRouteId = routeId
+            refereePendingResidualsMs.clear()
+        }
+        refereePendingResidualsMs += event.residualMs
+        if (refereePendingResidualsMs.size < REFEREE_AGREEMENT_COUNT) return
+
+        val window = refereePendingResidualsMs.toList()
+        val agrees = (window.max() - window.min()) <= REFEREE_AGREEMENT_TOLERANCE_MS
+        if (!agrees) {
+            // "resets the agreement count instead of writing" (CAL-04): the
+            // disagreeing sample starts the NEXT window rather than being
+            // discarded along with the ones it disagreed with.
+            refereePendingResidualsMs.clear()
+            refereePendingResidualsMs += window.last()
+            return
+        }
+
+        val committedMs = window.sorted()[window.size / 2] // median of the agreeing window
+        refereePendingResidualsMs.clear()
+        scope.launch(dispatcher) {
+            // Only a route we've actually measured has a latencyMs worth
+            // comparing a residual against — and only a reachable route
+            // could have produced a valid residual for real (see
+            // [maybeSampleReferee]'s doc comment); this re-check guards
+            // against a race where the route changed between the sample
+            // request and this event landing.
+            val profile = nudgeStore.calibrationProfileFor(routeId) ?: return@launch
+            if (!profile.acousticallyReachable) return@launch
+            val updated = profile.withRefereeSample(committedMs, System.currentTimeMillis())
+            nudgeStore.saveCalibrationProfile(updated)
+            com.jointheparty.app.debug.DebugLog.log(
+                "referee: committed ${committedMs}ms residual on $routeId" +
+                    if (updated.drifted) " — DRIFTED vs latencyMs=${updated.latencyMs}ms" else "",
+            )
+        }
     }
 
     // ---- Engine-driven transitions -----------------------------------------
@@ -650,12 +833,7 @@ class SessionViewModel(
             // when `recognition` is null.
             SyncCore.Event.RequestFix -> runRecognitionPass()
             is SyncCore.Event.CalibrationResult -> onCalibrationResult(event)
-            // CAL-03: the referee only measures and emits. Nobody calls
-            // engine.sampleLatencyResidual() yet, and aggregating repeated
-            // samples into a CalibrationProfile (agreement across ≥3 valid
-            // windows, drift detection) is CAL-04's job, not the
-            // ViewModel's — so this is deliberately a no-op for now.
-            is SyncCore.Event.LatencyResidual -> Unit
+            is SyncCore.Event.LatencyResidual -> onLatencyResidual(event)
             // INT-02: execute the engine's micro-seek; the controller echoes
             // notifySeekIssued (settle window + latency learning).
             is SyncCore.Event.Correction -> {
@@ -904,6 +1082,12 @@ class SessionViewModel(
             !event.converged && phase == SessionPhase.LOCKED ->
                 transition(SessionPhase.DRIFTING)
         }
+        // CAL-04: the referee only has anything meaningful to measure while
+        // the seek target is known-accurate (tech-req §2.6's attribution
+        // argument) — i.e. still LOCKED after the transitions above.
+        if (event.converged && _syncState.value.phase == SessionPhase.LOCKED) {
+            maybeSampleReferee()
+        }
     }
 
     /**
@@ -1036,7 +1220,13 @@ class SessionViewModel(
     private fun transition(to: SessionPhase): Boolean {
         val from = _syncState.value.phase
         if (!isLegalTransition(from, to)) return false
-        if (to == SessionPhase.LOCKED) consecutiveLosses = 0
+        if (to == SessionPhase.LOCKED) {
+            consecutiveLosses = 0
+            // CAL-04: start the referee's interval from the moment we lock,
+            // so the first request comes one full interval into a settled
+            // session rather than immediately on arrival.
+            lastRefereeSampleNs = System.nanoTime()
+        }
         _syncState.update { it.copy(phase = to) }
         com.jointheparty.app.debug.DebugLog.log("phase: $from → $to")
         return true
