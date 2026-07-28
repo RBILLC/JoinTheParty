@@ -461,8 +461,13 @@ private const val MAX_HAPTIC_TICKS_PER_UPDATE = 24
  * devices that support it. Below that, or where primitives aren't
  * supported, it falls back to an amplitude-scaled one-shot buzz: coarser,
  * but it still communicates "something happened here."
+ *
+ * Package-visible (not `private`) since CAL-07's tone-match caliper
+ * (`CalibrationSheet.kt`, same package) needs the identical `abClick`
+ * driver for its per-repetition haptic tick — one haptic implementation
+ * per platform, not two.
  */
-private class BilletHaptics(context: Context) {
+internal class BilletHaptics(context: Context) {
     private val vibrator: Vibrator? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         val manager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
         manager?.defaultVibrator

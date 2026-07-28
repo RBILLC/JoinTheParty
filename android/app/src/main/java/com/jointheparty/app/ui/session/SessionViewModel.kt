@@ -5,6 +5,7 @@ import com.jointheparty.app.backend.TrackResolution
 import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.core.SyncEngine
 import com.jointheparty.app.audio.ChirpPlayer
+import com.jointheparty.app.audio.TonePlayer
 import com.jointheparty.app.data.CalibrationProfile
 import com.jointheparty.app.data.NudgeStore
 import com.jointheparty.app.recognition.RecognitionProvider
@@ -128,12 +129,39 @@ private const val REFEREE_AGREEMENT_TOLERANCE_MS = 25
  * stated accuracy) or ESTIMATED (no measurement at all). */
 private const val MEASURED_CALIBRATION_CONFIDENCE = 1.0f
 
-/** INT-03: chirp-calibration lifecycle for the active route (arch §6.4). */
+/**
+ * CAL-07: seed confidence for a fresh by-ear profile — weaker evidence than
+ * a correlator round-trip (above), but a real human judgment against a
+ * reference tone, not a placeholder. Stronger than ESTIMATED's "no
+ * measurement at all," weaker than MEASURED's ground truth; the caliper
+ * itself doesn't care (both render as solid, real ticks — ui-ux §6.5), this
+ * only seeds the stored profile's own bookkeeping field.
+ */
+private const val BY_EAR_CALIBRATION_CONFIDENCE = 0.7f
+
+/** INT-03/CAL-07: calibration lifecycle for the active route (arch §6.4, ui-ux §6.5). */
 sealed interface CalibrationState {
     data object Idle : CalibrationState
     data object Running : CalibrationState
     data class Success(val latencyMs: Int) : CalibrationState
     data object Failed : CalibrationState
+
+    // CAL-07: tone-match (by ear). Reached automatically whenever the
+    // chirp's 8 s arm timeout elapses with no detection — that's the
+    // existing [Failed] state above (SyncCore.Event.CalibrationResult's
+    // valid=false path, unchanged), which now unconditionally offers the
+    // Quiet "Try by ear instead" exit into [ByEarIdle] (ui-ux §6.5's
+    // "Quiet exit on Failed is new: By ear is a fallback on every route,
+    // not just headphones" — no device-class branch anywhere in that
+    // wiring). [tryByEarInstead] is also callable directly, from any
+    // state, satisfying "available on any route" without a Failed
+    // attempt first.
+    //
+    // No ByEarFailed: "every completed attempt produces a usable value; a
+    // bad result gets fixed via 'Calibrate again,' not a retry state."
+    data object ByEarIdle : CalibrationState
+    data object ByEarRunning : CalibrationState
+    data class ByEarSuccess(val latencyMs: Int) : CalibrationState
 }
 
 data class TrackInfo(
@@ -168,6 +196,10 @@ class SessionViewModel(
     private val recognition: RecognitionProvider? = null,
     private val backend: BackendClient? = null,
     private val chirp: ChirpPlayer? = null,
+    // CAL-07: the by-ear tone-match reference tone. Null in unit tests,
+    // same convention as [chirp] — the by-ear functions below no-op the
+    // audio call and only drive [SyncState.calibration].
+    private val tonePlayer: TonePlayer? = null,
     // INT-02: the playback half of the loop. Null in unit tests.
     private val spotify: SpotifyController? = null,
     // INT-06a (technical-requirements.md §2.5): the session's lifetime
@@ -660,9 +692,91 @@ class SessionViewModel(
         _syncState.update { it.copy(calibration = CalibrationState.Idle) }
     }
 
-    /** Sheet dismissed: clear any terminal result so reopening starts fresh. */
+    /**
+     * Sheet dismissed: clear any terminal result so reopening starts fresh.
+     * Also stops the tone loop unconditionally (CAL-07) — a scrim tap or
+     * back-press can dismiss the sheet mid-[CalibrationState.ByEarRunning],
+     * and [TonePlayer.stop] is a harmless no-op if the tone was never
+     * started.
+     */
     fun acknowledgeCalibration() {
+        tonePlayer?.stop()
         _syncState.update { it.copy(calibration = CalibrationState.Idle) }
+    }
+
+    // ---- Calibration by ear (CAL-07) ---------------------------------------
+
+    /**
+     * Enters the tone-match flow's Idle state. Reachable two ways, per
+     * ui-ux §6.5: automatically available once the chirp times out (the
+     * existing [CalibrationState.Failed] path, which now renders a Quiet
+     * "Try by ear instead" exit calling this), and directly — this function
+     * itself has no precondition on the current [CalibrationState] or the
+     * active route, matching CAL-01/07's shared "no device-class check"
+     * rule and the ticket's "available on any route."
+     */
+    fun tryByEarInstead() {
+        // No defensive tonePlayer?.stop() here: the tone only ever starts
+        // from [startByEarCalibration] below, and every path out of
+        // [CalibrationState.ByEarRunning] (cancel/commit/dismiss) already
+        // stops it — by the time this function is reachable again, the
+        // tone is never playing.
+        _syncState.update { it.copy(calibration = CalibrationState.ByEarIdle) }
+    }
+
+    /**
+     * "Start": begins the tone loop and enters Running. The Running
+     * screen's visual strike + `abClick` haptic beat is driven entirely by
+     * the composable (a UI-side `LaunchedEffect`, never this class's
+     * [scope]) — this function only owns the audio side, mirroring
+     * [startCalibration]'s split with [ChirpPlayer].
+     */
+    fun startByEarCalibration() {
+        if (_syncState.value.calibration == CalibrationState.ByEarRunning) return
+        tonePlayer?.start()
+        _syncState.update { it.copy(calibration = CalibrationState.ByEarRunning) }
+    }
+
+    /** Quiet "Cancel" on Running: stop the tone, back to By-ear Idle. */
+    fun cancelByEarCalibration() {
+        tonePlayer?.stop()
+        _syncState.update { it.copy(calibration = CalibrationState.ByEarIdle) }
+    }
+
+    /**
+     * "That's it": the dragged caliper value the user judged as aligned
+     * becomes the route's [CalibrationProfile.latencyMs], `method = BY_EAR`
+     * (ui-ux §6.5). Mirrors [onCalibrationResult]'s MEASURED persistence
+     * shape — preserve an existing profile's creation time / referee
+     * history / acoustic-reachability across re-calibration, apply the new
+     * latency to the engine immediately, not just persist it.
+     */
+    fun commitByEar(latencyMs: Int) {
+        tonePlayer?.stop()
+        val routeId = _syncState.value.routeId
+        val routeName = _syncState.value.routeName
+        val routeClass = currentRoute()
+        _syncState.update { it.copy(calibration = CalibrationState.ByEarSuccess(latencyMs)) }
+        scope.launch(dispatcher) {
+            val existing = nudgeStore.calibrationProfileFor(routeId)
+            val now = System.currentTimeMillis()
+            val profile = CalibrationProfile(
+                routeId = routeId,
+                routeClass = routeClass.name,
+                deviceName = routeName ?: routeId,
+                method = CalibrationProfile.Method.BY_EAR,
+                latencyMs = latencyMs,
+                confidence = BY_EAR_CALIBRATION_CONFIDENCE,
+                sampleCount = (existing?.sampleCount ?: 0) + 1,
+                acousticallyReachable = existing?.acousticallyReachable ?: false,
+                createdAtMs = existing?.createdAtMs ?: now,
+                updatedAtMs = now,
+                refereeSamples = existing?.refereeSamples ?: emptyList(),
+                drifted = false,
+            )
+            nudgeStore.saveCalibrationProfile(profile)
+        }
+        engine.setOutputRoute(routeClass, latencyMs)
     }
 
     private fun onCalibrationResult(event: SyncCore.Event.CalibrationResult) {

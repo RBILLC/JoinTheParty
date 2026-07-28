@@ -1,5 +1,6 @@
 package com.jointheparty.app.ui.session
 
+import com.jointheparty.app.audio.TonePlayer
 import com.jointheparty.app.backend.BackendClient
 import com.jointheparty.app.backend.ShazamTokenResult
 import com.jointheparty.app.backend.TrackResolution
@@ -53,7 +54,13 @@ class SessionViewModelTest {
     private fun viewModel(
         engine: FakeSyncEngine = FakeSyncEngine(),
         nudgeStore: FakeNudgeStore = FakeNudgeStore(),
-    ) = SessionViewModel(engine, nudgeStore, testDispatcher)
+        tonePlayer: TonePlayer? = null,
+    ) = SessionViewModel(
+        engine = engine,
+        nudgeStore = nudgeStore,
+        dispatcher = testDispatcher,
+        tonePlayer = tonePlayer,
+    )
 
     @Test
     fun happyPathIdleToLocked() = runTest(testDispatcher) {
@@ -208,6 +215,112 @@ class SessionViewModelTest {
         engine.emit(SyncCore.Event.CalibrationResult(latencyMs = 0, valid = false))
         advanceUntilIdle()
         assertEquals(CalibrationState.Failed, vm.syncState.value.calibration)
+    }
+
+    // ---- CAL-07: by-ear (tone-match) calibration ---------------------------
+
+    @Test
+    fun chirpTimeoutReachesFailedOnAnyRouteType_noDeviceClassBranch() = runTest(testDispatcher) {
+        // The by-ear entry point (tryByEarInstead, below) hangs off this
+        // Failed state, unconditionally — this pins down that Failed
+        // itself is still reached automatically on the chirp's 8s timeout
+        // (SyncCore.Event.CalibrationResult valid=false), on an ordinary
+        // speaker route, not just headphones.
+        val engine = FakeSyncEngine()
+        val vm = viewModel(engine)
+        vm.onRouteChanged("speaker", null, SyncCore.Route.SPEAKER)
+        advanceUntilIdle()
+
+        vm.startCalibration()
+        engine.emit(SyncCore.Event.CalibrationResult(latencyMs = 0, valid = false))
+        advanceUntilIdle()
+
+        assertEquals(CalibrationState.Failed, vm.syncState.value.calibration)
+    }
+
+    @Test
+    fun tryByEarInsteadEntersByEarIdleFromFailed() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val vm = viewModel(engine)
+        vm.startCalibration()
+        engine.emit(SyncCore.Event.CalibrationResult(latencyMs = 0, valid = false))
+        advanceUntilIdle()
+        assertEquals(CalibrationState.Failed, vm.syncState.value.calibration)
+
+        vm.tryByEarInstead()
+
+        assertEquals(CalibrationState.ByEarIdle, vm.syncState.value.calibration)
+    }
+
+    @Test
+    fun tryByEarInsteadIsOfferedDirectlyWithoutFailingFirst() = runTest(testDispatcher) {
+        val vm = viewModel()
+        assertEquals(CalibrationState.Idle, vm.syncState.value.calibration)
+
+        vm.tryByEarInstead()
+
+        assertEquals(CalibrationState.ByEarIdle, vm.syncState.value.calibration)
+    }
+
+    @Test
+    fun startByEarCalibrationStartsToneAndEntersByEarRunning() = runTest(testDispatcher) {
+        val tonePlayer = FakeTonePlayer()
+        val vm = viewModel(tonePlayer = tonePlayer)
+        vm.tryByEarInstead()
+
+        vm.startByEarCalibration()
+
+        assertEquals(CalibrationState.ByEarRunning, vm.syncState.value.calibration)
+        assertEquals(1, tonePlayer.startCount)
+    }
+
+    @Test
+    fun cancelByEarCalibrationStopsToneAndReturnsToByEarIdle() = runTest(testDispatcher) {
+        val tonePlayer = FakeTonePlayer()
+        val vm = viewModel(tonePlayer = tonePlayer)
+        vm.tryByEarInstead()
+        vm.startByEarCalibration()
+
+        vm.cancelByEarCalibration()
+
+        assertEquals(CalibrationState.ByEarIdle, vm.syncState.value.calibration)
+        assertEquals(1, tonePlayer.stopCount)
+    }
+
+    @Test
+    fun commitByEarStopsToneSavesByEarProfileAndEntersByEarSuccess() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore()
+        val tonePlayer = FakeTonePlayer()
+        val vm = viewModel(engine, nudgeStore, tonePlayer)
+        vm.onRouteChanged("bluetooth:AirPods Pro", "AirPods Pro", SyncCore.Route.BLUETOOTH)
+        advanceUntilIdle()
+        vm.tryByEarInstead()
+        vm.startByEarCalibration()
+
+        vm.commitByEar(214)
+        advanceUntilIdle()
+
+        assertEquals(CalibrationState.ByEarSuccess(214), vm.syncState.value.calibration)
+        assertEquals(1, tonePlayer.stopCount)
+        val profile = nudgeStore.calibrationProfiles["bluetooth:AirPods Pro"]
+        assertEquals(214, profile?.latencyMs)
+        assertEquals(CalibrationProfile.Method.BY_EAR, profile?.method)
+        // Applied to the engine immediately, matching the MEASURED path.
+        assertEquals(SyncCore.Route.BLUETOOTH to 214, engine.routeCalls.last())
+    }
+
+    @Test
+    fun acknowledgeCalibrationStopsToneWhenDismissedMidByEarRunning() = runTest(testDispatcher) {
+        val tonePlayer = FakeTonePlayer()
+        val vm = viewModel(tonePlayer = tonePlayer)
+        vm.tryByEarInstead()
+        vm.startByEarCalibration()
+
+        vm.acknowledgeCalibration()
+
+        assertEquals(CalibrationState.Idle, vm.syncState.value.calibration)
+        assertEquals(1, tonePlayer.stopCount)
     }
 
     @Test
@@ -596,6 +709,22 @@ private data class SubmittedFix(
     val frequencySkew: Double,
     val confidence: Float,
 )
+
+/** CAL-07: records start/stop calls without touching android.media.AudioTrack. */
+private class FakeTonePlayer : TonePlayer {
+    var startCount = 0
+        private set
+    var stopCount = 0
+        private set
+
+    override fun start() {
+        startCount += 1
+    }
+
+    override fun stop() {
+        stopCount += 1
+    }
+}
 
 /** In-memory stand-in for the real DataStore-backed [NudgeStore] — no Context needed. */
 private class FakeNudgeStore : NudgeStore {

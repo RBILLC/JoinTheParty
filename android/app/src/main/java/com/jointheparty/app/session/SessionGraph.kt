@@ -3,6 +3,7 @@ package com.jointheparty.app.session
 import android.content.Context
 import com.jointheparty.app.audio.AudioRouteObserver
 import com.jointheparty.app.audio.AudioTrackChirpPlayer
+import com.jointheparty.app.audio.AudioTrackTonePlayer
 import com.jointheparty.app.backend.HttpBackendClient
 import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.data.DataStoreNudgeStore
@@ -71,6 +72,9 @@ class SessionGraph(context: Context) {
 
     private val chirp = AudioTrackChirpPlayer()
 
+    // CAL-07: the by-ear tone-match reference tone.
+    private val tonePlayer = AudioTrackTonePlayer()
+
     private val spotify = AppRemoteSpotifyController(
         context = context.applicationContext,
         engine = engine,
@@ -82,6 +86,7 @@ class SessionGraph(context: Context) {
         recognition = recognition,
         backend = backend,
         chirp = chirp,
+        tonePlayer = tonePlayer,
         spotify = spotify,
         scope = scope,
     )

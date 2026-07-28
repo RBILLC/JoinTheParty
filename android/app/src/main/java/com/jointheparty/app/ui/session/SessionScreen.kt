@@ -88,6 +88,11 @@ fun SessionScreen(
     onStartCalibration: () -> Unit = {},
     onCancelCalibration: () -> Unit = {},
     onDismissCalibration: () -> Unit = {},
+    // CAL-07: by-ear (tone-match) calibration intents.
+    onTryByEar: () -> Unit = {},
+    onStartByEar: () -> Unit = {},
+    onCancelByEar: () -> Unit = {},
+    onCommitByEar: (Int) -> Unit = {},
     onConnectSpotify: () -> Unit = {},
     spotifyLinked: Boolean = false,
     playbackPositionMs: Flow<Long> = MutableStateFlow(-1L),
@@ -159,6 +164,10 @@ fun SessionScreen(
                     showCalibration = false
                     onDismissCalibration()
                 },
+                onTryByEar = onTryByEar,
+                onStartByEar = onStartByEar,
+                onCancelByEar = onCancelByEar,
+                onCommitByEar = onCommitByEar,
             )
         }
     }
