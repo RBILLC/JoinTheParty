@@ -201,6 +201,9 @@ struct sc_session {
         // CAL-05: one-pole envelope follower state (full double precision;
         // only the published atomic is truncated to float).
         double input_level_state = 0.0;
+        // Deferred calibration arm — set by kBeginCalibration, consumed by
+        // the next drained capture block (see the FIELD FIX comment there).
+        bool pending_calibration_arm = false;
         // Wall-clock stamp of the last envelope step, so the idle release
         // decays by measured elapsed time rather than an assumed poll
         // period — see decay_input_level_idle().
@@ -257,6 +260,12 @@ struct sc_session {
                 // CORE-05: speaker-mode capture runs through AEC before any
                 // downstream consumer (no-op unless SC_AEC_FULL).
                 wk.aec.process_capture(&wk.scratch);
+                if (wk.pending_calibration_arm) {
+                    // Deferred arm (see kBeginCalibration): this block's
+                    // capture timestamp IS the present.
+                    wk.detector.arm(hdr.capture_mono_ns);
+                    wk.pending_calibration_arm = false;
+                }
                 if (wk.detector.armed())
                     wk.detector.push(wk.scratch.data(), wk.scratch.size(),
                                      hdr.capture_mono_ns);
@@ -552,16 +561,27 @@ struct sc_session {
                 wk.aec.push_reference(cmd.audio.data(), cmd.audio.size());
                 break;
             case Command::Kind::kBeginCalibration: {
-                // t0 = current capture time. Contract: the shell calls
-                // sc_begin_calibration at the instant it commands chirp
-                // playback, with capture already flowing.
-                wk.detector.arm(wk.now_ns);
+                // FIELD FIX (device test, 2026-07-28): arming with wk.now_ns
+                // directly trusted a contract nothing enforced — "capture
+                // already flowing". When the shell starts capture and
+                // calibration in the same breath (the idle-screen flow), no
+                // block has drained yet, so wk.now_ns is frozen at the LAST
+                // session's final timestamp. Armed with a t0 minutes stale,
+                // the detector's 8 s window expired on its first poll —
+                // before the chirp ever sounded — and a rapid re-tap
+                // "succeeded" by measuring the staleness of the clock
+                // (device log: a 2232 ms "latency" that was exactly the gap
+                // between two attempts). Defer the arm to the next drained
+                // capture block, whose timestamp is by construction the
+                // present: t0 can then never be staler than one block.
+                wk.pending_calibration_arm = true;
                 std::lock_guard<std::mutex> lock(mtx);
                 calibrating = true;
                 break;
             }
             case Command::Kind::kCancelCalibration: {
                 wk.detector.disarm();
+                wk.pending_calibration_arm = false;
                 std::lock_guard<std::mutex> lock(mtx);
                 calibrating = false;
                 break;

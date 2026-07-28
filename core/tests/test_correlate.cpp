@@ -176,6 +176,67 @@ void cal_cb(sc_event_type_t type, const void* payload, void* user) {
     log->got.store(true);
 }
 
+// FIELD FIX regression (device test, 2026-07-28): arming the detector with
+// wk.now_ns trusted "capture already flowing", which the idle-screen flow
+// violates — capture and calibration start together, so now_ns is frozen at
+// the PREVIOUS session's last timestamp. A t0 minutes stale made the 8 s
+// window expire on the first poll (single tap: instant Failed while the
+// chirp was audibly playing), and a rapid re-tap "measured" the staleness of
+// the clock itself (a 2232 ms "latency" on device). The arm now defers to
+// the next drained capture block. This test recreates the stale-clock gap:
+// session time is established, capture stops, a long gap passes, then
+// calibration begins simultaneously with fresh capture.
+void test_calibration_arm_defers_to_fresh_capture() {
+    sc_config_t cfg{};
+    cfg.sample_rate_hz = kRate;
+    cfg.channels = 1;
+    cfg.initial_route = SC_ROUTE_SPEAKER;
+    cfg.output_latency_prior_ms = -1;
+    cfg.command_latency_prior_ms = -1;
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    CalLog log;
+    sc_set_event_callback(s, cal_cb, &log);
+
+    const int block = kRate / 100;  // 10 ms
+    const uint64_t block_ns = kSec / 100;
+    std::vector<float> silence(static_cast<size_t>(block), 0.0f);
+
+    // Establish session time, then STOP pushing — now_ns freezes here.
+    uint64_t ts = 1 * kSec;
+    for (int i = 0; i < 50; ++i, ts += block_ns)
+        sc_push_capture(s, silence.data(), block, ts);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // drain
+
+    // 60 s of dead time with no capture at all — the stale-clock gap.
+    ts += 60 * kSec;
+
+    // Begin calibration BEFORE any fresh capture arrives (the idle-screen
+    // ordering), then stream capture whose chirp lands 300 ms in.
+    CHECK(sc_begin_calibration(s) == SC_OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    const auto chirp = synccore::generate_chirp(kRate);
+    const auto audio = embed(chirp, static_cast<int>(0.3 * kRate),
+                             2 * kRate, 15.0, 47);
+    for (size_t off = 0; off + block <= audio.size() && !log.got.load();
+         off += block, ts += block_ns)
+        sc_push_capture(s, audio.data() + off, block, ts);
+
+    for (int i = 0; i < 200 && !log.got.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    // Pre-fix this was got=true valid=FALSE (instant timeout: the 60 s gap
+    // exceeded the 8 s window before the chirp existed). Post-fix t0 is the
+    // first fresh block, so the chirp lands 300 ms after t0 and measures as
+    // exactly that — the gap contributes nothing.
+    CHECK(log.got.load());
+    CHECK(log.valid.load());
+    CHECK(std::abs(log.latency_ms.load() - 300) <= 5);
+
+    sc_destroy(s);
+}
+
 void test_session_calibration_roundtrip() {
     sc_config_t cfg{};
     cfg.sample_rate_hz = kRate;
@@ -436,6 +497,7 @@ int main() {
     test_chirp_detector_streaming();
     test_chirp_detector_timeout();
     test_session_calibration_roundtrip();
+    test_calibration_arm_defers_to_fresh_capture();
     test_latency_residual_roundtrip();
     test_latency_residual_gating_unconverged();
     test_latency_residual_restores_aec_mode();
