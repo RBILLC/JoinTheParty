@@ -37,13 +37,13 @@
 | CAL-01 | 🟡 Code done — chirp now takes Spotify's deep-buffer transport; **headline AC needs the two-phone mic rig** (chirp-reported vs mic-measured) | `5cea89f` |
 | CAL-02 | ✅ Done — shared `dsp/fft` helper, `dsp/lag_window` ported, `lag_analyzer` consumes it (selftest green), new DSP tests | `77144c2` |
 | CAL-03 | ✅ Done — `sc_sample_latency_residual` + `SC_EVT_LATENCY_RESIDUAL`, autocorrelation over the 12 s history, converged-gated, AEC restored on every path, no write to control state | `20ff81e` |
-| CAL-04 | ⬜ Not started | — |
+| CAL-04 | ✅ Done — `CalibrationProfile` JSON record per route (atomic, corrupt reads as absent), shell-side ≥3-window referee aggregation, drift flag | `0bd89c3` |
 | CAL-05 | ✅ Done — `sc_get_input_level` + JNI + `SyncEngine.inputLevel()`; idle release measures elapsed time (the assumed 2 ms poll period decayed ~7x too slowly under Windows timer granularity) | `77144c2` |
 | CAL-06 | ✅ Done — phase-word opacity tracks the mic level in LISTENING/MATCHING; draw-phase read so the screen root never recomposes; closes ux-audit gap #8 | `9d2cd48` |
-| CAL-07 | ⬜ Not started | — |
-| CAL-08 | ⬜ Not started | — |
-| CAL-09 | ⬜ Not started | — |
-| CAL-10 | ⬜ Not started | — |
+| CAL-07 | ✅ Done — tone-match (adjust-until-aligned, percussive click, deep-buffer transport) + the shared `CaliperScale` | `a70a2e5` |
+| CAL-08 | ✅ Done — device shelf + detail, provenance never rendered alike, one-warm-accent held structurally | `a2b864d` |
+| CAL-09 | ✅ Done — gate raised on an unknown route and it genuinely holds the aim (not recognition); decline writes ESTIMATED | `d4bbc4b` `3b4338b` |
+| CAL-10 | ✅ Done — 3 commits within 25 ms of median, above a 30 ms floor; always asks, folds in as BY_EAR and zeroes the wheel; 7-day decline via stored timestamp | `d4bbc4b` |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.
