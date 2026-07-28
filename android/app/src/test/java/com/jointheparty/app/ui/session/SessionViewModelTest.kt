@@ -8,6 +8,7 @@ import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.core.SyncEngine
 import com.jointheparty.app.data.CalibrationProfile
 import com.jointheparty.app.data.NudgeStore
+import com.jointheparty.app.data.sortedByUpdatedAtDescending
 import com.jointheparty.app.recognition.RecognitionProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -217,6 +218,32 @@ class SessionViewModelTest {
         engine.emit(SyncCore.Event.CalibrationResult(latencyMs = 0, valid = false))
         advanceUntilIdle()
         assertEquals(CalibrationState.Failed, vm.syncState.value.calibration)
+    }
+
+    // CFX-07: "Start calibration" must never be a dead tap — a refusal to
+    // arm surfaces into the same Failed state chirp-timeout already uses.
+    @Test
+    fun startCalibrationRoutesAnEngineRefusalIntoFailedWithoutPlayingTheChirp() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine().apply { beginCalibrationResult = false }
+        val vm = viewModel(engine)
+
+        vm.startCalibration()
+
+        assertEquals(CalibrationState.Failed, vm.syncState.value.calibration)
+        assertEquals(1, engine.calibrationBegun)
+    }
+
+    @Test
+    fun startCalibrationStillRunsNormallyWhenTheEngineArms() = runTest(testDispatcher) {
+        // Regression: beginCalibration() == true still transitions to
+        // Running exactly as before CFX-07.
+        val engine = FakeSyncEngine().apply { beginCalibrationResult = true }
+        val vm = viewModel(engine)
+
+        vm.startCalibration()
+
+        assertEquals(CalibrationState.Running, vm.syncState.value.calibration)
+        assertEquals(1, engine.calibrationBegun)
     }
 
     // ---- CAL-07: by-ear (tone-match) calibration ---------------------------
@@ -564,6 +591,76 @@ class SessionViewModelTest {
         assertTrue(shelf.profiles.any { it.routeId == "bluetooth:AirPods Pro" })
     }
 
+    // ---- CFX-09: deterministic shelf order, connected device first --------
+
+    @Test
+    fun withConnectedFirstMovesTheMatchingProfileToTheFrontOnly() {
+        val a = calibrationProfile("a", latencyMs = 1, updatedAtMs = 3_000L)
+        val b = calibrationProfile("b", latencyMs = 2, updatedAtMs = 2_000L)
+        val c = calibrationProfile("c", latencyMs = 3, updatedAtMs = 1_000L)
+        val baseOrder = listOf(a, b, c) // already updatedAtMs-descending
+
+        assertEquals(listOf("c", "a", "b"), baseOrder.withConnectedFirst("c").map { it.routeId })
+        // Already first: unchanged.
+        assertEquals(listOf("a", "b", "c"), baseOrder.withConnectedFirst("a").map { it.routeId })
+    }
+
+    @Test
+    fun withConnectedFirstFallsBackToPlainOrderWhenNothingMatches() {
+        val a = calibrationProfile("a", latencyMs = 1, updatedAtMs = 2_000L)
+        val b = calibrationProfile("b", latencyMs = 2, updatedAtMs = 1_000L)
+        val baseOrder = listOf(a, b)
+
+        assertEquals(listOf("a", "b"), baseOrder.withConnectedFirst("bluetooth:unknown").map { it.routeId })
+    }
+
+    @Test
+    fun openDeviceShelfPlacesTheConnectedDeviceFirstAheadOfUpdatedAtOrder() = runTest(testDispatcher) {
+        val nudgeStore = FakeNudgeStore().apply {
+            // Deliberately inserted out of updatedAtMs order — proves the
+            // shelf isn't just reflecting map/insertion order.
+            calibrationProfiles["bluetooth:AirPods Pro"] =
+                calibrationProfile("bluetooth:AirPods Pro", latencyMs = 182, updatedAtMs = 3_000L)
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 204, updatedAtMs = 1_000L)
+            calibrationProfiles["bluetooth:Kitchen speaker"] =
+                calibrationProfile("bluetooth:Kitchen speaker", latencyMs = 96, updatedAtMs = 2_000L)
+        }
+        // Default routeId is "speaker" — the OLDEST-updated profile, so a
+        // plain updatedAtMs-descending read alone would put it LAST.
+        val vm = viewModel(nudgeStore = nudgeStore)
+
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+
+        val shelf = vm.syncState.value.deviceReview as DeviceReviewPane.Shelf
+        assertEquals(
+            listOf("speaker", "bluetooth:AirPods Pro", "bluetooth:Kitchen speaker"),
+            shelf.profiles.map { it.routeId },
+        )
+    }
+
+    @Test
+    fun openDeviceShelfFallsBackToPlainUpdatedAtOrderWhenTheConnectedRouteIsUnknown() =
+        runTest(testDispatcher) {
+            val nudgeStore = FakeNudgeStore().apply {
+                calibrationProfiles["bluetooth:AirPods Pro"] =
+                    calibrationProfile("bluetooth:AirPods Pro", latencyMs = 182, updatedAtMs = 2_000L)
+                calibrationProfiles["bluetooth:Kitchen speaker"] =
+                    calibrationProfile("bluetooth:Kitchen speaker", latencyMs = 96, updatedAtMs = 1_000L)
+            }
+            // Default routeId "speaker" matches nothing in the store.
+            val vm = viewModel(nudgeStore = nudgeStore)
+
+            vm.openDeviceShelf()
+            advanceUntilIdle()
+
+            val shelf = vm.syncState.value.deviceReview as DeviceReviewPane.Shelf
+            assertEquals(
+                listOf("bluetooth:AirPods Pro", "bluetooth:Kitchen speaker"),
+                shelf.profiles.map { it.routeId },
+            )
+        }
+
     @Test
     fun selectDeviceOpensDetailForAKnownShelfRow() = runTest(testDispatcher) {
         val nudgeStore = FakeNudgeStore().apply {
@@ -686,7 +783,6 @@ class SessionViewModelTest {
         advanceUntilIdle()
         val gate = vm.syncState.value.firstContactGate
         assertEquals("bluetooth:AirPods Pro", gate?.routeId)
-        assertEquals(FirstContactVariant.ACOUSTIC, gate?.variant)
 
         // "speaker" already has a real (sampleCount=1) profile — handled.
         vm.onRouteChanged("speaker", null, SyncCore.Route.SPEAKER)
@@ -694,14 +790,20 @@ class SessionViewModelTest {
         assertNull(vm.syncState.value.firstContactGate)
     }
 
+    // CFX-06 (tech-req §2.6 "Gate copy must not pre-commit to a route
+    // class"): the gate fires identically for WIRED as for any other route
+    // — [FirstContactGateState] no longer carries a route-class-derived
+    // variant field at all (formerly [FirstContactVariant], removed).
     @Test
-    fun firstContactGateUsesTheHeadphoneClassVariantForWiredRoutes() = runTest(testDispatcher) {
+    fun firstContactGateFiresTheSameWayForWiredRoutes() = runTest(testDispatcher) {
         val vm = viewModel()
 
         vm.onRouteChanged("wired", "Wired headphones", SyncCore.Route.WIRED)
         advanceUntilIdle()
 
-        assertEquals(FirstContactVariant.HEADPHONE, vm.syncState.value.firstContactGate?.variant)
+        val gate = vm.syncState.value.firstContactGate
+        assertEquals("wired", gate?.routeId)
+        assertEquals("Wired headphones", gate?.deviceName)
     }
 
     @Test
@@ -743,7 +845,7 @@ class SessionViewModelTest {
     }
 
     @Test
-    fun acceptingTheAcousticVariantStartsTheGuidedAcousticFlow() = runTest(testDispatcher) {
+    fun acceptingTheGateAlwaysStartsTheGuidedAcousticFlow() = runTest(testDispatcher) {
         val engine = FakeSyncEngine()
         val vm = viewModel(engine)
         vm.onRouteChanged("speaker", null, SyncCore.Route.SPEAKER)
@@ -756,18 +858,26 @@ class SessionViewModelTest {
         assertEquals(1, engine.calibrationBegun)
     }
 
+    // CFX-06: WIRED gets the identical acoustic-first treatment as every
+    // other route — never startByEarCalibration() directly. By ear is
+    // reached only via the existing chirp-timeout → Failed → "Try by ear
+    // instead" path, tested separately
+    // (chirpTimeoutReachesFailedOnAnyRouteType_noDeviceClassBranch above).
     @Test
-    fun acceptingTheHeadphoneVariantStartsTheToneMatchFlow() = runTest(testDispatcher) {
-        val tonePlayer = FakeTonePlayer()
-        val vm = viewModel(tonePlayer = tonePlayer)
-        vm.onRouteChanged("wired", "Wired headphones", SyncCore.Route.WIRED)
-        advanceUntilIdle()
+    fun acceptingTheGateOnAWiredRouteStillStartsTheAcousticFlowNotToneMatchDirectly() =
+        runTest(testDispatcher) {
+            val engine = FakeSyncEngine()
+            val tonePlayer = FakeTonePlayer()
+            val vm = viewModel(engine, tonePlayer = tonePlayer)
+            vm.onRouteChanged("wired", "Wired headphones", SyncCore.Route.WIRED)
+            advanceUntilIdle()
 
-        vm.acceptFirstContactGate()
+            vm.acceptFirstContactGate()
 
-        assertNull(vm.syncState.value.firstContactGate)
-        assertEquals(CalibrationState.ByEarRunning, vm.syncState.value.calibration)
-        assertEquals(1, tonePlayer.startCount)
+            assertNull(vm.syncState.value.firstContactGate)
+            assertEquals(CalibrationState.Running, vm.syncState.value.calibration)
+            assertEquals(1, engine.calibrationBegun)
+            assertEquals(0, tonePlayer.startCount)
     }
 
     @Test
@@ -919,6 +1029,52 @@ class SessionViewModelTest {
         vm.declineTrimPromotion("speaker")
 
         assertNull((vm.syncState.value.deviceReview as DeviceReviewPane.Detail).trimPromotionMedianMs)
+    }
+
+    // ---- CFX-08: drift banner "Later" dismisses in place -------------------
+
+    @Test
+    fun dismissDriftBannerClosesTheBannerInPlaceWithoutLeavingTheDetailPane() = runTest(testDispatcher) {
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 204).copy(drifted = true)
+        }
+        val vm = viewModel(nudgeStore = nudgeStore)
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+        vm.selectDevice("speaker")
+        advanceUntilIdle()
+        val before = vm.syncState.value.deviceReview as DeviceReviewPane.Detail
+        assertTrue(before.profile.drifted)
+        assertFalse(before.driftDismissed)
+
+        vm.dismissDriftBanner("speaker")
+
+        // Still the SAME Detail pane — never DeviceReviewPane.Shelf — with
+        // the banner cleared and the profile itself untouched (the referee's
+        // finding is still true; only the banner's visibility changed).
+        val after = vm.syncState.value.deviceReview
+        assertTrue(after is DeviceReviewPane.Detail)
+        after as DeviceReviewPane.Detail
+        assertEquals("speaker", after.profile.routeId)
+        assertTrue(after.profile.drifted)
+        assertTrue(after.driftDismissed)
+    }
+
+    @Test
+    fun dismissDriftBannerIgnoresARouteIdThatIsNotTheOpenDetailPane() = runTest(testDispatcher) {
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 204).copy(drifted = true)
+        }
+        val vm = viewModel(nudgeStore = nudgeStore)
+        vm.openDeviceShelf()
+        advanceUntilIdle()
+        vm.selectDevice("speaker")
+        advanceUntilIdle()
+
+        vm.dismissDriftBanner("bluetooth:some-other-device")
+
+        val detail = vm.syncState.value.deviceReview as DeviceReviewPane.Detail
+        assertFalse(detail.driftDismissed)
     }
 
     @Test
@@ -1165,6 +1321,10 @@ class SessionViewModelTest {
         method: CalibrationProfile.Method = CalibrationProfile.Method.MEASURED,
         acousticallyReachable: Boolean = true,
         sampleCount: Int = 1,
+        // CFX-09: distinct updatedAtMs values are what a shelf-ordering test
+        // needs to seed — defaults to 0L so every pre-existing call site
+        // (which never cared about order) is unaffected.
+        updatedAtMs: Long = 0L,
     ) = CalibrationProfile(
         routeId = routeId,
         routeClass = when {
@@ -1179,7 +1339,7 @@ class SessionViewModelTest {
         sampleCount = sampleCount,
         acousticallyReachable = acousticallyReachable,
         createdAtMs = 0L,
-        updatedAtMs = 0L,
+        updatedAtMs = updatedAtMs,
     )
 }
 
@@ -1271,9 +1431,13 @@ private class FakeSyncEngine : SyncEngine {
     var calibrationCancelled = 0
         private set
 
+    // CFX-07: settable so a test can simulate the engine refusing to arm
+    // calibration (a bad session state) without touching native code.
+    var beginCalibrationResult = true
+
     override fun beginCalibration(): Boolean {
         calibrationBegun += 1
-        return true
+        return beginCalibrationResult
     }
 
     override fun cancelCalibration(): Boolean {
@@ -1344,8 +1508,13 @@ private class FakeNudgeStore : NudgeStore {
         calibrationProfiles[profile.routeId] = profile
     }
 
+    // CFX-09: mirrors [DataStoreNudgeStore.allCalibrationProfiles]'s real
+    // ordering contract (most-recently-updated first) instead of raw map
+    // iteration — otherwise this fake would make openDeviceShelf's
+    // connected-first ordering untestable (nothing to prove "the rest" is
+    // in a stable order behind it).
     override suspend fun allCalibrationProfiles(): List<CalibrationProfile> =
-        calibrationProfiles.values.toList()
+        calibrationProfiles.values.toList().sortedByUpdatedAtDescending()
 
     val setpoints = mutableMapOf<String, Int>()
 

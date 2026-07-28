@@ -15,7 +15,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.jointheparty.app.ui.session.FirstContactGateState
-import com.jointheparty.app.ui.session.FirstContactVariant
 import com.jointheparty.app.ui.theme.BilletTheme
 import com.jointheparty.app.ui.theme.BilletType
 import com.jointheparty.app.ui.theme.DT
@@ -34,16 +33,22 @@ import com.jointheparty.app.ui.theme.DT
  * the initial seek yet. See [FirstContactGateState]'s doc comment for the
  * full reasoning — nothing in this file (or its caller) ever touches
  * `startListening`/recognition.
+ *
+ * CFX-06 (tech-req §2.6 "Gate copy must not pre-commit to a route class" /
+ * ui-ux §6.5 "Corrected to a single, route-neutral variant"): formerly two
+ * variants (ACOUSTIC/HEADPHONE) branched on route class — a Bluetooth
+ * speaker was told the chirp "keeps everyone in sync on this speaker," then
+ * timed out and asked for fifteen more seconds by ear; a 3.5mm cable into a
+ * PA was told "Headphones can't be heard by the phone's mic" (false for
+ * that rig) and routed straight past the acoustic measurement that would
+ * have worked. The gate cannot know acoustic-capability in advance — only
+ * running the chirp can — so there is now exactly one copy set, for every
+ * route.
  */
 // ui-ux §6.5 copy deck — verbatim; `internal const` so a string-diff test
 // can pin it, matching Provenance.kt/DeviceShelf.kt's established pattern.
-internal const val GATE_ACOUSTIC_BODY = "A quick calibration keeps everyone in sync on this " +
-    "speaker. Takes about ten seconds."
-internal const val GATE_ACOUSTIC_PRIMARY = "Calibrate now"
-internal const val GATE_HEADPHONE_BODY = "Headphones can't be heard by the phone's mic — so " +
-    "you're the instrument here. We'll play a tone and you match it by ear. Takes about " +
-    "fifteen seconds."
-internal const val GATE_HEADPHONE_PRIMARY = "Calibrate by ear"
+internal const val GATE_BODY = "A quick calibration keeps everyone in sync. Takes about ten seconds."
+internal const val GATE_PRIMARY = "Calibrate now"
 internal const val GATE_QUIET = "Not now"
 internal const val GATE_FINE_CAPTION = "We'll use a generic default until you do."
 
@@ -74,9 +79,6 @@ internal fun FirstContactGateContent(
     onAccept: () -> Unit,
     onDecline: () -> Unit,
 ) {
-    val body = if (gate.variant == FirstContactVariant.ACOUSTIC) GATE_ACOUSTIC_BODY else GATE_HEADPHONE_BODY
-    val primary = if (gate.variant == FirstContactVariant.ACOUSTIC) GATE_ACOUSTIC_PRIMARY else GATE_HEADPHONE_PRIMARY
-
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -94,9 +96,9 @@ internal fun FirstContactGateContent(
             textAlign = TextAlign.Center,
         )
         Spacer(Modifier.height(DT.Space.sectionGap))
-        Text(text = body, style = BilletType.body, color = DT.Colors.ink2, textAlign = TextAlign.Center)
+        Text(text = GATE_BODY, style = BilletType.body, color = DT.Colors.ink2, textAlign = TextAlign.Center)
         Spacer(Modifier.height(DT.Space.sectionGap))
-        SheetPill(primary, primary = true, onTap = onAccept)
+        SheetPill(GATE_PRIMARY, primary = true, onTap = onAccept)
         Spacer(Modifier.height(DT.Space.grid))
         QuietText(GATE_QUIET, onTap = onDecline)
         Spacer(Modifier.height(8.dp))
@@ -106,31 +108,17 @@ internal fun FirstContactGateContent(
 
 // ---- Previews ---------------------------------------------------------------
 
-@Preview(name = "First-contact gate — acoustic-capable", showBackground = true, backgroundColor = 0xFF1D1A17)
+// CFX-06: a single preview now that there's one route-neutral variant —
+// the acoustic/headphone-class split previously previewed here no longer
+// exists (see this file's top-of-file doc comment).
+@Preview(name = "First-contact gate", showBackground = true, backgroundColor = 0xFF1D1A17)
 @Composable
-private fun FirstContactGateAcousticPreview() {
+private fun FirstContactGatePreview() {
     BilletTheme {
         FirstContactGateContent(
             gate = FirstContactGateState(
                 routeId = "speaker",
                 deviceName = "Living room speaker",
-                variant = FirstContactVariant.ACOUSTIC,
-            ),
-            onAccept = {},
-            onDecline = {},
-        )
-    }
-}
-
-@Preview(name = "First-contact gate — headphone-class", showBackground = true, backgroundColor = 0xFF1D1A17)
-@Composable
-private fun FirstContactGateHeadphonePreview() {
-    BilletTheme {
-        FirstContactGateContent(
-            gate = FirstContactGateState(
-                routeId = "wired",
-                deviceName = "Wired headphones",
-                variant = FirstContactVariant.HEADPHONE,
             ),
             onAccept = {},
             onDecline = {},

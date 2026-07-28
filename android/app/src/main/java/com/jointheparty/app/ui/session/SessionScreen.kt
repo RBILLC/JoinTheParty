@@ -124,6 +124,9 @@ fun SessionScreen(
     // to DeviceDetail's seam.
     onAcceptTrimPromotion: (routeId: String, medianMs: Int) -> Unit = { _, _ -> },
     onDeclineTrimPromotion: (routeId: String) -> Unit = {},
+    // CFX-08: drift banner's "Later" — dismisses in place, threaded down to
+    // CalibrationSheet exactly like the trim-promotion intents above.
+    onDismissDriftBanner: (routeId: String) -> Unit = {},
 ) {
     var showCalibration by remember { mutableStateOf(false) }
     // CAL-08: separate from [showCalibration] so the sheet appears the
@@ -131,6 +134,36 @@ fun SessionScreen(
     // profile fetch lands in [state.deviceReview] — see onOpenDeviceShelf
     // below.
     var showDeviceReview by remember { mutableStateOf(false) }
+
+    val phaseGroup = state.phase.toPhaseGroup()
+
+    // CFX-04 (tech-req §2.6 "Sheet lifetime"): a phase transition OUT of
+    // ACTIVE (into "Lost the room…" or a concierge gate) closes any open
+    // calibration/review sheet outright — resetting the local flags here,
+    // not merely hiding the sheet behind shouldShowCalibrationSheet below,
+    // which alone would let the very same sheet silently resurrect the
+    // moment the phase returns to ACTIVE. Mirrors the sheet's own onDismiss
+    // wiring (below) so the ViewModel's calibration/deviceReview state is
+    // cleared the same way a manual dismiss would clear it.
+    LaunchedEffect(phaseGroup) {
+        if (phaseGroup != PhaseGroup.ACTIVE && (showCalibration || showDeviceReview)) {
+            showCalibration = false
+            showDeviceReview = false
+            onDismissDeviceReview()
+            onDismissCalibration()
+        }
+    }
+
+    // CFX-05 (tech-req §2.6 "Entry points"): the exact same open-shelf
+    // action ActiveContent's "Devices" already used, extracted so IDLE's
+    // entry point below wires to the identical closure shape — one
+    // definition, reused, rather than two composables independently
+    // deciding how "open the shelf" behaves.
+    val handleOpenDeviceShelf = openDeviceShelfAction(
+        setShowDeviceReview = { showDeviceReview = it },
+        onOpenDeviceShelf = onOpenDeviceShelf,
+    )
+
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -142,16 +175,24 @@ fun SessionScreen(
         // unconditionally since this is a content swap, not a physical
         // gesture). No loops, no bounce.
         Crossfade(
-            targetState = state.phase.toPhaseGroup(),
+            targetState = phaseGroup,
             modifier = Modifier.fillMaxSize(),
             animationSpec = tween(DT.Motion.reducedMotionCrossfadeMs.toInt()),
             label = "session-phase",
         ) { group ->
             when (group) {
+                // CFX-05: the shelf/detail entry point is reachable here
+                // too — calibrating a device before joining a party, and
+                // reviewing known devices between sessions, are both
+                // legitimate uses (ui-ux §6.5's empty-state copy is written
+                // for exactly this moment). A single "Devices" label, not
+                // "Devices" + "Calibrate" as ActiveContent has — see
+                // IdleContent's own doc comment for why one, not two.
                 PhaseGroup.IDLE -> IdleContent(
                     onJoinTap = onJoinTap,
                     onConnectSpotify = onConnectSpotify,
                     spotifyLinked = spotifyLinked,
+                    onOpenDeviceShelf = handleOpenDeviceShelf,
                 )
                 PhaseGroup.WAITING -> WaitingContent(
                     phase = state.phase,
@@ -164,10 +205,7 @@ fun SessionScreen(
                     onTrimChange = onTrimChange,
                     onTrimCommit = onTrimCommit,
                     onOpenCalibration = { showCalibration = true },
-                    onOpenDeviceShelf = {
-                        showDeviceReview = true
-                        onOpenDeviceShelf()
-                    },
+                    onOpenDeviceShelf = handleOpenDeviceShelf,
                     playbackPositionMs = playbackPositionMs,
                     onLeaveSession = onLeaveSession,
                 )
@@ -185,7 +223,14 @@ fun SessionScreen(
         // release. Shows why recognition/playback is (not) progressing.
         DebugOverlay(modifier = Modifier.align(Alignment.TopStart))
 
-        if (showCalibration || showDeviceReview) {
+        // CFX-04 (tech-req §2.6 "Sheet lifetime & precedence"): visibility is
+        // no longer just `showCalibration || showDeviceReview` — it also
+        // requires the ACTIVE phase group and a clear first-contact gate.
+        // See shouldShowCalibrationSheet's doc comment for the full rule;
+        // the gate below is rendered completely independently, so this
+        // condition excluding gate!=null is what makes the two sheets
+        // structurally exclusive rather than a coincidence of layout.
+        if (shouldShowCalibrationSheet(showCalibration || showDeviceReview, state.phase, state.firstContactGate)) {
             CalibrationSheet(
                 routeName = state.routeName,
                 calibration = state.calibration,
@@ -240,13 +285,18 @@ fun SessionScreen(
                 },
                 onAcceptTrimPromotion = onAcceptTrimPromotion,
                 onDeclineTrimPromotion = onDeclineTrimPromotion,
+                onDismissDriftBanner = onDismissDriftBanner,
             )
         }
 
-        // CAL-09: independent of showCalibration/showDeviceReview above —
-        // the gate is raised by SessionViewModel.onRouteChanged, not a
-        // quiet-entry-point tap, and can appear the instant a route
-        // connects regardless of whether either sheet is open.
+        // CAL-09: independent of the calibration sheet above — the gate is
+        // raised by SessionViewModel.onRouteChanged, not a quiet-entry-point
+        // tap, and can appear the instant a route connects regardless of
+        // whether the sheet is open. CFX-04: this independence, combined
+        // with shouldShowCalibrationSheet's gate!=null exclusion above, is
+        // what makes the gate and the sheet mutually exclusive — the gate
+        // wins, since a non-null gate here always forces the sheet's own
+        // condition false.
         state.firstContactGate?.let { gate ->
             FirstContactGateSheet(
                 gate = gate,
@@ -255,6 +305,58 @@ fun SessionScreen(
             )
         }
     }
+}
+
+/**
+ * CFX-04 (tech-req §2.6 "Sheet lifetime & precedence" / ui-ux §6.5 "Sheet
+ * lifetime"): whether the calibration/device-review sheet should be visible
+ * right now. Two independent rules, both must hold:
+ *  1. Scoped to the ACTIVE phase group — a transition into LOST or a
+ *     concierge gate (NEEDS_SPOTIFY/NEEDS_PREMIUM/ERROR) must not leave the
+ *     sheet open and interactive over that state.
+ *  2. The gate wins — the sheet can never be visible while
+ *     [FirstContactGateState] is non-null, whether that's because the gate
+ *     just became eligible while the sheet was already open, or because a
+ *     tap that would open the sheet lands while the gate is still pending
+ *     (the sheet only becomes visible once accept/decline clears it).
+ *
+ * `internal`, not `private`: lets a JVM test drive this directly against a
+ * scripted phase/gate combination without composing anything — same
+ * "extract for testability" convention as
+ * [shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest]. What this
+ * function alone does NOT cover — actually resetting [SessionScreen]'s
+ * local `showCalibration`/`showDeviceReview` flags so a sheet closed by
+ * rule 1 doesn't resurrect itself the moment the phase returns to ACTIVE —
+ * is the `LaunchedEffect` in [SessionScreen] above; that's Compose wiring,
+ * not decision logic, and is called out as the one "needs a device pass"
+ * item (no overlay-flicker artifact during the transition) in this
+ * ticket's own acceptance criteria.
+ */
+internal fun shouldShowCalibrationSheet(
+    sheetRequested: Boolean,
+    phase: SessionPhase,
+    firstContactGate: FirstContactGateState?,
+): Boolean = sheetRequested && firstContactGate == null && phase.toPhaseGroup() == PhaseGroup.ACTIVE
+
+/**
+ * CFX-05 (tech-req §2.6 "Entry points"): the open-shelf action shared by
+ * IdleContent's and ActiveContent's "Devices" entry points — flips the
+ * screen-local `showDeviceReview` flag and fires the ViewModel's
+ * [com.jointheparty.app.ui.session.SessionViewModel.openDeviceShelf] call,
+ * exactly as the pre-CFX-05 inline lambda on ActiveContent's entry point
+ * did. Extracted to a plain function (not a private inline lambda per call
+ * site) for two reasons: it lets a JVM test assert the wiring directly —
+ * same "extract for testability" convention as
+ * [shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest] — and it
+ * guarantees IDLE's and ACTIVE's entry points can never drift into
+ * behaving differently from each other over time.
+ */
+internal fun openDeviceShelfAction(
+    setShowDeviceReview: (Boolean) -> Unit,
+    onOpenDeviceShelf: () -> Unit,
+): () -> Unit = {
+    setShowDeviceReview(true)
+    onOpenDeviceShelf()
 }
 
 /**
@@ -332,12 +434,33 @@ private fun SessionPhase.toPhaseGroup(): PhaseGroup = when (this) {
  * IDLE (§4): the invitation IS the screen. One whisper-quiet secondary
  * action beneath it — the PKCE account link (AUTH-02), needed before the
  * Web API can be called on the user's behalf.
+ *
+ * CFX-05 (tech-req §2.6 "Entry points" / ui-ux §6.5): also carries the
+ * shelf/device-review entry point — calibrating a device before joining a
+ * party, and reviewing known devices between sessions, are both legitimate
+ * uses ui-ux §6.5's empty-state copy is written for exactly this moment
+ * ("Play something through a speaker or headphones and JoinTheParty will
+ * get to know it").
+ *
+ * A single "Devices" label, not "Devices" + "Calibrate" as [ActiveContent]
+ * has: [onOpenDeviceShelf] here opens the SAME sheet, and the device
+ * shelf's own empty state ("Calibrate this device," `DeviceShelf.kt`)
+ * already offers a calibration action once inside it. Outside a session
+ * there is also no meaningfully "active route" to calibrate ahead of time
+ * — [com.jointheparty.app.ui.session.SyncState.routeId] defaults to
+ * `"speaker"` with no real connection behind it yet — so a bare standalone
+ * "Calibrate" here would just duplicate the shelf's own empty-state entry
+ * under a second, redundant idiom. One quiet label keeps IDLE's "the
+ * invitation IS the screen" restraint (§4) intact: this is a second
+ * quiet-register action alongside Connect Spotify, not a doubling of the
+ * "single quiet entry point" ui-ux §4 already promises.
  */
 @Composable
 private fun IdleContent(
     onJoinTap: () -> Unit,
     onConnectSpotify: () -> Unit = {},
     spotifyLinked: Boolean = false,
+    onOpenDeviceShelf: () -> Unit = {},
 ) {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -360,6 +483,17 @@ private fun IdleContent(
                         .clickable(onClick = onConnectSpotify),
                 )
             }
+            // CFX-05: same register as "Devices" in ActiveContent's own
+            // quiet settings-tier row (§4) — label/ink3, no icon chrome, no
+            // separate settings screen.
+            Text(
+                text = "Devices",
+                style = BilletType.label,
+                color = DT.Colors.ink3,
+                modifier = Modifier
+                    .padding(top = DT.Space.grid)
+                    .clickable(onClick = onOpenDeviceShelf),
+            )
         }
     }
 }

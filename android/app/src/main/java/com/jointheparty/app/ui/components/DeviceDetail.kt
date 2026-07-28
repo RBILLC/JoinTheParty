@@ -75,6 +75,12 @@ data class TrimPromotionBannerState(
  * drift banner — satisfying that acceptance criterion regardless of what
  * the caller passes.
  *
+ * CFX-08 (ui-ux §6.5 "Both Quiet actions dismiss in place"): [driftDismissed]
+ * suppresses the drift banner for THIS already-open pane only — it never
+ * edits [CalibrationProfile.drifted] itself — so "Later" behaves exactly
+ * like trim promotion's "Keep as is" (below): both dismiss in place and
+ * neither navigates back to the shelf.
+ *
  * CFX-03 (tech-req §2.6 "Connected-state encoding"): [connected] also feeds
  * a `· Connected` text qualifier onto [ProvenanceLine] (in both the plain
  * and drift-banner branches below) — the caliper's `brass` settled line is
@@ -88,6 +94,9 @@ fun DeviceDetail(
     modifier: Modifier = Modifier,
     onDismissBanner: () -> Unit = {},
     trimPromotion: TrimPromotionBannerState? = null,
+    // CFX-08: suppresses the drift banner for this already-open pane once
+    // "Later" has been tapped — see the doc comment above.
+    driftDismissed: Boolean = false,
     nowMs: Long = System.currentTimeMillis(),
 ) {
     Column(
@@ -124,8 +133,10 @@ fun DeviceDetail(
 
         when {
             // Drift wins over trim-promotion whenever both happen to be
-            // true — see the doc comment above.
-            profile.drifted -> {
+            // true — see the doc comment above. CFX-08: also gated on
+            // !driftDismissed, so "Later" drops straight through to the
+            // plain-provenance branch below without navigating anywhere.
+            profile.drifted && !driftDismissed -> {
                 ProvenanceLine(profile, nowMs, connected = connected)
                 Spacer(Modifier.height(DT.Space.grid))
                 // CFX-02: the drift banner's "Recalibrate" routes through

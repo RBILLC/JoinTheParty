@@ -44,6 +44,21 @@ import kotlin.math.roundToInt
 internal const val CALIBRATION_CANCELLED_BODY = "Device changed — calibration cancelled."
 
 /**
+ * CFX-06 (additional fix, alongside the gate copy above): the old copy —
+ * "Couldn't hear the chirp — turn the volume up and try again" — assumed a
+ * speaker. On headphones no volume ever reaches the phone's mic, so that
+ * "fix" is useless advice, and CFX-06's route-neutral gate means headphone
+ * users now always land here (the gate no longer skips them straight to By
+ * ear). Rewritten to state what happened and hand off evenhandedly to both
+ * recovery paths already offered below (the "Try again" pill, the "Try by
+ * ear instead" quiet exit) without asserting which situation — speaker or
+ * headphones — the user is actually in. §6.4 error voice: what happened,
+ * what to do, no apology theater. `internal const` for the same
+ * string-diff-testability reason as [CALIBRATION_CANCELLED_BODY].
+ */
+internal const val CALIBRATION_FAILED_BODY = "Couldn't hear the chirp. Try again, or set it by ear instead."
+
+/**
  * INT-03: the per-route latency calibration sheet (arch §6.4, ui-ux §6.4
  * error-voice rules: state what happened, state the fix, no apology
  * theater). Billet-styled ModalBottomSheet on the `billet` surface.
@@ -78,6 +93,12 @@ fun CalibrationSheet(
     onBackToShelf: () -> Unit = {},
     onRequestRecalibrate: () -> Unit = {},
     onCalibratePhoneSpeaker: () -> Unit = {},
+    // CFX-08 (ui-ux §6.5 "Both Quiet actions dismiss in place"): the drift
+    // banner's "Later" — dismisses the banner on the SAME Detail pane,
+    // never navigates back to the shelf like [onBackToShelf] does. Defaults
+    // keep previews/simple hosts terse, same convention as the intents
+    // above.
+    onDismissDriftBanner: (routeId: String) -> Unit = {},
     // CAL-10: trim-promotion accept/decline, threaded down to
     // [DeviceDetail]'s existing `TrimPromotionBannerState` seam below.
     // Defaults keep previews/simple hosts terse, same convention as the
@@ -132,7 +153,13 @@ fun CalibrationSheet(
                         profile = deviceReview.profile,
                         connected = deviceReview.profile.routeId == connectedRouteId,
                         onRecalibrate = onRequestRecalibrate,
-                        onDismissBanner = onBackToShelf,
+                        // CFX-08: was `onBackToShelf`, which silently
+                        // navigated the pane away — the drift banner's
+                        // "Later" is a sibling of trim promotion's "Keep as
+                        // is" (below), which dismisses in place, so "Later"
+                        // must too.
+                        onDismissBanner = { onDismissDriftBanner(deviceReview.profile.routeId) },
+                        driftDismissed = deviceReview.driftDismissed,
                         // CAL-10 seam (CAL-08 left this null): non-null
                         // exactly when SessionViewModel.selectDevice found
                         // this device's recent commits eligible — see
@@ -229,8 +256,7 @@ private fun GuidedCalibrationContent(
                 }
                 CalibrationState.Failed -> {
                     Text(
-                        "Couldn't hear the chirp — turn the volume up and " +
-                            "try again.",
+                        CALIBRATION_FAILED_BODY,
                         style = BilletType.body,
                         color = DT.Colors.ink2,
                     )

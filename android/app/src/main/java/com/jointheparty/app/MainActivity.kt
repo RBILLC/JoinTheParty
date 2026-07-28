@@ -150,6 +150,7 @@ class MainActivity : ComponentActivity() {
                             onDeclineTrimPromotion = { routeId ->
                                 viewModel.declineTrimPromotion(routeId)
                             },
+                            onDismissDriftBanner = viewModel::dismissDriftBanner,
                         )
                     }
                 }

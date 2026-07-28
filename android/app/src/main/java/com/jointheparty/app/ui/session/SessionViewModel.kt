@@ -194,6 +194,32 @@ private const val TRIM_PROMOTION_FLOOR_MS = 30
  * lets the threshold math be pinned directly by a JVM test, no
  * ViewModel/store/coroutine scaffolding required.
  */
+/**
+ * CFX-09 (technical-requirements.md §2.6 "Shelf ordering"): the shell-side
+ * half of the ordering contract — [NudgeStore.allCalibrationProfiles]
+ * already returns a deterministic updatedAtMs-descending base order (the
+ * store's own half, since it has no notion of "connected"); this moves the
+ * profile matching [connectedRouteId], if any, to the front of that list
+ * without disturbing the relative order of the rest. A no-op (returns
+ * `this` unchanged) when nothing matches, or the match is already first.
+ *
+ * Index-based rather than a list-remove-by-value — [CalibrationProfile] is
+ * a data class, so removing "by value" would risk touching the wrong
+ * element if two entries were ever structurally equal.
+ *
+ * `internal`, not `private` — same "extract for testability" convention as
+ * [trimPromotionMedian]: a JVM test can pin this reordering directly, no
+ * ViewModel/store/coroutine scaffolding required.
+ */
+internal fun List<CalibrationProfile>.withConnectedFirst(connectedRouteId: String): List<CalibrationProfile> {
+    val index = indexOfFirst { it.routeId == connectedRouteId }
+    if (index <= 0) return this
+    val reordered = toMutableList()
+    val connected = reordered.removeAt(index)
+    reordered.add(0, connected)
+    return reordered
+}
+
 internal fun trimPromotionMedian(commits: List<Int>): Int? {
     val sampleCount = DT.Calibration.trimPromotionSampleCount.roundToInt()
     if (commits.size < sampleCount) return null
@@ -273,17 +299,29 @@ sealed interface DeviceReviewPane {
      * .accepted` — true once "Use this offset" is tapped, so the "Folded
      * into the calibration" confirmation replaces the accept/decline
      * actions IN PLACE rather than needing a fresh shelf/detail reload.
+     * @param driftDismissed CFX-08 (ui-ux §6.5 "Both Quiet actions dismiss
+     * in place"): true once the drift banner's "Later" has been tapped for
+     * THIS view of the pane — mirrors [trimPromotionAccepted]'s shape
+     * exactly. [DeviceDetail] shows the drift banner only while
+     * `profile.drifted && !driftDismissed`; dismissing never edits
+     * `profile.drifted` itself (the referee's finding is still true), it
+     * only stops re-showing the banner in this already-open pane. A fresh
+     * [SessionViewModel.selectDevice] always starts a new `Detail` with this
+     * defaulted back to `false`, so the banner is offered again on the next
+     * deliberate visit — matching drift's own "visited deliberately, no
+     * push/toast/badge" restraint.
      */
     data class Detail(
         val profile: CalibrationProfile,
         val trimPromotionMedianMs: Int? = null,
         val trimPromotionAccepted: Boolean = false,
+        val driftDismissed: Boolean = false,
     ) : DeviceReviewPane
 }
 
 /**
- * CAL-09 (ui-ux §6.5 "First-contact gate" / tech-req §2.6 "Scope"): which
- * gate copy to show for an unknown routeId.
+ * CAL-09 (ui-ux §6.5 "First-contact gate" / tech-req §2.6 "Scope"): raised
+ * for an unknown routeId.
  *
  * THE LOAD-BEARING DISTINCTION (tech-req §2.6's own "Scope" paragraph):
  * this gates PLAYBACK'S AIM ONLY, never recognition. Recognition reads the
@@ -293,13 +331,18 @@ sealed interface DeviceReviewPane {
  * costs. [SessionViewModel.startListening]/[SessionViewModel
  * .runRecognitionPass] never read [SyncState.firstContactGate] anywhere —
  * that omission (not a guard that skips it) IS the enforcement.
+ *
+ * CFX-06 (tech-req §2.6 "Gate copy must not pre-commit to a route class"):
+ * formerly carried a `variant: FirstContactVariant` (ACOUSTIC/HEADPHONE)
+ * branched on [SyncCore.Route] — removed along with `FirstContactVariant`
+ * and `firstContactVariant()` entirely. The gate cannot know
+ * acoustic-capability in advance (only running the chirp can), so there is
+ * now exactly one route-neutral copy set for every route (ui-ux §6.5's
+ * corrected "First-contact gate" section) — no field left to branch on.
  */
-enum class FirstContactVariant { ACOUSTIC, HEADPHONE }
-
 data class FirstContactGateState(
     val routeId: String,
     val deviceName: String,
-    val variant: FirstContactVariant,
 )
 
 data class TrackInfo(
@@ -837,7 +880,7 @@ class SessionViewModel(
             // anything above — recognition's bootstrap lives entirely in
             // startListening(), which doesn't read this field.
             val gate = if (profile == null || profile.sampleCount == 0) {
-                FirstContactGateState(routeId, routeName ?: routeId, firstContactVariant(route))
+                FirstContactGateState(routeId, routeName ?: routeId)
             } else {
                 null
             }
@@ -902,10 +945,20 @@ class SessionViewModel(
     /**
      * Arms the engine's chirp detector, then plays the calibration chirp
      * through the active output route.
+     *
+     * CFX-07: "Start calibration" must never be a dead tap (ui-ux §6.5). If
+     * the engine refuses to arm calibration — a bad session state, distinct
+     * from a chirp that arms fine but times out undetected — this routes
+     * straight into the same [CalibrationState.Failed] that timeout already
+     * reaches, reusing its existing "Try again"/"Try by ear instead"
+     * recovery rather than leaving Idle with no visible change at all.
      */
     fun startCalibration() {
         if (_syncState.value.calibration == CalibrationState.Running) return
-        if (!engine.beginCalibration()) return
+        if (!engine.beginCalibration()) {
+            _syncState.update { it.copy(calibration = CalibrationState.Failed) }
+            return
+        }
         // CFX-01: snapshot the route NOW, at measurement start — completion
         // (onCalibrationResult) writes against this snapshot, never a
         // re-read of the live route.
@@ -1101,26 +1154,18 @@ class SessionViewModel(
     // ---- First-contact gate (CAL-09) ---------------------------------------
 
     /**
-     * CAL-09 gate-copy selection (ui-ux §6.5's own examples: "Acoustic-
-     * capable device (phone speaker, Bluetooth speaker)"). Branches on the
-     * ALREADY-KNOWN [SyncCore.Route] [onRouteChanged] was called with — the
-     * exact same information [onRouteChanged] already uses to pick the AEC
-     * mode a few lines above it — never a NEW device-class permission or
-     * API lookup (what tech-req §2.6 and this ticket's own acceptance
-     * criteria forbid). SPEAKER/BLUETOOTH get the acoustic-capable copy,
-     * matching "acoustic offered first" (tech-req §2.6's method table:
-     * MEASURED is attempted for every route, "wired/Bluetooth attempted
-     * first"); WIRED — the one [SyncCore.Route] the spec's acoustic-capable
-     * examples never name, and the connection least likely to ever host a
-     * party speaker — gets the headphone-class copy instead.
-     */
-    private fun firstContactVariant(route: SyncCore.Route): FirstContactVariant =
-        if (route == SyncCore.Route.WIRED) FirstContactVariant.HEADPHONE else FirstContactVariant.ACOUSTIC
-
-    /**
-     * "Calibrate now" / "Calibrate by ear": dismiss the gate and enter
-     * whichever guided flow CAL-01/CAL-07 already built. This ticket adds
-     * no new calibration mechanism — only the prompt that offers one.
+     * "Calibrate now": dismiss the gate and enter the guided acoustic flow
+     * CAL-01 already built. This ticket adds no new calibration mechanism —
+     * only the prompt that offers one.
+     *
+     * CFX-06 (tech-req §2.6 "Gate copy must not pre-commit to a route
+     * class"): always [startCalibration] — never [startByEarCalibration]
+     * directly. The gate cannot know acoustic-capability in advance, so it
+     * always attempts the acoustic flow unconditionally, per the Method
+     * taxonomy's existing no-device-class-lookup rule; a route that can't be
+     * heard acoustically reaches By ear via [startCalibration]'s own
+     * existing chirp-timeout → [CalibrationState.Failed] → "Try by ear
+     * instead" path, not by this function pre-emptively skipping to it.
      *
      * CFX-01 (tech-req §2.6 "Route attribution"): staleness-guarded the
      * same way [declineFirstContactGate] already was — a route change
@@ -1132,13 +1177,7 @@ class SessionViewModel(
         val gate = _syncState.value.firstContactGate ?: return
         _syncState.update { it.copy(firstContactGate = null) }
         if (gate.routeId != _syncState.value.routeId) return
-        when (gate.variant) {
-            FirstContactVariant.ACOUSTIC -> startCalibration()
-            FirstContactVariant.HEADPHONE -> {
-                tryByEarInstead()
-                startByEarCalibration()
-            }
-        }
+        startCalibration()
     }
 
     /**
@@ -1196,7 +1235,13 @@ class SessionViewModel(
     fun openDeviceShelf() {
         scope.launch(dispatcher) {
             val profiles = nudgeStore.allCalibrationProfiles()
-            _syncState.update { it.copy(deviceReview = DeviceReviewPane.Shelf(profiles)) }
+            // CFX-09 (tech-req §2.6 "Shelf ordering"): the store already
+            // returns a deterministic updatedAtMs-descending base order (see
+            // NudgeStore.sortedByUpdatedAtDescending); this is the ONLY
+            // place that knows connectedRouteId, so connected-first is
+            // layered on here rather than in the store.
+            val ordered = profiles.withConnectedFirst(_syncState.value.routeId)
+            _syncState.update { it.copy(deviceReview = DeviceReviewPane.Shelf(ordered)) }
         }
     }
 
@@ -1305,6 +1350,22 @@ class SessionViewModel(
             // line takes its place, same as dismissDeviceReview does for
             // drift's "Later" (ui-ux: neither decline reads as failure).
             state.copy(deviceReview = detail.copy(trimPromotionMedianMs = null))
+        }
+    }
+
+    /**
+     * Drift banner's "Later" (CFX-08, ui-ux §6.5 "Both Quiet actions dismiss
+     * in place"): closes the banner on the SAME `DeviceReviewPane.Detail`
+     * the user is already looking at — never [backToDeviceShelf]. Mirrors
+     * [declineTrimPromotion]'s exact shape (a no-persistence, in-memory
+     * flag flip on the currently-open `Detail`, ignored if the pane has
+     * since navigated elsewhere or moved to a different device).
+     */
+    fun dismissDriftBanner(routeId: String) {
+        _syncState.update { state ->
+            val detail = state.deviceReview as? DeviceReviewPane.Detail
+            if (detail == null || detail.profile.routeId != routeId) return@update state
+            state.copy(deviceReview = detail.copy(driftDismissed = true))
         }
     }
 

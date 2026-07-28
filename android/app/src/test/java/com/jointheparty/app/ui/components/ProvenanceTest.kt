@@ -2,6 +2,7 @@ package com.jointheparty.app.ui.components
 
 import com.jointheparty.app.data.CalibrationProfile
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 
 /**
@@ -206,5 +207,23 @@ class ProvenanceTest {
             "timing's drifted, worth a redo · Connected",
             provenanceQualifier(measuredDrifted, nowMs, connected = true),
         )
+    }
+
+    // ---- CFX-06 (additional fix): route-neutral Failed-state copy ---------
+    // The old "turn the volume up and try again" assumed a speaker; with
+    // the gate now route-neutral (CFX-06), headphone users reach this state
+    // too, where no volume ever reaches the phone's mic. The rewrite hands
+    // off evenhandedly to both recovery paths already offered below it
+    // (Try again / Try by ear instead) without asserting which situation
+    // the user is in.
+
+    @Test
+    fun calibrationFailedCopyIsRouteNeutralAndNamesBothRecoveryPaths() {
+        assertEquals(
+            "Couldn't hear the chirp. Try again, or set it by ear instead.",
+            CALIBRATION_FAILED_BODY,
+        )
+        // What CFX-06 removes: no speaker-assuming "volume" advice.
+        assertFalse(CALIBRATION_FAILED_BODY.contains("volume", ignoreCase = true))
     }
 }

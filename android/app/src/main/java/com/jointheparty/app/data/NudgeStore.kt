@@ -84,6 +84,24 @@ interface NudgeStore {
     suspend fun saveTrimPromotionDeclinedAtMs(routeId: String, atMs: Long)
 }
 
+/**
+ * CFX-09 (technical-requirements.md §2.6 "Shelf ordering"): the store's
+ * entire ordering contract — most-recently-updated first, deterministic
+ * across repeated reads with no intervening writes. The store has no
+ * notion of "connected" (that's layered on top by
+ * [com.jointheparty.app.ui.session.SessionViewModel.openDeviceShelf], which
+ * knows the live route), so this is the whole of what [NudgeStore
+ * .allCalibrationProfiles] itself owes every caller.
+ *
+ * `internal`, not `private`, and a plain function on `List<CalibrationProfile>`
+ * rather than inlined into [DataStoreNudgeStore.allCalibrationProfiles] —
+ * lets a JVM test pin the ordering directly against a list of profiles, no
+ * `Context`/DataStore required, same "extract for testability" convention as
+ * [com.jointheparty.app.ui.session.trimPromotionMedian].
+ */
+internal fun List<CalibrationProfile>.sortedByUpdatedAtDescending(): List<CalibrationProfile> =
+    sortedByDescending { it.updatedAtMs }
+
 class DataStoreNudgeStore(private val context: Context) : NudgeStore {
 
     override suspend fun trimFor(routeId: String): Int =
@@ -128,7 +146,7 @@ class DataStoreNudgeStore(private val context: Context) : NudgeStore {
                 prefs.asMap().entries.mapNotNull { (key, value) ->
                     if (!key.name.startsWith(CALIBRATION_PROFILE_KEY_PREFIX)) return@mapNotNull null
                     CalibrationProfile.fromJson(value as? String)
-                }
+                }.sortedByUpdatedAtDescending()
             }
             .first()
 
