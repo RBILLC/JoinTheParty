@@ -44,6 +44,15 @@
 | CAL-08 | ✅ Done — device shelf + detail, provenance never rendered alike, one-warm-accent held structurally | `a2b864d` |
 | CAL-09 | ✅ Done — gate raised on an unknown route and it genuinely holds the aim (not recognition); decline writes ESTIMATED | `d4bbc4b` `3b4338b` |
 | CAL-10 | ✅ Done — 3 commits within 25 ms of median, above a 30 ms floor; always asks, folds in as BY_EAR and zeroes the wheel; 7-day decline via stored timestamp | `d4bbc4b` |
+| CFX-01 | ⬜ Not started | — |
+| CFX-02 | ⬜ Not started | — |
+| CFX-03 | ⬜ Not started | — |
+| CFX-04 | ⬜ Not started | — |
+| CFX-05 | ⬜ Not started | — |
+| CFX-06 | ⬜ Not started | — |
+| CFX-07 | ⬜ Not started | — |
+| CFX-08 | ⬜ Not started | — |
+| CFX-09 | ⬜ Not started | — |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.
@@ -459,6 +468,96 @@ Calibration outgrew INT-03's single ticket once the chirp-path bug, the acoustic
 
 ---
 
+## Epic 7 — Calibration UX fixes (CFX)
+
+A UX audit of the shipped calibration feature (CAL-01..CAL-10, all done) found nine follow-up defects, verified in code with specific locations. None of them are new calibration mechanisms — all are corrections to contracts CAL-01..CAL-10 already implemented, per the amendments in tech-req §2.6 and ui-ux §6.5. **CFX-01/02/03 are correctness and accessibility bugs — wrong data silently written, the wrong device silently measured, a flow structurally unreachable by screen-reader users — and are ordered first as such; they are not polish.** CFX-04 through CFX-09 are UI-state and consistency defects, ordered roughly by how directly they touch correctness (state leaking/overlapping) versus pure surface consistency.
+
+This suite has 83 JVM tests and no instrumentation tests; acceptance criteria below are written to be JVM-testable wherever the defect is state/logic-shaped, and each ticket calls out explicitly where a criterion genuinely needs a device or a TalkBack pass instead.
+
+### CFX-01 · Wrong-device attribution at calibration completion — correctness
+**Description:** `onCalibrationResult()` (`SessionViewModel.kt:952`) and `commitByEar()` (`:924`) read `_syncState.value.routeId`/`routeName` at COMPLETION time, not at measurement start. If the active route changes mid-chirp or mid-tone-match, the result is written against whatever route is connected when it lands — with MEASURED/BY_EAR provenance and full confidence. Silent data corruption: a calibration for the Bluetooth speaker can end up filed against a phone speaker that connected seconds later. Fix per tech-req §2.6's "Route attribution" contract: snapshot `routeId`/`routeName`/`routeClass` when the measurement starts (`startCalibration()`/`startByEarCalibration()`) and thread that snapshot through to completion, instead of re-reading live state. A route change observed before completion invalidates the in-flight measurement — auto-cancel (mirroring `cancelCalibration()`/`cancelByEarCalibration()`), return the sheet to Idle scoped to the newly-connected route, and show "Device changed — calibration cancelled." Also closes the companion gap the audit found in the same shape: `acceptFirstContactGate()` (`:1027`) gets the same route-staleness guard `declineFirstContactGate()` (`:1076`) already applies to its live-engine call — a route change between the gate raising and the user accepting must dismiss the gate as stale rather than calibrating whichever device is now connected.
+**Acceptance criteria:**
+- JVM unit test (`SessionViewModelTest.kt`): start acoustic calibration on route A (fake engine), simulate `onRouteChanged` to route B before the `CalibrationResult` event arrives, then deliver the result → no `CalibrationProfile` is saved for route A or route B; `_syncState.value.calibration` lands on `Idle` (or an equivalent explicit "cancelled" terminal), not `Success`.
+- JVM unit test: same shape for `commitByEar` — start by-ear on route A, route changes to B mid-`ByEarRunning`, the commit ("That's it") arrives after → no profile write for either route.
+- JVM unit test (regression): start and complete a measurement with no intervening route change → the profile still writes against the route it started on, exactly as today.
+- JVM unit test: `acceptFirstContactGate()` when the gate's `routeId` no longer equals `_syncState.value.routeId` at accept time → `engine.beginCalibration()`/`tonePlayer.start()` are never invoked (spy/fake call-count assertion), the gate clears, no profile is written.
+- JVM unit test (regression): `acceptFirstContactGate()` when the route hasn't changed still starts calibration exactly as today.
+**Dependencies:** CAL-04, CAL-09.
+
+### CFX-02 · Recalibrate / empty-state targeting — correctness
+**Description:** `SessionViewModel.requestRecalibrate()` (`:1227`) correctly refuses to start a measurement when the reviewed device isn't the connected route — but `SessionScreen.kt:207-215`'s `onRequestRecalibrate` lambda unconditionally sets `showCalibration = true` regardless of that check, swapping the sheet into guided calibration titled with the name of whatever device is CURRENTLY CONNECTED (`routeName = state.routeName` feeds `CalibrationSheet`'s title, `:184`). A user who opened Device detail for device X, believing they're about to recalibrate X, silently measures whatever device Y happens to be plugged in — the same failure shape as CFX-01, one layer up, at the UI-wiring boundary instead of the data-write boundary. The shelf empty state has the identical defect: "Calibrate phone speaker" (`DeviceShelf.kt:67`, wired at `SessionScreen.kt:216-228`) never switches the active route to the phone speaker — it starts guided calibration on whatever route is already active, under a "phone speaker" label. Fix per tech-req §2.6's "Recalibration targeting": (1) disable the "Calibrate again" pill when `detail.profile.routeId != connectedRouteId`, with an inline reason (ui-ux §6.5); (2) `SessionScreen`'s `onRequestRecalibrate` opens the guided-calibration pane only when `SessionViewModel.requestRecalibrate()` actually started something, not unconditionally; (3) the empty-state action either switches to the phone-speaker route before calibrating, or is relabelled to describe what it actually calibrates.
+**Acceptance criteria:**
+- JVM unit test (regression): `requestRecalibrate()` called with `deviceReview.profile.routeId != state.routeId` leaves `_syncState.value.calibration` at `Idle` — existing behavior, kept green.
+- Compose state/semantics test: the "Calibrate again" pill's enabled/disabled state is asserted directly from composable state (`detail.profile.routeId == connectedRouteId`), and the "Reconnect this device to recalibrate it" string is present exactly when disabled — testable as a state/string assertion without a full render.
+- Copy audit: the disabled-reason string matches ui-ux §6.5 verbatim.
+- New unit test on the `SessionScreen` wiring layer (or an extracted plain-function version of the `onRequestRecalibrate` lambda, if refactored for testability): given the ViewModel's `requestRecalibrate()` did *not* start calibration (mismatched route), the guided-calibration pane does not open.
+- **Needs a device pass:** end-to-end confirmation that "Calibrate phone speaker" actually switches to and calibrates the phone's built-in speaker (or, if relabelled instead, that the guided flow's title matches the new label) — JVM tests can only assert which route-switch call, if any, the handler issues against a fake route controller, not that real audio hardware responds.
+**Dependencies:** CAL-08.
+
+### CFX-03 · CaliperScale semantics + connected-state non-colour encoding — correctness / accessibility
+**Description:** `CaliperScale` (`CaliperScale.kt:103-252`) is a bare `Canvas` with `detectHorizontalDragGestures` and no `Modifier.semantics` anywhere in the file — no exposed value, no role, no accessibility action. Because drag is the only way to move the Input-mode cursor and enable "That's it," and By ear is the sole calibration path ever offered on a route the chirp can't measure (Method taxonomy, tech-req §2.6), this makes an entire calibration path structurally unreachable via TalkBack. Fix per tech-req §2.6's CaliperScale accessibility contract: add a value/state-description semantics node (ms) to both `ReadOut` and `Input` modes, and add TalkBack-operable increment/decrement custom accessibility actions to `Input` mode that move the cursor by one step and invoke `onCursorChange` — a drag-free path to the same commit. Separately: connection state is conveyed purely by `brass` vs. `ink2` line colour (`DeviceShelf.kt`'s `connected` flag into `CaliperScale`; `DeviceDetail.kt:96-111`) with no textual tell, while provenance three doors down gets three redundant encodings. Fix: append a "Connected" qualifier to the shelf row's provenance line and the detail pane's title area per ui-ux §6.5's amendment, wherever `connected == true`.
+**Acceptance criteria:**
+- Compose semantics unit test: a `CaliperScale` in `ReadOut` mode with a non-null `settledValueMs` exposes a semantics value/state description containing the ms value — assert via the Compose UI testing semantics tree if the project's test dependencies support headless semantics assertions; otherwise **flag explicitly as needing a device pass**, since this repo has no instrumentation tests today and this may be the ticket that first requires adding one.
+- Compose semantics unit test: a `CaliperScale` in `Input` mode exposes custom accessibility actions whose invocation calls `onCursorChange` with `cursorMs` offset by exactly one defined step (increment) and the inverse (decrement) — invokable directly as a semantics-action lambda in a unit test, no live TalkBack session required.
+- **Needs a device/TalkBack pass:** end-to-end confirmation that a TalkBack user can reach, adjust, and commit a by-ear value using only accessibility gestures. This is explicitly called out — it is the actual bar the fix exists to clear, and no JVM test substitutes for it.
+- Unit test: `DeviceShelfRow`/`DeviceDetail` composable state — given `connected = true`, the rendered provenance/title string contains "Connected"; given `connected = false`, it's absent.
+- Copy audit: the connected-state string matches ui-ux §6.5's wording verbatim.
+**Dependencies:** CAL-07, CAL-08.
+
+### CFX-04 · Sheet lifecycle + first-contact-gate mutual exclusion — correctness
+**Description:** `showCalibration`/`showDeviceReview` (`SessionScreen.kt:122-127`) are composable-local `remember` state nothing in `SessionViewModel` can close, and both sheets are rendered as siblings of the phase `Crossfade` (`:138-244`) rather than gated by it — so a calibration sheet stays open and interactive over "Lost the room" (`PhaseGroup.LOST`) or a concierge gate (`PhaseGroup.CONCIERGE`). Separately, the gate sheet (`state.firstContactGate?.let { ... }`, `:238-244`) and the calibration sheet (`if (showCalibration || showDeviceReview)`, `:182`) are independent conditions in the same `Box`, so both `ModalBottomSheet`s can be eligible and rendered at once today. Fix per tech-req §2.6's "Sheet lifetime & precedence": (1) close the calibration/review sheet whenever the observed `PhaseGroup` leaves `ACTIVE` for `LOST` or `CONCIERGE`; (2) the calibration sheet's open condition must exclude the moment `firstContactGate` is non-null, and the gate must be resolved before the sheet is allowed to open — gate wins per the defined precedence.
+**Acceptance criteria:**
+- State-driven test: given `showCalibration = true` and a scripted `state.phase` transition into `SessionPhase.LOST`/`NEEDS_SPOTIFY`/`NEEDS_PREMIUM`/`ERROR`, the calibration sheet's visibility condition evaluates false after the transition — verifiable against a fake `StateFlow<SyncState>` without rendering to a device.
+- State-driven test: given `showCalibration = true` and `state.firstContactGate` becoming non-null, the calibration sheet's visibility condition evaluates false while the gate is showing.
+- State-driven test: given `state.firstContactGate` non-null and a tap that would otherwise open the calibration sheet, the sheet does not become visible until the gate resolves (accept or decline clears `firstContactGate`).
+- Regression: existing sheet open/close flows (CAL-08/CAL-09's tests) continue to pass unmodified.
+- **Needs a device pass** only for visual confirmation that no overlay flicker/double-sheet artifact occurs during the transition itself — the state-machine correctness above is fully JVM-testable.
+**Dependencies:** CAL-08, CAL-09.
+
+### CFX-05 · Calibration entry points reachable outside ACTIVE — correctness
+**Description:** "Devices" and "Calibrate" (`SessionScreen.kt:503-514`) live in `ActiveContent`, rendered only for `PhaseGroup.ACTIVE` (AIMING/CONVERGING/LOCKED/DRIFTING). `IdleContent` (`:308-335`) offers only Join and Connect Spotify — a device cannot be calibrated before joining a party, and calibrations cannot be reviewed without an active session. Per tech-req §2.6's "Entry points" amendment and ui-ux §6.5's empty-state copy (written for exactly this moment — "Play something through a speaker or headphones and JoinTheParty will get to know it"), this is a design goal the shipped `IdleContent` doesn't support. Fix: add the same quiet entry point to `IdleContent`, wired to the same `onOpenDeviceShelf`/`showDeviceReview` mechanism `ActiveContent` already uses.
+**Acceptance criteria:**
+- Composable-wiring test: `IdleContent` (or `SessionScreen` in the `IDLE` phase group) exposes a tappable element wired to `onOpenDeviceShelf`, verified by invoking the click handler and asserting `onOpenDeviceShelf` fires — same style as the existing `onJoinTap`/`onConnectSpotify` wiring tests.
+- Regression: `ActiveContent`'s existing "Devices"/"Calibrate" entry points are unchanged.
+- Design review (not JVM-testable, called out explicitly): the IDLE entry point matches the "single quiet entry point" styling (ui-ux §4) rather than introducing a second visual idiom.
+**Dependencies:** CAL-08.
+
+### CFX-06 · Evidence-based first-contact gate copy
+**Description:** `firstContactVariant()` (`SessionViewModel.kt:1019`) maps `WIRED` → headphone copy, everything else → acoustic copy, asserting a route class the app cannot know in advance. Bluetooth speakers get "keeps everyone in sync on this speaker… ten seconds," then the chirp times out at 8 s and asks for fifteen more; a 3.5mm cable into a PA — an ordinary party rig — gets the false claim "Headphones can't be heard by the phone's mic" and is routed away from the acoustic measurement that would work. Per tech-req §2.6 and ui-ux §6.5's corrected copy, the gate collapses to one route-neutral variant that always attempts the acoustic flow (`acceptFirstContactGate()`'s `ACOUSTIC` branch, unconditionally) and relies on the flow's existing chirp-timeout auto-fallback (Method taxonomy) to reach By ear — never branching on `SyncCore.Route` up front. `FirstContactVariant`/`firstContactVariant()` and the `HEADPHONE` branch of `acceptFirstContactGate()` are removed as part of the simplification; `FirstContactGateTest.kt`'s per-variant copy assertions are updated to the single variant.
+**Acceptance criteria:**
+- Copy audit (`FirstContactGateTest.kt`): the gate's title/body/primary/quiet/fine-caption strings are identical regardless of the connected route's `SyncCore.Route` — one constant set, not two.
+- Code inspection: no remaining reference to `SyncCore.Route`/`WIRED` in the gate-copy-selection path (grep-verified, matching CAL-01/07/09's existing "no device-class lookup" audit convention).
+- JVM unit test: `acceptFirstContactGate()` always calls `startCalibration()` (never `startByEarCalibration()` directly), regardless of route class; By ear is reached only via the existing, separately-tested chirp-timeout transition.
+- Regression: `declineFirstContactGate()`'s behavior (writes `ESTIMATED`, staleness-guards the live-engine call) is unchanged.
+**Dependencies:** CAL-09.
+
+### CFX-07 · Surface `beginCalibration()` failure
+**Description:** `startCalibration()` (`SessionViewModel.kt:839`: `if (!engine.beginCalibration()) return`) is a complete silent no-op when the engine refuses to arm calibration — no state transition, no error copy. Tapping "Start calibration" produces nothing, indistinguishable from a broken button. Fix: route this failure into the existing `CalibrationState.Failed` state (the same one chirp-detection failure already uses) instead of returning early, reusing Failed's "Try again"/"Try by ear instead" recovery per ui-ux §6.5's amendment — no new UI state needed.
+**Acceptance criteria:**
+- JVM unit test: with a fake `engine.beginCalibration()` returning `false`, `startCalibration()` transitions `_syncState.value.calibration` to `Failed` (not left unchanged at `Idle`), and `chirp?.play()` is never called.
+- JVM unit test (regression): `engine.beginCalibration()` returning `true` still transitions to `Running` and plays the chirp exactly as before.
+- Copy audit: the Failed-state copy shown for this path is the existing "Couldn't hear the chirp — turn the volume up and try again" / "Try by ear instead" strings — no new string introduced.
+**Dependencies:** none.
+
+### CFX-08 · Consistent sibling-banner dismissal
+**Description:** The drift banner's "Later" is wired to `onBackToShelf` (`CalibrationSheet.kt:126`: `onDismissBanner = onBackToShelf`), navigating the pane back to the device shelf, while trim promotion's "Keep as is" (`SessionViewModel.declineTrimPromotion`, `~:1200`) dismisses its banner in place on the same Device-detail pane. The two pills are visually identical siblings (same position, same weight, same pane) with different behavior underneath. Fix per ui-ux §6.5's amendment: both dismiss in place — change `CalibrationSheet`'s drift-banner wiring to call a dismiss-in-place handler (matching trim promotion's shape) instead of `onBackToShelf`.
+**Acceptance criteria:**
+- Unit test: tapping the drift banner's "Later" leaves `deviceReview` on the same `DeviceReviewPane.Detail` (profile unchanged) with the drift banner cleared — not `DeviceReviewPane.Shelf`.
+- Unit test (regression): trim promotion's "Keep as is" continues to dismiss in place exactly as today.
+- Code inspection: `CalibrationSheet.kt`'s drift banner no longer references `onBackToShelf` for its dismiss action.
+**Dependencies:** CAL-08, CAL-10.
+
+### CFX-09 · Deterministic shelf order, connected device first
+**Description:** `NudgeStore.allCalibrationProfiles()` (`NudgeStore.kt:125-133`) maps `prefs.asMap().entries` directly with no sort, so shelf row order follows `DataStore`'s internal map iteration — unordered and not guaranteed stable across writes — and the connected device isn't prioritized. Per tech-req §2.6's "Shelf ordering" (split across two layers, since the store itself has no notion of "connected"): `allCalibrationProfiles()` sorts by `updatedAtMs` descending, giving every caller a stable base order; `SessionViewModel.openDeviceShelf()`, which knows `connectedRouteId`, then moves the connected device's profile (if present) to the front of that already-sorted list before exposing it to the shelf.
+**Acceptance criteria:**
+- JVM unit test (`NudgeStore`'s test file): given N stored profiles with distinct `updatedAtMs`, `allCalibrationProfiles()` returns them ordered by `updatedAtMs` descending.
+- JVM unit test: calling `allCalibrationProfiles()` twice with no intervening writes returns the same order both times (determinism, not incidental to map iteration).
+- JVM unit test (`SessionViewModelTest.kt`): `openDeviceShelf()` with a `connectedRouteId` matching one of the stored profiles places that profile first in `state.deviceReview`'s list, with the remaining profiles in the store's `updatedAtMs`-descending order behind it.
+- JVM unit test: no stored profile matches `connectedRouteId` (e.g. a brand-new, still-unknown route is active) → order falls back to plain `updatedAtMs` descending with no crash.
+**Dependencies:** CAL-04, CAL-08.
+
+---
+
 ## Dependency graph (summary)
 
 ```
@@ -483,6 +582,16 @@ CAL-02 ─▶ CAL-03 ─▶ CAL-04 ─┬─▶ CAL-08
                              └─▶ CAL-10
 CAL-01 ─▶ CAL-07
 CAL-05 ─▶ CAL-06
+
+CAL-04, CAL-09        ─▶ CFX-01   (route-attribution + accept-gate staleness fix)
+CAL-08                ─▶ CFX-02   (recalibrate / empty-state targeting fix)
+CAL-07, CAL-08        ─▶ CFX-03   (caliper a11y + connected-state non-colour fix)
+CAL-08, CAL-09        ─▶ CFX-04   (sheet lifecycle + gate mutual exclusion)
+CAL-08                ─▶ CFX-05   (entry points outside ACTIVE)
+CAL-09                ─▶ CFX-06   (evidence-based gate copy)
+(none)                ─▶ CFX-07   (surface beginCalibration() failure)
+CAL-08, CAL-10        ─▶ CFX-08   (consistent sibling-banner dismissal)
+CAL-04, CAL-08        ─▶ CFX-09   (deterministic shelf order, connected first)
 ```
 
 ## Critical path to MVP-on-device (INT-01, iOS)

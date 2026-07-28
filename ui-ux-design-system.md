@@ -207,7 +207,9 @@ Errors app-wide follow the same voice: state what happened, state the fix, no ap
 
 ### 6.5 Calibration — provenance, the caliper scale, and the quiet entry point
 
-Reached only from the single quiet entry point behind Settings/calibration/A-B (§4) — never surfaced on the session screen itself. Three provenance classes feed one shared visual language: the caliper scale, used to browse (device shelf), inspect (device detail), and — for By ear — dial in a value (tone-match, below). One signature element carries the whole feature, deliberately: §1's thesis is "a precision instrument you happen to hold," and a caliper *is* that instrument, literally rather than decoratively. No other visual device is introduced anywhere in this section.
+Reached only from the single quiet entry point behind Settings/calibration/A-B (§4) — never surfaced on the session screen itself. **That entry point must exist outside an active session too**, not only inside one: calibrating a device before joining a party is an explicit goal (the empty state, below, is written for exactly that moment), and reviewing known devices without a session running is equally legitimate. "Single quiet entry point" constrains *how many* there are, not which app states it's present in. Three provenance classes feed one shared visual language: the caliper scale, used to browse (device shelf), inspect (device detail), and — for By ear — dial in a value (tone-match, below). One signature element carries the whole feature, deliberately: §1's thesis is "a precision instrument you happen to hold," and a caliper *is* that instrument, literally rather than decoratively. No other visual device is introduced anywhere in this section.
+
+**Sheet lifetime.** The sheet that hosts shelf/detail/guided-calibration is owned by session state, not by state local to the session screen that nothing else can close (tech-req §2.6). If the session's phase leaves the active group for "Lost the room…" or a concierge gate (Premium/Spotify) while this sheet is open, the sheet closes automatically rather than staying open and interactive over that state. It is also mutually exclusive with the first-contact gate sheet (below) — the two must never be on screen together; see tech-req §2.6 for precedence.
 
 **Provenance — three labels, and why they must never render identically**
 
@@ -226,7 +228,8 @@ Latency is one scalar, so this is not a scatter plot; it's a single horizontal m
 - **Axis** — a `hairline` stroke spanning the available width. `0` at the left, `DT.Calibration.scaleRangeMs` (600 ms) at the right, both set in `engraved`/`ink3`, matching the meter's `+`/`−` well-edge labels (§6.1). Linear, not logarithmic: this axis compares devices to a fixed ritual and to each other, not error-around-zero like the meter, so it doesn't need the meter's log compression.
 - **Measurement ticks** — one fine vertical line per retained sample, `DT.Calibration.tickStrokeWidthPt` (1pt) wide, in `ink3` at `DT.Calibration.tickAlpha` (0.35) — the same faint-means-uncertain idiom as the meter's confidence alpha. Where samples agree, their ticks land on the same column and compound under ordinary alpha blending — no stacking logic, just several translucent lines drawn on top of each other, darkening toward `ink` exactly where the device agrees with itself. A wide scatter stays faint and spread; a tight cluster reads as a solid dark band. No number, badge, or word is needed — spread *is* the confidence.
 - **Retention** — up to `DT.Calibration.maxRetainedSamples` (12) most-recent samples, a ring buffer: a stale outlier from a noisier moment ages out on its own, so the strip always reflects current conditions. This is provenance-agnostic — an acoustic chirp reading and a tone-match result are both just ticks to the caliper (see Trim promotion, below, for the wheel's contribution).
-- **Settled line** — the profile's committed value is a single `DT.Calibration.settledLineStrokeWidthPt` (2pt) hairline drawn over the ticks. Its **color** encodes connection state, not provenance: `brass` for the currently connected device (the one warm accent, §2/§4), `ink2` for every other known device — cold shelf, warm now, exactly one warm line on screen at a time. Its **stroke style** encodes provenance instead: **solid** where the line is backed by real ticks (Measured, By ear), **dashed** where it isn't (Estimated) — the honest tell that this number was never actually taken.
+- **Settled line** — the profile's committed value is a single `DT.Calibration.settledLineStrokeWidthPt` (2pt) hairline drawn over the ticks. Its **color** encodes connection state, not provenance: `brass` for the currently connected device (the one warm accent, §2/§4), `ink2` for every other known device — cold shelf, warm now, exactly one warm line on screen at a time. Its **stroke style** encodes provenance instead: **solid** where the line is backed by real ticks (Measured, By ear), **dashed** where it isn't (Estimated) — the honest tell that this number was never actually taken. **Connection state is never colour-only**, unlike provenance's three redundant tells above: wherever a `brass` line appears, the row/pane also carries a plain-text "Connected" qualifier (shelf: appended to the provenance line, e.g. `MEASURED · measured 2 days ago · Connected`; detail: a small word beneath the device name) — color is a reinforcing signal, not the only one.
+- **Accessibility contract (Input mode).** The caliper is a custom-drawn control with a bespoke drag gesture; as the sole interaction surface it must not be reachable by pointer/touch drag alone. In Input mode it must expose its live value via an accessibility value/state description (in ms) and must support committing a value through accessibility increment/decrement actions — a drag-free path to the same "That's it" commit — because By ear is the *only* calibration path ever offered to a route that can't be heard acoustically (Method taxonomy, tech-req §2.6): a screen-reader user with no drag-free path to a value cannot calibrate that device at all. ReadOut instances (shelf, detail) expose their settled value the same way, read-only, so rows are announced and not merely drawn.
 - **Zero / one / many samples**:
   - *No profile at all* (never seen before the gate ran): no line, no ticks — the row/pane reads "Not calibrated" instead of a provenance word.
   - *Estimated*: the settled line only, dashed, zero ticks.
@@ -238,9 +241,11 @@ Latency is one scalar, so this is not a scatter plot; it's a single horizontal m
 
 One row per known device — name, latency (tabular numerals), provenance, and a compact caliper strip (`DT.Calibration.shelfStripHeightPt`, 20dp — a thumbnail of the detail pane's scale, identical stroke weights, same 0–600 range). Tapping a row opens Device detail.
 
+**Row order is deterministic, not incidental to storage iteration** (tech-req §2.6): the connected device sorts first, then the remaining known devices by most-recently-updated. The shelf must not visibly reshuffle between openings, and the connected device must not require scrolling to find.
+
 ```
  Living room speaker                              204 ms
- MEASURED · measured 2 days ago
+ MEASURED · measured 2 days ago · Connected
  ┈┈┈┈┈┈┈┈┈┈┈┆┆┃┆┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈   ← brass, solid: connected now
 
  AirPods Pro                                       182 ms
@@ -252,11 +257,11 @@ One row per known device — name, latency (tabular numerals), provenance, and a
  ┈┈┈┈┈┈┈┆┈┆┈┆┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈   ← ink2, solid, ticks from repeated tone-match
 ```
 
-Row anatomy, top to bottom: name in `label`/`ink`; value right-aligned on the same baseline, `label`/`ink`, tabular; provenance line — `engraved`/`ink3` word plus a `fine`/`ink3` qualifier ("measured {relative time}" / "not measured yet" / "set by ear, {relative time}"); the strip, full row width, beneath.
+Row anatomy, top to bottom: name in `label`/`ink`; value right-aligned on the same baseline, `label`/`ink`, tabular; provenance line — `engraved`/`ink3` word plus a `fine`/`ink3` qualifier ("measured {relative time}" / "not measured yet" / "set by ear, {relative time}"), with a `· Connected` suffix on the connected device's row only (the text half of the colour-plus-text connection tell, above); the strip, full row width, beneath.
 
 **Empty state** (no known devices yet) — an invitation, not a shrug:
 - Body: *"No devices calibrated yet. Play something through a speaker or headphones and JoinTheParty will get to know it."*
-- Primary: **"Calibrate phone speaker"** — the one device that's always available, so the invitation has somewhere to go immediately.
+- Primary: **"Calibrate phone speaker"** — the one device that's always available, so the invitation has somewhere to go immediately. **This label is a promise the action must keep:** it must genuinely target the phone's built-in speaker route (switching to it first if something else is connected) before starting calibration. If switching output routes from this entry point isn't feasible, the label must instead describe what actually happens (e.g. "Calibrate this device," against whatever route is connected) — it must never read "phone speaker" while quietly calibrating something else.
 
 **Device detail**
 
@@ -272,7 +277,9 @@ Row anatomy, top to bottom: name in `label`/`ink`; value right-aligned on the sa
            [ Calibrate again ]
 ```
 
-Value in `heroMs` + `heroUnit` (§3), always `ink` — never `brass`, even for the connected device: brass is spent once, on the caliper line, not doubled onto the number (a deliberate call to keep "exactly one warm element" unambiguous rather than having two things both plausibly claim it). Full caliper scale beneath at `DT.Calibration.detailScaleHeightPt` (72dp) in a `recess` well, the same carved-in language as the meter (§6.1). Provenance line as on the shelf. One secondary pill, **"Calibrate again"** — secondary, not primary: arriving here isn't itself a call to redo anything.
+Value in `heroMs` + `heroUnit` (§3), always `ink` — never `brass`, even for the connected device: brass is spent once, on the caliper line, not doubled onto the number (a deliberate call to keep "exactly one warm element" unambiguous rather than having two things both plausibly claim it). Full caliper scale beneath at `DT.Calibration.detailScaleHeightPt` (72dp) in a `recess` well, the same carved-in language as the meter (§6.1). Provenance line as on the shelf, with the same `· Connected` suffix when this pane's device is the connected one. One secondary pill, **"Calibrate again"** — secondary, not primary: arriving here isn't itself a call to redo anything.
+
+**"Calibrate again" is disabled when this pane's device isn't the connected one** (tech-req §2.6): recalibration measures the device that's live right now, so viewing a device that currently isn't connected renders the pill disabled with a `fine`/`ink3` line beneath it — *"Reconnect this device to recalibrate it"* — rather than a tappable pill that either does nothing or opens a guided flow titled with whatever device actually is connected.
 
 Two banners can appear above the action in place of the plain provenance line — never both at once, and neither interrupts playback; both live only inside this deliberately-opened pane:
 
@@ -285,6 +292,8 @@ Two banners can appear above the action in place of the plain provenance line �
 - Banner: *"You've nudged this by about −180 ms, three times running. Make that the calibration?"*
 - Primary: **"Use this offset"** · Quiet: **"Keep as is"**
 - On accept: the nudge wheel (§6.2) returns to zero; confirmation in `fine`: *"Folded into the calibration — the wheel's back at zero."* The accepted offset is stored as a By ear tick, same as any tone-match result — the caliper doesn't care how a tick was produced, only whether it agrees with its neighbors.
+
+**Both Quiet actions dismiss in place.** "Later" (Drift) and "Keep as is" (Trim promotion) are visually parallel — same pill, same position, same weight — so they must be behaviorally parallel too: both dismiss the banner and return to the plain provenance line on the *same* Device-detail pane the user is already looking at. Neither navigates back to the shelf; a sibling action that looks identical must not silently do something different underneath.
 
 **Guided calibration**
 
@@ -300,6 +309,8 @@ Extends the existing four-state sheet (Idle / Running / Success / Failed), uncha
 | Failed | "Couldn't hear the chirp — turn the volume up and try again." | Primary **"Try again"** · Quiet **"Try by ear instead"** |
 
 The Quiet exit on Failed is new: By ear is a fallback on *every* route, not just headphones.
+
+**"Start calibration" must never be a dead tap.** If the engine refuses to arm calibration (a bad session state — not a chirp-detection failure, which already has its own Failed row above), Idle must transition to the same Failed state and copy shown above, not stay on Idle with no visible change: a user who taps a button and sees nothing happen cannot distinguish "working" from "broken." Reuse Failed's existing "Try again" / "Try by ear instead" recovery — no new state is needed, only routing this failure into the one that already exists.
 
 *By ear — tone-match* (the only headphone flow; also reachable from any acoustic Failed state). Interaction is **adjust-until-aligned**, not tap-along-to-a-beat: tapping measures the user's own reaction time stacked on top of the audio latency, which is a systematic bias in one direction; judging perceptual alignment isn't.
 
@@ -326,19 +337,18 @@ This is the case §5's motion principle names as welcome: transitional, user-cau
 
 Shown once, before playback, when an unknown device becomes the active output. A guided prompt, not a wall — it always offers a way out that doesn't read as failure.
 
-*Acoustic-capable device (phone speaker, Bluetooth speaker):*
+**Corrected to a single, route-neutral variant** (tech-req §2.6): the shipped copy branched on route class — wired got headphone copy, everything else got acoustic copy — which asserts something a route class cannot know. A Bluetooth speaker got told the chirp "keeps everyone in sync on this speaker," then the chirp timed out and asked for fifteen more seconds by ear; a 3.5mm cable into a PA — an ordinary party rig — got told "Headphones can't be heard by the phone's mic," which is false for that rig, and was routed straight past the acoustic measurement that would have worked. The gate cannot know acoustic-capability in advance; only running the chirp can tell it. So there is one variant, for every route:
+
 - Title: *"New here: {device name}"*
-- Body: *"A quick calibration keeps everyone in sync on this speaker. Takes about ten seconds."*
-- Primary: **"Calibrate now"** → guided acoustic flow.
+- Body: *"A quick calibration keeps everyone in sync. Takes about ten seconds."*
+- Primary: **"Calibrate now"** → attempts the guided acoustic flow, unconditionally, per the Method taxonomy's existing no-device-class-lookup rule (tech-req §2.6). The flow's own 8 s chirp-detection timeout — not this gate — decides whether it auto-falls to By ear; the gate never pre-announces which one is coming.
 - Quiet: **"Not now"** — fine caption beneath: *"We'll use a generic default until you do."*
 
-*Headphone-class device:*
-- Title: *"New here: {device name}"*
-- Body: *"Headphones can't be heard by the phone's mic — so you're the instrument here. We'll play a tone and you match it by ear. Takes about fifteen seconds."*
-- Primary: **"Calibrate by ear"** → guided tone-match flow.
-- Quiet: **"Not now"** — same fine caption.
+The gate itself never says "speaker" or "headphones" — that claim only becomes true once the chirp succeeds or times out, and by then the guided flow (Idle/Running/Success/Failed, above) already carries the correct copy for what actually happened. The old "Calibrate by ear" primary (headphone variant) is retired along with the route-class branch: every acceptance now enters the same acoustic Idle state, and a route that can't be heard acoustically reaches By ear via the existing chirp-timeout fallback instead of skipping straight there.
 
-Declining either applies `Estimated`, described honestly rather than as a computed guess: the provenance qualifier reads **"not measured yet"** on both the shelf and the detail pane, never "estimated from…" anything. Nothing is inferred automatically anywhere in this system — Estimated is a flat placeholder, and the copy never implies otherwise.
+Declining applies `Estimated`, described honestly rather than as a computed guess: the provenance qualifier reads **"not measured yet"** on both the shelf and the detail pane, never "estimated from…" anything. Nothing is inferred automatically anywhere in this system — Estimated is a flat placeholder, and the copy never implies otherwise.
+
+**Precedence with the review sheet.** This gate and the device shelf/detail/guided-calibration sheet (above) must never be shown at once — see "Sheet lifetime," at the top of this section, and tech-req §2.6 for the precedence rule (the gate wins).
 
 **Drift prompt**
 
