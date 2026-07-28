@@ -29,6 +29,12 @@ import com.jointheparty.app.ui.theme.recessedWell
 // ui-ux §6.5 Device detail — banner/action copy verbatim; `internal const`
 // so ProvenanceTest's copy audit diffs against the real strings.
 internal const val DETAIL_RECALIBRATE_LABEL = "Calibrate again"
+// CFX-02 (tech-req §2.6 "Recalibration targeting"): shown beneath a
+// disabled "Calibrate again" — recalibration always measures whatever
+// route is live right now, so viewing a device that ISN'T the connected
+// one can't offer a tappable pill that would either no-op silently or
+// measure the wrong device.
+internal const val DETAIL_RECALIBRATE_DISABLED_REASON = "Reconnect this device to recalibrate it"
 internal const val DRIFT_BANNER_BODY = "This one's drifted from where we measured it. A quick " +
     "recalibration will tighten it back up."
 internal const val DRIFT_BANNER_PRIMARY = "Recalibrate"
@@ -117,21 +123,38 @@ fun DeviceDetail(
             profile.drifted -> {
                 ProvenanceLine(profile, nowMs)
                 Spacer(Modifier.height(DT.Space.grid))
-                DriftBanner(onRecalibrate = onRecalibrate, onLater = onDismissBanner)
+                // CFX-02: the drift banner's "Recalibrate" routes through
+                // the same onRecalibrate as the plain provenance case below
+                // — same disabled/reason treatment when this pane's device
+                // isn't the connected one.
+                DriftBanner(connected = connected, onRecalibrate = onRecalibrate, onLater = onDismissBanner)
             }
             trimPromotion != null -> TrimPromotionBanner(trimPromotion)
             else -> {
                 ProvenanceLine(profile, nowMs)
                 Spacer(Modifier.height(DT.Space.sectionGap))
-                SheetPill(DETAIL_RECALIBRATE_LABEL, primary = false, onTap = onRecalibrate)
+                // CFX-02 (tech-req §2.6): disabled, with a plain-language
+                // reason beneath, whenever this pane's device isn't the
+                // connected route — never a tappable pill that either
+                // no-ops or opens a guided flow titled with some other
+                // device.
+                SheetPill(DETAIL_RECALIBRATE_LABEL, primary = false, enabled = connected, onTap = onRecalibrate)
+                if (!connected) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = DETAIL_RECALIBRATE_DISABLED_REASON,
+                        style = BilletType.fine,
+                        color = DT.Colors.ink3,
+                    )
+                }
             }
         }
     }
 }
 
-/** ui-ux §6.5 Drift banner — copy verbatim. */
+/** ui-ux §6.5 Drift banner — copy verbatim. CFX-02: [connected] mirrors the plain-provenance case's disabled/reason treatment. */
 @Composable
-private fun DriftBanner(onRecalibrate: () -> Unit, onLater: () -> Unit) {
+private fun DriftBanner(connected: Boolean, onRecalibrate: () -> Unit, onLater: () -> Unit) {
     Text(
         text = DRIFT_BANNER_BODY,
         style = BilletType.body,
@@ -139,7 +162,15 @@ private fun DriftBanner(onRecalibrate: () -> Unit, onLater: () -> Unit) {
         textAlign = TextAlign.Center,
     )
     Spacer(Modifier.height(DT.Space.sectionGap))
-    SheetPill(DRIFT_BANNER_PRIMARY, primary = true, onTap = onRecalibrate)
+    SheetPill(DRIFT_BANNER_PRIMARY, primary = true, enabled = connected, onTap = onRecalibrate)
+    if (!connected) {
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = DETAIL_RECALIBRATE_DISABLED_REASON,
+            style = BilletType.fine,
+            color = DT.Colors.ink3,
+        )
+    }
     Spacer(Modifier.height(DT.Space.grid))
     QuietText(DRIFT_BANNER_QUIET, onTap = onLater)
 }

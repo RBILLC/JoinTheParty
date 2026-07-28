@@ -640,7 +640,10 @@ class SessionViewModelTest {
         advanceUntilIdle()
         vm.selectDevice("speaker")
 
-        vm.requestRecalibrate()
+        // CFX-02: the return value is what SessionScreen's wiring uses to
+        // decide whether the guided-calibration pane opens — true here
+        // because a measurement genuinely started.
+        assertTrue(vm.requestRecalibrate())
 
         assertEquals(DeviceReviewPane.Hidden, vm.syncState.value.deviceReview)
         assertEquals(CalibrationState.Running, vm.syncState.value.calibration)
@@ -660,7 +663,9 @@ class SessionViewModelTest {
         advanceUntilIdle()
         vm.selectDevice("bluetooth:AirPods Pro")
 
-        vm.requestRecalibrate()
+        // CFX-02: false — SessionScreen's wiring must NOT open the
+        // guided-calibration pane off this, since nothing started.
+        assertFalse(vm.requestRecalibrate())
 
         assertEquals(DeviceReviewPane.Hidden, vm.syncState.value.deviceReview)
         // No measurement was started against the wrong device.
@@ -946,6 +951,154 @@ class SessionViewModelTest {
         vm.selectDevice("speaker", nowMs = declinedAtMs + 8L * 86_400_000L)
         advanceUntilIdle()
         assertEquals(-180, (vm.syncState.value.deviceReview as DeviceReviewPane.Detail).trimPromotionMedianMs)
+    }
+
+    // ---- CFX-01: route attribution at calibration completion ---------------
+
+    @Test
+    fun chirpResultAfterRouteChangeWritesNoProfileAndSurfacesCancelled() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore().apply {
+            // Route B is already known so onRouteChanged("B") doesn't raise
+            // a first-contact gate that would otherwise complicate the
+            // assertions below — this test is purely about the calibration
+            // result, not the gate.
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 150)
+        }
+        val vm = viewModel(engine, nudgeStore)
+        vm.onRouteChanged("bluetooth:Route A", "Route A", SyncCore.Route.BLUETOOTH)
+        advanceUntilIdle()
+
+        vm.startCalibration() // captures route A
+        assertEquals(1, engine.calibrationBegun)
+        assertEquals(CalibrationState.Running, vm.syncState.value.calibration)
+
+        // The route changes to B WHILE the chirp is armed-and-playing —
+        // this must invalidate the in-flight measurement immediately.
+        vm.onRouteChanged("speaker", null, SyncCore.Route.SPEAKER)
+        advanceUntilIdle()
+        assertEquals(1, engine.calibrationCancelled)
+        assertEquals(CalibrationState.Cancelled, vm.syncState.value.calibration)
+
+        // The (now-stale) result finally lands.
+        engine.emit(SyncCore.Event.CalibrationResult(latencyMs = 182, valid = true))
+        advanceUntilIdle()
+
+        // No profile written for EITHER route — B's pre-existing profile is
+        // untouched, and A never had one to begin with.
+        assertNull(nudgeStore.calibrationProfiles["bluetooth:Route A"])
+        assertEquals(150, nudgeStore.calibrationProfiles["speaker"]?.latencyMs)
+        assertEquals(CalibrationState.Cancelled, vm.syncState.value.calibration)
+        // Never applied to the live engine either.
+        assertTrue(engine.routeCalls.none { it.second == 182 })
+    }
+
+    @Test
+    fun byEarCommitAfterRouteChangeWritesNoProfile() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore()
+        val tonePlayer = FakeTonePlayer()
+        val vm = viewModel(engine, nudgeStore, tonePlayer)
+        vm.onRouteChanged("bluetooth:Route A", "Route A", SyncCore.Route.BLUETOOTH)
+        advanceUntilIdle()
+        vm.tryByEarInstead()
+        vm.startByEarCalibration() // captures route A
+        assertEquals(CalibrationState.ByEarRunning, vm.syncState.value.calibration)
+
+        // The route changes to B mid-ByEarRunning — the proactive
+        // invalidation stops the tone immediately.
+        vm.onRouteChanged("wired", null, SyncCore.Route.WIRED)
+        advanceUntilIdle()
+        assertEquals(1, tonePlayer.stopCount)
+        assertEquals(CalibrationState.Cancelled, vm.syncState.value.calibration)
+
+        // "That's it" arrives after — the value it carries must never land.
+        // commitByEar's own unconditional tonePlayer.stop() is harmless
+        // (the tone is already stopped).
+        vm.commitByEar(214)
+        advanceUntilIdle()
+
+        assertEquals(2, tonePlayer.stopCount)
+        assertNull(nudgeStore.calibrationProfiles["bluetooth:Route A"])
+        assertNull(nudgeStore.calibrationProfiles["wired"])
+        assertTrue(engine.routeCalls.none { it.second == 214 })
+    }
+
+    @Test
+    fun chirpResultWithNoInterveningRouteChangeStillWritesTheMeasuredProfile() = runTest(testDispatcher) {
+        // Regression (CAL-04): the unchanged-route path must still write
+        // exactly as before CFX-01.
+        val engine = FakeSyncEngine()
+        val nudgeStore = FakeNudgeStore()
+        val vm = viewModel(engine, nudgeStore)
+        vm.onRouteChanged("bluetooth:AirPods Pro", "AirPods Pro", SyncCore.Route.BLUETOOTH)
+        advanceUntilIdle()
+
+        vm.startCalibration()
+        engine.emit(SyncCore.Event.CalibrationResult(latencyMs = 182, valid = true))
+        advanceUntilIdle()
+
+        assertEquals(CalibrationState.Success(182), vm.syncState.value.calibration)
+        assertEquals(182, nudgeStore.calibrationProfiles["bluetooth:AirPods Pro"]?.latencyMs)
+        assertEquals(CalibrationProfile.Method.MEASURED, nudgeStore.calibrationProfiles["bluetooth:AirPods Pro"]?.method)
+    }
+
+    @Test
+    fun acceptingAKnownGoodGateStillStartsCalibrationRegressionAfterCFX01() = runTest(testDispatcher) {
+        // Regression: the staleness guard must not affect the ordinary
+        // (unchanged-route) accept path.
+        val engine = FakeSyncEngine()
+        val vm = viewModel(engine)
+        vm.onRouteChanged("speaker", null, SyncCore.Route.SPEAKER)
+        advanceUntilIdle()
+
+        vm.acceptFirstContactGate()
+
+        assertNull(vm.syncState.value.firstContactGate)
+        assertEquals(CalibrationState.Running, vm.syncState.value.calibration)
+        assertEquals(1, engine.calibrationBegun)
+    }
+
+    @Test
+    fun acceptFirstContactGateDoesNothingOnceTheGateHasBeenSupersededByARouteChange() = runTest(testDispatcher) {
+        // CFX-01 (tech-req §2.6, symmetric with declineFirstContactGate's
+        // existing guard): by the time the user's tap reaches the
+        // ViewModel, the route the gate named may no longer be current —
+        // acceptFirstContactGate() must never start a measurement against
+        // whatever NOW happens to be connected. onRouteChanged already
+        // clears/replaces a superseded gate as part of its own atomic
+        // state update (routeId and firstContactGate are always written
+        // together), so accepting after that must be a safe no-op — this
+        // pins that outcome down.
+        val engine = FakeSyncEngine()
+        val tonePlayer = FakeTonePlayer()
+        val nudgeStore = FakeNudgeStore().apply {
+            calibrationProfiles["speaker"] = calibrationProfile("speaker", latencyMs = 200)
+        }
+        val vm = viewModel(engine, nudgeStore, tonePlayer)
+        vm.onRouteChanged("bluetooth:AirPods Pro", "AirPods Pro", SyncCore.Route.BLUETOOTH)
+        advanceUntilIdle()
+        assertNotNull(vm.syncState.value.firstContactGate)
+
+        // The route moves on to an already-known device before "Calibrate
+        // now" is tapped.
+        vm.onRouteChanged("speaker", null, SyncCore.Route.SPEAKER)
+        advanceUntilIdle()
+        assertNull(vm.syncState.value.firstContactGate)
+
+        vm.acceptFirstContactGate()
+
+        assertEquals(0, engine.calibrationBegun)
+        assertEquals(0, tonePlayer.startCount)
+        assertNull(nudgeStore.calibrationProfiles["bluetooth:AirPods Pro"])
+    }
+
+    // ---- CFX-02: recalibrate / empty-state targeting -----------------------
+
+    @Test
+    fun shouldOpenGuidedCalibrationPaneReflectsWhetherRequestRecalibrateStartedSomething() {
+        assertTrue(shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest { true })
+        assertFalse(shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest { false })
     }
 
     private suspend fun TestScope.driveToLocked(vm: SessionViewModel, engine: FakeSyncEngine) {

@@ -212,6 +212,18 @@ sealed interface CalibrationState {
     data class Success(val latencyMs: Int) : CalibrationState
     data object Failed : CalibrationState
 
+    // CFX-01 (tech-req §2.6 "Route attribution"): the connected route
+    // changed while a chirp was armed-and-playing or a tone-match was
+    // Running. The in-flight measurement is invalidated, not relabelled
+    // against the new route — this is a distinct terminal from [Idle] so
+    // the sheet can name what happened ("Device changed — calibration
+    // cancelled.") instead of silently resetting, which the spec calls
+    // out as reading like a stuck button. [CalibrationSheet] offers
+    // "Start calibration" from here, which (re-)starts against whatever
+    // route is now connected — the sheet is already re-scoped to it by
+    // the time this state is visible.
+    data object Cancelled : CalibrationState
+
     // CAL-07: tone-match (by ear). Reached automatically whenever the
     // chirp's 8 s arm timeout elapses with no detection — that's the
     // existing [Failed] state above (SyncCore.Event.CalibrationResult's
@@ -716,6 +728,7 @@ class SessionViewModel(
             samplingAttempts = 0
             autoAdvanceHandled = null
             endOfTrackJob?.cancel()
+            capturedCalibrationRoute = null // CFX-01
             refereePendingRouteId = null
             refereePendingResidualsMs.clear()
             _syncState.update {
@@ -783,6 +796,10 @@ class SessionViewModel(
 
     /** Route reconnect: load persisted trim + command-latency prior, apply both. */
     fun onRouteChanged(routeId: String, routeName: String?, route: SyncCore.Route) {
+        // CFX-01: a route change invalidates any calibration/tone-match
+        // measurement captured against the PREVIOUS route — see
+        // invalidateInFlightCalibrationIfRouteChanged's doc comment.
+        invalidateInFlightCalibrationIfRouteChanged(routeId)
         // CAL-04: a fresh route also starts a fresh referee agreement
         // window — residuals accumulated against the PREVIOUS route must
         // never be attributed to this one.
@@ -833,12 +850,66 @@ class SessionViewModel(
     // ---- Calibration (INT-03) ---------------------------------------------
 
     /**
+     * CFX-01 (tech-req §2.6 "Route attribution — captured at measurement
+     * start, not completion"): the route identity a chirp or tone-match
+     * measurement is running against. Snapshotted by [captureCalibrationRoute]
+     * when the measurement starts ([startCalibration]/[startByEarCalibration]),
+     * held for its duration, and consumed by [onCalibrationResult]/
+     * [commitByEar] at completion — those functions write against THIS,
+     * never a re-read of [SyncState.routeId]. Null whenever nothing is in
+     * flight; cleared on every exit path (cancel, dismiss, completion,
+     * session reset) so a stale snapshot can never survive into the next
+     * measurement.
+     */
+    private data class CapturedCalibrationRoute(
+        val routeId: String,
+        val routeName: String?,
+        val routeClass: SyncCore.Route,
+    )
+
+    private var capturedCalibrationRoute: CapturedCalibrationRoute? = null
+
+    private fun captureCalibrationRoute() {
+        capturedCalibrationRoute = CapturedCalibrationRoute(
+            routeId = _syncState.value.routeId,
+            routeName = _syncState.value.routeName,
+            routeClass = currentRoute(),
+        )
+    }
+
+    /**
+     * CFX-01: called from [onRouteChanged] on every route change. A route
+     * change observed while a measurement is in flight invalidates it
+     * outright (tech-req §2.6) — same effect as [cancelCalibration]/
+     * [cancelByEarCalibration], but landing on [CalibrationState.Cancelled]
+     * instead of [CalibrationState.Idle]/[CalibrationState.ByEarIdle] so the
+     * sheet can name what happened. A no-op whenever nothing is in flight,
+     * or the "new" route is the same one the in-flight measurement already
+     * captured (e.g. a redundant reconnect callback for the same device).
+     */
+    private fun invalidateInFlightCalibrationIfRouteChanged(newRouteId: String) {
+        val captured = capturedCalibrationRoute ?: return
+        if (captured.routeId == newRouteId) return
+        when (_syncState.value.calibration) {
+            CalibrationState.Running -> engine.cancelCalibration()
+            CalibrationState.ByEarRunning -> tonePlayer?.stop()
+            else -> Unit // stale snapshot with nothing actually running; just clear it below
+        }
+        capturedCalibrationRoute = null
+        _syncState.update { it.copy(calibration = CalibrationState.Cancelled) }
+    }
+
+    /**
      * Arms the engine's chirp detector, then plays the calibration chirp
      * through the active output route.
      */
     fun startCalibration() {
         if (_syncState.value.calibration == CalibrationState.Running) return
         if (!engine.beginCalibration()) return
+        // CFX-01: snapshot the route NOW, at measurement start — completion
+        // (onCalibrationResult) writes against this snapshot, never a
+        // re-read of the live route.
+        captureCalibrationRoute()
         // INT-03b: begin arms the detector (t0 = capture-now), THEN the
         // chirp is rendered through the active output route — the measured
         // delta is exactly the route's output-chain latency.
@@ -859,6 +930,7 @@ class SessionViewModel(
 
     fun cancelCalibration() {
         engine.cancelCalibration()
+        capturedCalibrationRoute = null // CFX-01: cancelling clears the captured route
         _syncState.update { it.copy(calibration = CalibrationState.Idle) }
     }
 
@@ -871,6 +943,7 @@ class SessionViewModel(
      */
     fun acknowledgeCalibration() {
         tonePlayer?.stop()
+        capturedCalibrationRoute = null // CFX-01: dismissing clears the captured route
         _syncState.update { it.copy(calibration = CalibrationState.Idle) }
     }
 
@@ -903,6 +976,10 @@ class SessionViewModel(
      */
     fun startByEarCalibration() {
         if (_syncState.value.calibration == CalibrationState.ByEarRunning) return
+        // CFX-01: snapshot the route NOW, at measurement start — completion
+        // (commitByEar) writes against this snapshot, never a re-read of
+        // the live route.
+        captureCalibrationRoute()
         tonePlayer?.start()
         _syncState.update { it.copy(calibration = CalibrationState.ByEarRunning) }
     }
@@ -910,6 +987,7 @@ class SessionViewModel(
     /** Quiet "Cancel" on Running: stop the tone, back to By-ear Idle. */
     fun cancelByEarCalibration() {
         tonePlayer?.stop()
+        capturedCalibrationRoute = null // CFX-01: cancelling clears the captured route
         _syncState.update { it.copy(calibration = CalibrationState.ByEarIdle) }
     }
 
@@ -923,17 +1001,28 @@ class SessionViewModel(
      */
     fun commitByEar(latencyMs: Int) {
         tonePlayer?.stop()
-        val routeId = _syncState.value.routeId
-        val routeName = _syncState.value.routeName
-        val routeClass = currentRoute()
+        // CFX-01: consume the snapshot captured at startByEarCalibration()
+        // — never re-read the live route here. A null/mismatched snapshot
+        // means the route moved on since the tone-match started (normally
+        // already caught by invalidateInFlightCalibrationIfRouteChanged,
+        // which would have landed on Cancelled already; this is the
+        // completion-time backstop for the race where the commit was
+        // already in flight). Either way: discard, no profile write, no
+        // engine apply.
+        val captured = capturedCalibrationRoute
+        capturedCalibrationRoute = null
+        if (captured == null || captured.routeId != _syncState.value.routeId) {
+            _syncState.update { it.copy(calibration = CalibrationState.Cancelled) }
+            return
+        }
         _syncState.update { it.copy(calibration = CalibrationState.ByEarSuccess(latencyMs)) }
         scope.launch(dispatcher) {
-            val existing = nudgeStore.calibrationProfileFor(routeId)
+            val existing = nudgeStore.calibrationProfileFor(captured.routeId)
             val now = System.currentTimeMillis()
             val profile = CalibrationProfile(
-                routeId = routeId,
-                routeClass = routeClass.name,
-                deviceName = routeName ?: routeId,
+                routeId = captured.routeId,
+                routeClass = captured.routeClass.name,
+                deviceName = captured.routeName ?: captured.routeId,
                 method = CalibrationProfile.Method.BY_EAR,
                 latencyMs = latencyMs,
                 confidence = BY_EAR_CALIBRATION_CONFIDENCE,
@@ -946,14 +1035,23 @@ class SessionViewModel(
             )
             nudgeStore.saveCalibrationProfile(profile)
         }
-        engine.setOutputRoute(routeClass, latencyMs)
+        engine.setOutputRoute(captured.routeClass, latencyMs)
     }
 
     private fun onCalibrationResult(event: SyncCore.Event.CalibrationResult) {
+        // CFX-01: consume the snapshot captured at startCalibration() —
+        // never re-read the live route here. See commitByEar's matching
+        // comment for why both the proactive (onRouteChanged) and this
+        // completion-time check exist together.
+        val captured = capturedCalibrationRoute
+        capturedCalibrationRoute = null
+        if (captured == null || captured.routeId != _syncState.value.routeId) {
+            if (_syncState.value.calibration != CalibrationState.Cancelled) {
+                _syncState.update { it.copy(calibration = CalibrationState.Cancelled) }
+            }
+            return
+        }
         if (event.valid) {
-            val routeId = _syncState.value.routeId
-            val routeName = _syncState.value.routeName
-            val routeClass = currentRoute()
             _syncState.update {
                 it.copy(calibration = CalibrationState.Success(event.latencyMs))
             }
@@ -965,12 +1063,12 @@ class SessionViewModel(
                 // an existing profile's creation time / referee history
                 // across re-calibration; a fresh chirp result supersedes
                 // any prior drift flag.
-                val existing = nudgeStore.calibrationProfileFor(routeId)
+                val existing = nudgeStore.calibrationProfileFor(captured.routeId)
                 val now = System.currentTimeMillis()
                 val profile = CalibrationProfile(
-                    routeId = routeId,
-                    routeClass = routeClass.name,
-                    deviceName = routeName ?: routeId,
+                    routeId = captured.routeId,
+                    routeClass = captured.routeClass.name,
+                    deviceName = captured.routeName ?: captured.routeId,
                     method = CalibrationProfile.Method.MEASURED,
                     latencyMs = event.latencyMs,
                     confidence = MEASURED_CALIBRATION_CONFIDENCE,
@@ -985,7 +1083,7 @@ class SessionViewModel(
                 // sc_set_output_route on every reconnect (onRouteChanged).
                 nudgeStore.saveCalibrationProfile(profile)
             }
-            engine.setOutputRoute(routeClass, event.latencyMs)
+            engine.setOutputRoute(captured.routeClass, event.latencyMs)
         } else {
             _syncState.update { it.copy(calibration = CalibrationState.Failed) }
         }
@@ -1023,10 +1121,17 @@ class SessionViewModel(
      * "Calibrate now" / "Calibrate by ear": dismiss the gate and enter
      * whichever guided flow CAL-01/CAL-07 already built. This ticket adds
      * no new calibration mechanism — only the prompt that offers one.
+     *
+     * CFX-01 (tech-req §2.6 "Route attribution"): staleness-guarded the
+     * same way [declineFirstContactGate] already was — a route change
+     * between the gate raising and the user tapping "Calibrate now" must
+     * dismiss the gate as stale rather than starting a measurement against
+     * whatever now-unrelated device happens to be connected.
      */
     fun acceptFirstContactGate() {
         val gate = _syncState.value.firstContactGate ?: return
         _syncState.update { it.copy(firstContactGate = null) }
+        if (gate.routeId != _syncState.value.routeId) return
         when (gate.variant) {
             FirstContactVariant.ACOUSTIC -> startCalibration()
             FirstContactVariant.HEADPHONE -> {
@@ -1223,13 +1328,21 @@ class SessionViewModel(
      * doing nothing on a mismatched routeId (rather than starting a
      * measurement against the wrong device) is the honest choice — CAL-09/
      * CAL-10 own the rest of this seam.
+     *
+     * CFX-02 (tech-req §2.6 "Recalibration targeting"): returns whether a
+     * measurement actually started. The caller (SessionScreen's
+     * `onRequestRecalibrate` wiring) uses this to decide whether to swap
+     * the sheet into the guided-calibration pane — the bug this fixes is
+     * that wiring swapping in UNCONDITIONALLY, which showed a guided flow
+     * titled with whatever device happened to be connected even when this
+     * function silently declined to touch it.
      */
-    fun requestRecalibrate() {
-        val detail = _syncState.value.deviceReview as? DeviceReviewPane.Detail ?: return
+    fun requestRecalibrate(): Boolean {
+        val detail = _syncState.value.deviceReview as? DeviceReviewPane.Detail ?: return false
         dismissDeviceReview()
-        if (detail.profile.routeId == _syncState.value.routeId) {
-            startCalibration()
-        }
+        if (detail.profile.routeId != _syncState.value.routeId) return false
+        startCalibration()
+        return true
     }
 
     // ---- Acoustic referee (CAL-03/CAL-04) ----------------------------------

@@ -109,7 +109,13 @@ fun SessionScreen(
     onSelectDevice: (String) -> Unit = {},
     onBackToDeviceShelf: () -> Unit = {},
     onDismissDeviceReview: () -> Unit = {},
-    onRequestRecalibrate: () -> Unit = {},
+    // CFX-02 (tech-req §2.6 "Recalibration targeting"): mirrors
+    // [com.jointheparty.app.ui.session.SessionViewModel.requestRecalibrate]'s
+    // return — true exactly when a measurement actually started. See
+    // [shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest]'s doc
+    // comment for why the guided-calibration pane's visibility is gated on
+    // this instead of opening unconditionally.
+    onRequestRecalibrate: () -> Boolean = { false },
     // CAL-09: first-contact gate intents (defaults keep previews/simple
     // hosts terse, same convention as the calibration intents above).
     onAcceptFirstContactGate: () -> Unit = {},
@@ -206,21 +212,27 @@ fun SessionScreen(
                 onBackToShelf = onBackToDeviceShelf,
                 onRequestRecalibrate = {
                     // Detail's "Calibrate again": the review pane closes
-                    // itself (the ViewModel sets deviceReview = Hidden),
-                    // but the sheet must stay open to show the guided flow
-                    // that opens in its place.
+                    // itself (the ViewModel sets deviceReview = Hidden).
+                    // CFX-02: the sheet only stays open into the guided
+                    // flow when requestRecalibrate() actually started one
+                    // (the viewed device IS the connected route) — it used
+                    // to swap in unconditionally, showing a guided flow
+                    // titled with whatever device happened to be connected
+                    // even when nothing was started against it.
                     showDeviceReview = false
-                    showCalibration = true
-                    onRequestRecalibrate()
+                    showCalibration = shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest(onRequestRecalibrate)
                 },
                 onCalibratePhoneSpeaker = {
-                    // Empty-state primary (ui-ux §6.5): "the one device
-                    // that's always available." This ticket doesn't own
-                    // route-selection, so it starts guided calibration on
-                    // whatever route is already active rather than forcing
-                    // a switch to the phone's built-in speaker — see
+                    // CFX-02: DEVICE_SHELF_EMPTY_PRIMARY is now labelled
+                    // honestly ("Calibrate this device," not "Calibrate
+                    // phone speaker") precisely because this still starts
+                    // guided calibration on whatever route is already
+                    // active rather than switching to the phone's built-in
+                    // speaker — route-switching is out of scope here (see
                     // SessionViewModel.requestRecalibrate's doc comment for
-                    // the same limitation.
+                    // the matching limitation on "Calibrate again"). Always
+                    // starts something (unlike onRequestRecalibrate above),
+                    // so the pane opens unconditionally.
                     showDeviceReview = false
                     showCalibration = true
                     onDismissDeviceReview()
@@ -244,6 +256,23 @@ fun SessionScreen(
         }
     }
 }
+
+/**
+ * CFX-02 (tech-req §2.6 "Recalibration targeting"): [SessionScreen]'s
+ * "Calibrate again" pane-swap decision, extracted as a plain function so
+ * it's unit-testable without composing anything — this file's sheet/pane
+ * `remember`ed booleans aren't otherwise reachable from a JVM test.
+ * [requestRecalibrate] mirrors [SessionViewModel.requestRecalibrate]'s
+ * return value: true exactly when a measurement actually started. The
+ * guided-calibration pane must open if and only if that's true — CFX-02's
+ * bug was this happening unconditionally, which swapped the sheet into a
+ * guided flow titled with whatever device happened to be connected even
+ * when [SessionViewModel.requestRecalibrate] silently declined (mismatched
+ * routeId) to start anything against it.
+ */
+internal fun shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest(
+    requestRecalibrate: () -> Boolean,
+): Boolean = requestRecalibrate()
 
 /**
  * Field request: the song's current position, quiet fine print under the

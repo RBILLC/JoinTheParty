@@ -64,7 +64,15 @@ fun DeviceShelf(
 /** ui-ux §6.5 empty-state copy — verbatim; `internal const` so [com.jointheparty.app.ui.components.ProvenanceTest]'s copy audit diffs against the real strings, not a duplicate. */
 internal const val DEVICE_SHELF_EMPTY_BODY = "No devices calibrated yet. Play something through a " +
     "speaker or headphones and JoinTheParty will get to know it."
-internal const val DEVICE_SHELF_EMPTY_PRIMARY = "Calibrate phone speaker"
+
+// CFX-02 (tech-req §2.6 "Recalibration targeting"): was "Calibrate phone
+// speaker," which never switched the active route — it started a guided
+// flow on whatever route already happened to be connected, under a label
+// naming a device that might not be it. Route-switching is out of scope
+// (CFX-02's description), so the label is corrected to honestly describe
+// what the action does regardless of which route is currently live —
+// ui-ux §6.5's own prescribed fallback wording for exactly this case.
+internal const val DEVICE_SHELF_EMPTY_PRIMARY = "Calibrate this device"
 
 /** ui-ux §6.5 empty state — "an invitation, not a shrug." Copy verbatim. */
 @Composable

@@ -35,6 +35,15 @@ import kotlinx.coroutines.isActive
 import kotlin.math.roundToInt
 
 /**
+ * CFX-01 (technical-requirements.md §2.6 "Route attribution") — verbatim,
+ * shown when the active route changed out from under an in-flight chirp/
+ * tone-match measurement, invalidating it. `internal const` so a copy-audit
+ * test can string-diff it, same convention as [DETAIL_RECALIBRATE_LABEL] et
+ * al. in `DeviceDetail.kt`.
+ */
+internal const val CALIBRATION_CANCELLED_BODY = "Device changed — calibration cancelled."
+
+/**
  * INT-03: the per-route latency calibration sheet (arch §6.4, ui-ux §6.4
  * error-voice rules: state what happened, state the fix, no apology
  * theater). Billet-styled ModalBottomSheet on the `billet` surface.
@@ -232,6 +241,21 @@ private fun GuidedCalibrationContent(
                     // is a fallback on every route, not just headphones" —
                     // shown unconditionally, no device-class check.
                     QuietText("Try by ear instead", onTap = onTryByEar)
+                }
+
+                // CFX-01: the route changed mid-measurement — the sheet is
+                // already re-scoped to the newly-connected device (routeName
+                // above reflects it), so "Start calibration" here targets
+                // that device fresh, not the one the invalidated attempt
+                // started on.
+                CalibrationState.Cancelled -> {
+                    Text(
+                        CALIBRATION_CANCELLED_BODY,
+                        style = BilletType.body,
+                        color = DT.Colors.ink2,
+                    )
+                    Spacer(Modifier.height(DT.Space.sectionGap))
+                    SheetPill("Start calibration", primary = true, onTap = onStart)
                 }
 
                 // ---- CAL-07: tone-match (by ear) -----------------------

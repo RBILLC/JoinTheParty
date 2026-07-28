@@ -97,7 +97,10 @@ class ProvenanceTest {
                 "or headphones and JoinTheParty will get to know it.",
             DEVICE_SHELF_EMPTY_BODY,
         )
-        assertEquals("Calibrate phone speaker", DEVICE_SHELF_EMPTY_PRIMARY)
+        // CFX-02: relabelled from "Calibrate phone speaker" — this action
+        // never switches the active route, so the label must describe what
+        // it actually calibrates (tech-req §2.6 "Recalibration targeting").
+        assertEquals("Calibrate this device", DEVICE_SHELF_EMPTY_PRIMARY)
     }
 
     // ---- ui-ux §6.5 Device detail: banner copy verbatim --------------------
@@ -126,5 +129,25 @@ class ProvenanceTest {
     @Test
     fun detailRecalibrateLabelMatchesTheDeckVerbatim() {
         assertEquals("Calibrate again", DETAIL_RECALIBRATE_LABEL)
+    }
+
+    // ---- CFX-02: "Recalibration targeting" copy verbatim -------------------
+
+    @Test
+    fun recalibrateDisabledReasonMatchesTheDeckVerbatim() {
+        assertEquals(
+            "Reconnect this device to recalibrate it",
+            DETAIL_RECALIBRATE_DISABLED_REASON,
+        )
+    }
+
+    // ---- CFX-01: "Route attribution" cancelled-measurement copy verbatim --
+
+    @Test
+    fun calibrationCancelledCopyMatchesTheSpecVerbatim() {
+        assertEquals(
+            "Device changed — calibration cancelled.",
+            CALIBRATION_CANCELLED_BODY,
+        )
     }
 }
