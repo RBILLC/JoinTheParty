@@ -72,3 +72,32 @@ suite initially waited out full tracks; the user called it, and the
 protocol should codify the fast loop. The user's ear remains the only
 instrument that catches an out-of-range self-match: keep a human in every
 sync field test.
+
+## Addendum — the repeatability cycle protocol (same day, later)
+
+The user correctly rejected the first wrap-up: one song verified twice is
+not repeatability. Five join→verify→leave cycles followed, each with a
+visually-verified room source, a mic verdict, and the user's ear:
+
+| Cycle | Song | Verdict |
+|---|---|---|
+| 1 | Toto — Africa | **IN SYNC** (ear + mic floor + engine −51 ms, 0 corrections, 33 s to lock) |
+| — | Billy Joel — My Life (earlier, twice) | **IN SYNC** (mic 43–63 ms) |
+| 2 | a-ha — Take On Me (music video) | honest refusal: drift clamped, conf 0.30, never claimed lock against a mismatched edit |
+| 3 | Fleetwood Mac — Dreams | locks in ~35 s, then a CONSTANT ~285 ms echo, 0 corrections — the deadband ceiling |
+| 4 | Michael Jackson — Billie Jean | harmonic churn (one fix read 47.6 s) → honest "Couldn't find the song" |
+| 5 | Billy Joel — Vienna | locks in 33 s, CONSTANT ~300 ms echo (engine 281 / mic 314 / ear ~250 — all three agree) |
+
+**The pattern:** distinct material syncs and stays synced; repetitive
+material defeats single-fix trust; and residuals inside the 350 ms
+deadband stand forever. The deadband-150 experiment (tried live) made
+things worse — eight corrections in 77 s chasing the song's own beat
+comb into an on-beat-but-3-beats-late hole — so the deadband stays and
+the accuracy fix belongs to corroborated, referee-verified correction
+(CTL-02), with the user's harmonic-disambiguation diagnosis
+(ux-notes #14) as the layer that unlocks Billie Jean-class material.
+
+Two more same-day fixes came out of the cycles: the capture ring now
+resets per session epoch (a fresh join had matched the PREVIOUS
+session's song from the ring's stale tail), and Leave-the-party's pause
+was verified working on-device.
