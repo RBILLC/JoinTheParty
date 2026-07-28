@@ -74,6 +74,11 @@ data class TrimPromotionBannerState(
  * trimPromotion], so a state where both are true still renders only the
  * drift banner — satisfying that acceptance criterion regardless of what
  * the caller passes.
+ *
+ * CFX-03 (tech-req §2.6 "Connected-state encoding"): [connected] also feeds
+ * a `· Connected` text qualifier onto [ProvenanceLine] (in both the plain
+ * and drift-banner branches below) — the caliper's `brass` settled line is
+ * never the only connection signal.
  */
 @Composable
 fun DeviceDetail(
@@ -121,7 +126,7 @@ fun DeviceDetail(
             // Drift wins over trim-promotion whenever both happen to be
             // true — see the doc comment above.
             profile.drifted -> {
-                ProvenanceLine(profile, nowMs)
+                ProvenanceLine(profile, nowMs, connected = connected)
                 Spacer(Modifier.height(DT.Space.grid))
                 // CFX-02: the drift banner's "Recalibrate" routes through
                 // the same onRecalibrate as the plain provenance case below
@@ -131,7 +136,7 @@ fun DeviceDetail(
             }
             trimPromotion != null -> TrimPromotionBanner(trimPromotion)
             else -> {
-                ProvenanceLine(profile, nowMs)
+                ProvenanceLine(profile, nowMs, connected = connected)
                 Spacer(Modifier.height(DT.Space.sectionGap))
                 // CFX-02 (tech-req §2.6): disabled, with a plain-language
                 // reason beneath, whenever this pane's device isn't the

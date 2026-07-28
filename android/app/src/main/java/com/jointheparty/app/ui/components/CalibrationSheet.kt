@@ -325,6 +325,13 @@ private fun ToneMatchCaliper(onCommit: (Int) -> Unit) {
     val reducedMotion = isReducedMotionEnabled(context)
 
     val cursorMs = remember { mutableStateOf(DT.Calibration.scaleRangeMs / 2f) }
+    // CFX-03: named for its ORIGINAL trigger (the drag gesture), but the
+    // single flag onCursorChange flips below now also fires from
+    // CaliperScale's accessibility path (progressBarRangeInfo + setProgress,
+    // CaliperScale.kt) — a TalkBack "adjust" action reaches this exact same
+    // state, so "That's it" enables without ever requiring a drag. Kept the
+    // name rather than a broader rename to minimize the diff; the doc
+    // comment carries the correction.
     val hasDragged = remember { mutableStateOf(false) }
     val struck = remember { mutableStateOf(false) }
 

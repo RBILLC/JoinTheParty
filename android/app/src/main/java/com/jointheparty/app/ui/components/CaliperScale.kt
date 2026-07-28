@@ -16,6 +16,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.setProgress
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -144,6 +150,62 @@ fun CaliperScale(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(caliperHeight)
+                // CFX-03 (tech-req §2.6 "CaliperScale accessibility
+                // contract"; ui-ux §6.5 "Accessibility contract (Input
+                // mode)"): the drag gesture below is layered on TOP of this
+                // modifier, so it never shadows the semantics node — a
+                // screen-reader user reaches the same value/commit path
+                // whether or not touch exploration is on.
+                .semantics {
+                    when (mode) {
+                        is CaliperMode.ReadOut -> {
+                            // Deliberately just "what this control is" — the
+                            // device name and provenance word/qualifier are
+                            // the surrounding row's job (ProvenanceLine,
+                            // DeviceShelfRow/DeviceDetail); duplicating them
+                            // here would repeat the same words twice in one
+                            // TalkBack pass over a merged row.
+                            contentDescription = CALIPER_READOUT_CONTENT_DESCRIPTION
+                            stateDescription = caliperReadOutStateDescription(mode.settledValueMs)
+                        }
+                        is CaliperMode.Input -> {
+                            contentDescription = CALIPER_INPUT_CONTENT_DESCRIPTION
+                            stateDescription = caliperInputStateDescription(mode.cursorMs)
+                            // progressBarRangeInfo + setProgress (not a bare
+                            // contentDescription, per NudgeWheel's read-only
+                            // precedent) is the platform's actual
+                            // drag-free path: it's what makes this node
+                            // "Adjustable" to TalkBack, offering an
+                            // increment/decrement gesture that calls
+                            // [setProgress] instead of requiring a drag.
+                            // `steps` quantizes that gesture to
+                            // [CALIPER_ADJUST_STEPS] stops — one call, so the
+                            // system-computed default step can't silently
+                            // drift from [CALIPER_ADJUST_STEP_MS].
+                            progressBarRangeInfo = ProgressBarRangeInfo(
+                                current = mode.cursorMs,
+                                range = 0f..DT.Calibration.scaleRangeMs,
+                                steps = CALIPER_ADJUST_STEPS,
+                            )
+                            setProgress { targetValue ->
+                                // Snapped rather than passed through raw:
+                                // guarantees "exactly one defined step" per
+                                // adjust gesture (CFX-03 acceptance
+                                // criteria) regardless of what raw value the
+                                // accessibility framework computes.
+                                // mode.onCursorChange is the SAME callback
+                                // the drag path uses (below) — it's also
+                                // what CalibrationSheet.kt's ToneMatchCaliper
+                                // reads to flip `hasDragged` (which enables
+                                // "That's it"), so this path reaches the
+                                // exact same commit-enabled state a drag
+                                // would.
+                                mode.onCursorChange(caliperSnapToStep(targetValue))
+                                true
+                            }
+                        }
+                    }
+                }
                 .let { base ->
                     if (mode !is CaliperMode.Input) return@let base
                     base.pointerInput(Unit) {
@@ -255,6 +317,68 @@ private val CALIPER_HEIGHT = 48.dp
 private val TICK_V_INSET = 2.dp
 private val DASH_ON = 6.dp
 private val DASH_OFF = 4.dp
+
+// ---- Accessibility (CFX-03) --------------------------------------------------
+//
+// Plain functions/constants, not inlined into the semantics block above, so
+// a JVM test can exercise the announcement copy and the step arithmetic
+// directly — same convention as Provenance.kt's provenanceLabel/
+// provenanceQualifier ("string-diff audit... testable on the JVM without
+// Compose"). This project has no Robolectric/instrumentation suite (only
+// JVM unit tests), so the semantics attachment itself (does TalkBack
+// actually announce this / invoke this action?) is NOT covered by any
+// automated test here — see the ticket's outstanding "needs a device pass"
+// criterion.
+
+/** ReadOut's contentDescription: names the control, nothing else (see the KDoc at its call site for why device name/provenance are deliberately excluded). */
+const val CALIPER_READOUT_CONTENT_DESCRIPTION = "Calibration scale"
+
+/** Input's contentDescription — distinct wording so a TalkBack user can tell, by ear, whether the node they've landed on is browsing a value or setting one. */
+const val CALIPER_INPUT_CONTENT_DESCRIPTION = "Tone-match calibration scale"
+
+/**
+ * ReadOut's stateDescription (tech-req §2.6): the settled value in ms, or
+ * "Not calibrated" for ui-ux §6.5's "no profile at all" case
+ * ([CaliperMode.ReadOut.settledValueMs] `null`) — the same wording the
+ * caller uses in place of a provenance word, so a screen-reader user and a
+ * sighted user land on the same fact.
+ */
+fun caliperReadOutStateDescription(settledValueMs: Float?): String =
+    if (settledValueMs == null) "Not calibrated" else "${settledValueMs.roundToInt()} ms"
+
+/** Input's stateDescription: the live cursor value, updated on every accepted change (drag or accessibility). */
+fun caliperInputStateDescription(cursorMs: Float): String = "${cursorMs.roundToInt()} ms"
+
+/**
+ * Accessibility adjustment step (tech-req §2.6 / ui-ux §6.5 "Accessibility
+ * contract (Input mode)"): anchored to [DT.Calibration.byEarAccuracyMs] (±30
+ * ms) — the by-ear method's own stated accuracy floor. A finer step would
+ * promise more precision than tone-match ever claims (Success copy: "Good
+ * to about ±30 ms"); a coarser one would make the accessible path less
+ * precise than the sighted drag path, which has no such floor.
+ */
+val CALIPER_ADJUST_STEP_MS: Float = DT.Calibration.byEarAccuracyMs
+
+/**
+ * [ProgressBarRangeInfo.steps]: the number of discrete stops BETWEEN the two
+ * endpoints (`Slider`'s own convention — a range split into `steps + 1`
+ * equal segments). scaleRangeMs (600) / stepMs (30) = 20 segments, so 19
+ * interior stops.
+ */
+private val CALIPER_ADJUST_STEPS: Int =
+    (DT.Calibration.scaleRangeMs / CALIPER_ADJUST_STEP_MS).roundToInt() - 1
+
+/**
+ * Snaps an accessibility-reported target (e.g. TalkBack's Adjust gesture,
+ * via `setProgress`) onto the nearest [CALIPER_ADJUST_STEP_MS] multiple and
+ * clamps into the axis range — guarantees "offset by exactly one defined
+ * step" regardless of whatever raw float the framework computes, and is the
+ * one piece of this contract testable on the JVM as a pure function.
+ */
+fun caliperSnapToStep(targetMs: Float): Float {
+    val stepped = (targetMs / CALIPER_ADJUST_STEP_MS).roundToInt() * CALIPER_ADJUST_STEP_MS
+    return stepped.coerceIn(0f, DT.Calibration.scaleRangeMs)
+}
 
 // ---- Previews ---------------------------------------------------------------
 

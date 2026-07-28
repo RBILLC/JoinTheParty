@@ -150,4 +150,61 @@ class ProvenanceTest {
             CALIBRATION_CANCELLED_BODY,
         )
     }
+
+    // ---- CFX-03: "Connected-state encoding" — connected != colour-only ----
+    // tech-req §2.6 / ui-ux §6.5 "Settled line": "wherever a brass line
+    // appears, the row/pane also carries a plain-text 'Connected' qualifier
+    // ... color is a reinforcing signal, not the only one." Verified here as
+    // a copy/string-diff check, same convention as the rest of this file.
+
+    @Test
+    fun connectedQualifierSuffixMatchesTheDeckVerbatim() {
+        assertEquals("· Connected", CONNECTED_QUALIFIER_SUFFIX)
+    }
+
+    @Test
+    fun measuredQualifierAppendsConnectedSuffixWhenConnectedIsTrue() {
+        val twoDaysMs = 2 * 86_400_000L
+        val nowMs = 10 * 86_400_000L
+        val qualifier = provenanceQualifier(
+            profile(CalibrationProfile.Method.MEASURED, updatedAtMs = nowMs - twoDaysMs),
+            nowMs,
+            connected = true,
+        )
+        // ui-ux §6.5's own worked example, verbatim.
+        assertEquals("measured 2 days ago · Connected", qualifier)
+    }
+
+    @Test
+    fun qualifierOmitsConnectedSuffixByDefaultAndWhenExplicitlyFalse() {
+        val nowMs = 10 * 86_400_000L
+        val profile = profile(CalibrationProfile.Method.ESTIMATED, updatedAtMs = 0L)
+        assertEquals("not measured yet", provenanceQualifier(profile, nowMs))
+        assertEquals("not measured yet", provenanceQualifier(profile, nowMs, connected = false))
+    }
+
+    @Test
+    fun byEarQualifierAppendsConnectedSuffixWhenConnected() {
+        val sixDaysMs = 6 * 86_400_000L
+        val nowMs = 10 * 86_400_000L
+        val qualifier = provenanceQualifier(
+            profile(CalibrationProfile.Method.BY_EAR, updatedAtMs = nowMs - sixDaysMs),
+            nowMs,
+            connected = true,
+        )
+        assertEquals("set by ear, 6 days ago · Connected", qualifier)
+    }
+
+    @Test
+    fun driftedQualifierAlsoAppendsConnectedSuffixWhenConnected() {
+        // The drift banner replaces WHAT HAPPENED, not WHETHER this is the
+        // connected device right now — §6.5's connection-tell rule carries
+        // no drift-state exception.
+        val nowMs = 10 * 86_400_000L
+        val measuredDrifted = profile(CalibrationProfile.Method.MEASURED, updatedAtMs = 0L, drifted = true)
+        assertEquals(
+            "timing's drifted, worth a redo · Connected",
+            provenanceQualifier(measuredDrifted, nowMs, connected = true),
+        )
+    }
 }

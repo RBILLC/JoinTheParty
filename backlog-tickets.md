@@ -46,7 +46,7 @@
 | CAL-10 | ✅ Done — 3 commits within 25 ms of median, above a 30 ms floor; always asks, folds in as BY_EAR and zeroes the wheel; 7-day decline via stored timestamp | `d4bbc4b` |
 | CFX-01 | ⬜ Not started | — |
 | CFX-02 | ⬜ Not started | — |
-| CFX-03 | ⬜ Not started | — |
+| CFX-03 | 🟡 Done — ReadOut/Input semantics (stateDescription + progressBarRangeInfo/setProgress a11y path), `· Connected` text tell shelf+detail; pending: TalkBack/device pass (no instrumentation tests in repo) | — |
 | CFX-04 | ⬜ Not started | — |
 | CFX-05 | ⬜ Not started | — |
 | CFX-06 | ⬜ Not started | — |

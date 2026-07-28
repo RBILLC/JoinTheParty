@@ -11,6 +11,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -106,7 +107,13 @@ private fun DeviceShelfRow(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onTap),
+            .clickable(onClick = onTap)
+            // CFX-03: an explicit merge boundary, not left to clickable's
+            // own default — the row's name/value/provenance/strip Texts
+            // (plus the CaliperScale strip's own semantics, below) collapse
+            // into ONE TalkBack stop per row, not four-plus scattered
+            // fragments a user has to swipe through individually.
+            .semantics(mergeDescendants = true) {},
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -116,7 +123,7 @@ private fun DeviceShelfRow(
             Text("${profile.latencyMs} ms", style = BilletType.label, color = DT.Colors.ink)
         }
         Spacer(Modifier.height(4.dp))
-        ProvenanceLine(profile, nowMs)
+        ProvenanceLine(profile, nowMs, connected = connected)
         Spacer(Modifier.height(DT.Space.grid))
         // The shelf strip is the detail pane's scale drawn shorter — same
         // stroke weights, same 0..scaleRangeMs axis (ui-ux §6.5). Hence
