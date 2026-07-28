@@ -34,7 +34,7 @@
 | CORE-06 | ✅ Done — ±30ms guard (PM-confirmed), seek-refreshed reference, headphone bypass, C-API tested; energy condition deferred to real APM | `b344da8` |
 | INT-04 | 🟡 Route→AEC wiring + UI hint done (unit-tested); 10/10 speaker-mode field trials AC needs real APM + device | `b344da8` |
 | INT-06 | 🟡 06a/06b/06c implemented; **field test 7 passed** FGS start, notification text, Stop action, screen-off + adb-loss survival. Pending: 10-min soak (only ~104 s of music), task-swipe. See docs/field-test-7-int06.md | `729052a` `c29c517` `2f113a9` `1161065` |
-| CAL-01 | 🟡 Code done — chirp now takes Spotify's deep-buffer transport; **headline AC needs the two-phone mic rig** (chirp-reported vs mic-measured) | `5cea89f` |
+| CAL-01 | ✅ **Field-verified 2026-07-28** — cold single press measures 153 ms MEASURED on the phone speaker (deep-buffer range; the fast path would read ~40 ms). Needed two more fixes found on device: the MODE_STREAM start threshold silenced the chirp entirely, and the detector armed on a stale session clock | `5cea89f` `99216e1` `35cef47` |
 | CAL-02 | ✅ Done — shared `dsp/fft` helper, `dsp/lag_window` ported, `lag_analyzer` consumes it (selftest green), new DSP tests | `77144c2` |
 | CAL-03 | ✅ Done — `sc_sample_latency_residual` + `SC_EVT_LATENCY_RESIDUAL`, autocorrelation over the 12 s history, converged-gated, AEC restored on every path, no write to control state | `20ff81e` |
 | CAL-04 | ✅ Done — `CalibrationProfile` JSON record per route (atomic, corrupt reads as absent), shell-side ≥3-window referee aggregation, drift flag | `0bd89c3` |
