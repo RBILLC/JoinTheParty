@@ -53,7 +53,7 @@
 | CFX-07 | ✅ Done — `beginCalibration()==false` lands in Failed instead of a dead tap | `e82a518` |
 | CFX-08 | ✅ Done — drift "Later" dismisses in place, matching "Keep as is" | `e82a518` |
 | CFX-09 | ✅ Done — store sorts by `updatedAtMs`, shell promotes the connected device | `e82a518` |
-| CTL-01 | ⬜ Not started — referee sentinel + active probe per tech-req §2.9 (FT8's headline self-match defect); split CTL-01a/01b below | — |
+| CTL-01 | 🟡 Done — CTL-01a/01b: agreement-starvation sentinel + Wittenmark turn-off trigger + `SC_EVT_ACTIVE_PROBE`/echo/verdict in core, pause-resume-echo in the shell; 8/8 ctest + 129/129 JVM + assembleDebug; pending: the device pass (audible probe + forced self-match on the field rig, per CTL-01b's AC) | `7d0cc28` |
 | CTL-02 | ✅ Done — CTL-02a/02b: persistence gate + residual ring in `CorrectionPolicy` per tech-req §2.7; closed-loop sims reproduce FT8's Vienna (one seek, −50 ms landing) and hold the deadband-150 lesson (0 seeks under scatter); five-cycle field re-verification pending | `5f03d08` |
 | CTL-03 | ✅ Done — CTL-03a/03b: `comb_ratio` in `analyze_window`+CLI (graded path byte-identical), large-correction hold in `CorrectionPolicy`; phantom sim 0 large seeks / genuine-jump sim exactly 1; field re-verification pending | `9237e3a` |
 | Everything else | ⬜ Not started | — |
