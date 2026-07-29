@@ -54,7 +54,7 @@
 | CFX-08 | ✅ Done — drift "Later" dismisses in place, matching "Keep as is" | `e82a518` |
 | CFX-09 | ✅ Done — store sorts by `updatedAtMs`, shell promotes the connected device | `e82a518` |
 | CTL-01 | ⬜ Not started — referee validity collapse while LOCKED as the self-match sentinel (FT8's headline defect; see docs/field-test-8-results.md) | — |
-| CTL-02 | ⬜ Not started — persistence gate + dynamic deadband per tech-req §2.7 (FT8's Vienna/Dreams constant ~300 ms echo); split CTL-02a/02b below | — |
+| CTL-02 | ✅ Done — CTL-02a/02b: persistence gate + residual ring in `CorrectionPolicy` per tech-req §2.7; closed-loop sims reproduce FT8's Vienna (one seek, −50 ms landing) and hold the deadband-150 lesson (0 seeks under scatter); five-cycle field re-verification pending | `5f03d08` |
 | CTL-03 | ⬜ Not started — comb-flatness/ambiguity gate: expose analyze_window's top-K peak-ratio score; corrections >1000 ms need a corroborating second fix or post-seek verification (FT8's 1259 ms single-fix overshoot; spec pass pending) | — |
 | Everything else | ⬜ Not started | — |
 
