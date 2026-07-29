@@ -54,7 +54,8 @@
 | CFX-08 | ✅ Done — drift "Later" dismisses in place, matching "Keep as is" | `e82a518` |
 | CFX-09 | ✅ Done — store sorts by `updatedAtMs`, shell promotes the connected device | `e82a518` |
 | CTL-01 | ⬜ Not started — referee validity collapse while LOCKED as the self-match sentinel (FT8's headline defect; see docs/field-test-8-results.md) | — |
-| CTL-02 | ⬜ Not started — corrections above a size threshold need a corroborating second fix or post-seek verification (FT8's 1259 ms overshoot) | — |
+| CTL-02 | ⬜ Not started — persistence gate + dynamic deadband per tech-req §2.7 (FT8's Vienna/Dreams constant ~300 ms echo); split CTL-02a/02b below | — |
+| CTL-03 | ⬜ Not started — comb-flatness/ambiguity gate: expose analyze_window's top-K peak-ratio score; corrections >1000 ms need a corroborating second fix or post-seek verification (FT8's 1259 ms single-fix overshoot; spec pass pending) | — |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.
@@ -560,6 +561,33 @@ This suite has 83 JVM tests and no instrumentation tests; acceptance criteria be
 
 ---
 
+## Epic 8 — Control loop (CTL)
+
+Field test 8 (docs/field-test-8-results.md) measured three distinct control-loop failure classes in the same session: a self-match sentinel gap (CTL-01), a stable-but-inaccurate residual sitting inside a widened deadband forever (this epic), and a single large uncorroborated correction standing uncorrected (CTL-03). The composite design reconciling event-triggered control, NTP's step/slew discipline, and adaptive playout thresholds into one mechanism lives in docs/research-closed-loop-control.md §5; tech-req §2.7 specs the first of the three mechanisms in full, and that's this epic's scope — CTL-02a (the policy-internal ring + persistence trigger) and CTL-02b (closed-loop proof + the shell comment it unblocks). CTL-01 (self-match sentinel) and CTL-03 (large-correction/comb-ambiguity gate) keep their own rows in the status table above, awaiting their own spec passes — CTL-02's ring/persistence machinery is not a substitute for either and must not be stretched to cover them (tech-req §2.7's scope note). All CTL-02 acceptance criteria below are desktop-ctest-testable — no device pass required to land; a field re-verification (the five-cycle repeatability protocol, field-test-8-results.md's addendum) is listed as the post-landing check, not a landing blocker.
+
+### CTL-02a · Persistence gate + residual ring in `CorrectionPolicy`
+**Description:** Implement tech-req §2.7's mechanism exactly. `CorrectionPolicy` gains a fixed-size ring (default N=8) of `est.error_ms`, appended only from `on_estimate` calls where `est.valid && est.converged` and the policy is not settling — every ring entry is fresh, non-coasted fix evidence. The ring clears on `reset()`, on every emitted seek (a correction changes the operating point — post-seek residuals are a new cluster), and on any non-converged estimate (loss of convergence invalidates the cluster's premise). New `PolicyConfig` fields: `confirm_min_fixes = 3`, `confirm_window_ns = 20 s`, `confirm_agree_ms = 60`, `confirm_floor_ms = 125` — the last a deliberate resolution of RFC 5905's own internal discrepancy (Figure 27's table vs. Appendix A.5.5.6's `STEPT .128`), picked on purpose per §2.7 rather than left ambiguous. Persistence trigger: while converged, when the ring holds ≥ `confirm_min_fixes` samples spanning ≥ `confirm_window_ns`, every sample is within `confirm_agree_ms` of the cluster mean, |mean| exceeds `confirm_floor_ms`, and `est.confidence ≥ min_confidence_to_correct` (existing FT4 guard, unchanged) → emit exactly one correction computed from the cluster mean (not the instantaneous `est.error_ms`) through the existing drift-centered target formula in `on_estimate`, then clear the ring immediately. Corroboration-hungry cadence: while converged with a live above-floor cluster open, fix-request cadence drops from `fix_interval_max_ns` (30 s) to `fix_interval_base_ns` (10 s) — the same constant already used for the non-converged case, reverting once the cluster clears. Core-only, in `CorrectionPolicy`; no C ABI change, no shell change.
+**Acceptance criteria** (all in `core/tests/test_policy.cpp`, existing `CHECK`/`make_est` conventions):
+- Vienna-class unit test: policy configured `deadband_ms=350`; converged estimates with constant ~285 ms error and confidence 0.9 fed at 10 s spacing → NO seek before both `confirm_min_fixes` and `confirm_window_ns` are met, then EXACTLY ONE seek whose target is computed from the cluster mean; ring cleared after (the next estimate does not immediately re-fire during/after settle).
+- Churn-class unit test: converged estimates scattered at beat-comb spread (e.g. alternating +280/−250/+300 ms, all inside 350) → the persistence trigger never fires regardless of how many arrive.
+- Floor test: constant ~60 ms converged residual (configure `deadband_ms=350` so 60 is sub-deadband) → never fires (below `confirm_floor_ms`).
+- Confidence test: Vienna-class cluster but confidence 0.19 → never fires (FT4 guard holds).
+- Clearing tests: a non-converged estimate mid-accumulation clears the ring (subsequent agreeing fixes start over); an instantaneous out-of-deadband seek clears it too.
+- Cadence test: converged + above-floor cluster → `current_fix_interval_ns() == fix_interval_base_ns`; cluster clears → back to `fix_interval_max_ns`.
+- Inertness regression: every existing test in `test_policy.cpp` passes UNMODIFIED (core defaults `deadband_ms=25 < confirm_floor_ms=125` → the mechanism is structurally inert at core defaults, tech-req §2.7).
+**Dependencies:** none.
+
+### CTL-02b · Closed-loop proof + shell comment redirect
+**Description:** Closed-loop simulation evidence in the `test_closed_loop_sawtooth_within_deadband` style (estimator + policy + simulated world), plus the `SessionGraph.kt` `ENGINE_DEADBAND_MS` comment update §2.7's Unchanged paragraph promises — pointing at tech-req §2.7 instead of the bare forward reference to "CTL-02" (`SessionGraph.kt:144-155`), keeping the measured history intact (350 stays; the deadband-150 experiment story stays).
+**Acceptance criteria:**
+- Closed-loop Vienna sim: `deadband_ms=350` on both estimator and policy; world starts with ~285 ms true error and fixes reading it faithfully (small noise) → system converges (declares LOCKED at ~285 residual, reproducing FT8), then the persistence gate fires within ≤90 s of convergence and final true |error| lands under `confirm_floor_ms`; total corrections ≤2.
+- Closed-loop stability sim: same config, fixes scattered ±300 ms alternating around zero → zero persistence corrections over ≥5 min simulated (no churn reintroduced at 350 — the deadband-150 lesson holds).
+- Existing sawtooth sim (`test_closed_loop_sawtooth_within_deadband`) unchanged and green.
+- `SessionGraph.kt`'s comment references tech-req §2.7 and no longer describes the accuracy gap as unaddressed; no functional Kotlin change (comment-only diff verified by `./gradlew.bat :app:testDebugUnitTest` passing untouched).
+**Dependencies:** CTL-02a.
+
+---
+
 ## Dependency graph (summary)
 
 ```
@@ -594,6 +622,8 @@ CAL-09                ─▶ CFX-06   (evidence-based gate copy)
 (none)                ─▶ CFX-07   (surface beginCalibration() failure)
 CAL-08, CAL-10        ─▶ CFX-08   (consistent sibling-banner dismissal)
 CAL-04, CAL-08        ─▶ CFX-09   (deterministic shelf order, connected first)
+
+CTL-02a ─▶ CTL-02b   (Epic 8)
 ```
 
 ## Critical path to MVP-on-device (INT-01, iOS)

@@ -150,9 +150,14 @@ class SessionGraph(context: Context) {
         // the song's own beat periodicity into an on-beat-but-3-beats-late
         // hole. Each correction re-seeds recognition against two copies of
         // the same song, so uncorroborated corrections at tight thresholds
-        // feed themselves. The accuracy gap is real but belongs to CTL-02
-        // (corroborated corrections / post-lock refinement), not to this
-        // constant.
+        // feed themselves. Tech-req §2.7's persistence gate (CTL-02,
+        // landed) closes the accuracy gap this constant creates: entirely
+        // inside CorrectionPolicy (core), a stable, corroborated residual
+        // held across several converged fixes now earns one correction
+        // from the cluster mean through a second, slower gate, even while
+        // sitting inside this 350 ms deadband. This constant is unchanged
+        // by that mechanism — it still gates every ordinary, single-fix
+        // correction exactly as before.
         private const val ENGINE_DEADBAND_MS = 350
     }
 }

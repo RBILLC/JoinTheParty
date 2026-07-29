@@ -14,9 +14,15 @@
 //   - |error| ≥ 2 s → track lost
 //   - fix cadence: 8 s when erroring, 10 s base, stretched to 30 s once
 //     converged; a verification fix shortly after each settle window
+//   - persistence gate (tech-req §2.7, CTL-02): a stable, corroborated
+//     residual cluster — confirm_min_fixes converged fixes spanning
+//     confirm_window_ns, all within confirm_agree_ms of their mean and
+//     above confirm_floor_ms — earns one correction from the cluster mean
+//     even while sitting inside a widened deadband_ms
 #ifndef SYNCCORE_POLICY_H
 #define SYNCCORE_POLICY_H
 
+#include <cstddef>
 #include <cstdint>
 
 #include "estimator/estimator.h"
@@ -54,6 +60,36 @@ struct PolicyConfig {
     uint64_t fix_interval_max_ns = 30'000'000'000ull;
     uint64_t post_settle_verify_ns = 500'000'000ull;  // fix 0.5 s after settle
     uint64_t request_retry_ns = 5'000'000'000ull;     // re-request if unanswered
+
+    // tech-req §2.7 (CTL-02): persistence gate. A shell that widens
+    // deadband_ms past confirm_floor_ms (Android runs 350) can lock LOCKED
+    // onto a stable, corroborated residual the instantaneous deadband will
+    // never touch — field test 8's Vienna/Dreams held ~285-300 ms echoes
+    // for entire cycles, zero corrections. This is a second, slower gate
+    // layered above the instantaneous one, never a replacement for it.
+
+    // Minimum ring occupancy before a cluster of converged fixes can be
+    // judged coherent enough to act on.
+    int confirm_min_fixes = 3;
+    // Minimum span the qualifying ring samples must cover — a handful of
+    // fixes seconds apart is not yet "persistent."
+    uint64_t confirm_window_ns = 20'000'000'000ull;
+    // Max deviation of any ring sample from the cluster mean, sized off the
+    // two FT8 failure shapes: the deadband-150 churn class chases the
+    // song's own ~500 ms beat-comb spacing, while Vienna/Dreams's residual
+    // is constant to within tens of ms across the whole cycle — 60 ms
+    // admits the latter and rejects the former by close to an order of
+    // magnitude.
+    double confirm_agree_ms = 60.0;
+    // Absolute floor epsilon: a cluster at or below this is healthy sync,
+    // never corrected. RFC 5905 states its own step threshold two ways —
+    // Figure 27's parameter table says 125 ms, Appendix A.5.5.6's reference
+    // pseudocode defines STEPT .128 — an internal discrepancy the RFC never
+    // resolves. This spec picks the table's 125 on purpose (tech-req
+    // §2.7): FT8's healthy locks read −30 to −63 ms and the broken class
+    // reads 250–314 ms, so 125 sits well clear of both with margin either
+    // way.
+    double confirm_floor_ms = 125.0;
 };
 
 enum class ActionKind { kNone, kSeek, kTrackLost };
@@ -95,6 +131,23 @@ public:
     void reset();
 
 private:
+    // Fixed-size ring of recent converged-fix residuals backing the
+    // persistence gate (tech-req §2.7). No heap allocation, no STL
+    // container growth — the policy runs on the worker thread of a
+    // realtime audio product.
+    static constexpr std::size_t kRingCapacity = 8;
+    struct RingSample {
+        double error_ms = 0.0;
+        uint64_t mono_ns = 0;
+    };
+
+    void ring_append(double error_ms, uint64_t mono_ns);
+    void ring_clear();
+    double ring_mean() const;
+    uint64_t ring_oldest_ns() const;
+    uint64_t ring_newest_ns() const;
+    bool ring_all_agree(double mean, double tol) const;
+
     PolicyConfig cfg_;
     bool seek_pending_ack_ = false;
     uint64_t seek_emitted_ns_ = 0;
@@ -103,6 +156,10 @@ private:
     uint64_t next_request_ns_ = 0;  // 0 = not scheduled
     bool awaiting_verify_ = false;  // seek issued; next estimate calibrates
     double last_centering_ms_ = 0.0;
+
+    RingSample ring_[kRingCapacity];
+    std::size_t ring_count_ = 0;
+    std::size_t ring_head_ = 0;  // index of the oldest sample
 };
 
 }  // namespace synccore

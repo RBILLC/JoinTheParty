@@ -17,6 +17,48 @@ void CorrectionPolicy::reset() {
     next_request_ns_ = 0;
     awaiting_verify_ = false;
     last_centering_ms_ = 0.0;
+    ring_clear();
+}
+
+void CorrectionPolicy::ring_append(double error_ms, uint64_t mono_ns) {
+    const std::size_t idx = (ring_head_ + ring_count_) % kRingCapacity;
+    ring_[idx] = {error_ms, mono_ns};
+    if (ring_count_ < kRingCapacity) {
+        ++ring_count_;
+    } else {
+        ring_head_ = (ring_head_ + 1) % kRingCapacity;
+    }
+}
+
+void CorrectionPolicy::ring_clear() {
+    ring_count_ = 0;
+    ring_head_ = 0;
+}
+
+double CorrectionPolicy::ring_mean() const {
+    if (ring_count_ == 0) return 0.0;
+    double sum = 0.0;
+    for (std::size_t i = 0; i < ring_count_; ++i)
+        sum += ring_[(ring_head_ + i) % kRingCapacity].error_ms;
+    return sum / static_cast<double>(ring_count_);
+}
+
+uint64_t CorrectionPolicy::ring_oldest_ns() const {
+    return ring_count_ ? ring_[ring_head_].mono_ns : 0;
+}
+
+uint64_t CorrectionPolicy::ring_newest_ns() const {
+    if (ring_count_ == 0) return 0;
+    return ring_[(ring_head_ + ring_count_ - 1) % kRingCapacity].mono_ns;
+}
+
+bool CorrectionPolicy::ring_all_agree(double mean, double tol) const {
+    for (std::size_t i = 0; i < ring_count_; ++i) {
+        if (std::abs(ring_[(ring_head_ + i) % kRingCapacity].error_ms - mean) >
+            tol)
+            return false;
+    }
+    return true;
 }
 
 bool CorrectionPolicy::is_settling(uint64_t now_ns) const {
@@ -69,9 +111,26 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
         return action;
     }
 
-    // Adapt the recognition cadence to the state we're in.
+    // CTL-02 (tech-req §2.7) persistence ring: only genuinely converged,
+    // fresh fix evidence accumulates into the cluster. Losing convergence —
+    // even briefly — invalidates the cluster's premise, so a non-converged
+    // estimate clears it outright rather than pausing it.
     if (est.converged) {
-        fix_interval_ns_ = cfg_.fix_interval_max_ns;
+        ring_append(e, now_ns);
+    } else {
+        ring_clear();
+    }
+
+    // Adapt the recognition cadence to the state we're in. A live,
+    // above-floor persistence cluster is corroboration-hungry: it drops to
+    // the base interval (same constant already used for the non-converged
+    // case) instead of stretching to max, so confirm_min_fixes corroborating
+    // samples arrive faster.
+    if (est.converged) {
+        fix_interval_ns_ = (ring_count_ >= 1 &&
+                             std::abs(ring_mean()) > cfg_.confirm_floor_ms)
+                                ? cfg_.fix_interval_base_ns
+                                : cfg_.fix_interval_max_ns;
     } else if (std::abs(e) > cfg_.deadband_ms) {
         fix_interval_ns_ = cfg_.fix_interval_min_ns;
     } else {
@@ -86,15 +145,16 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
     if (est.confidence < cfg_.min_confidence_to_correct) return action;
 
     // Correct when out of the deadband now, or predicted to leave it before
-    // the next measurement (§6.3 skew pre-emption).
+    // the next measurement (§6.3 skew pre-emption). Aim so the post-seek
+    // error drifts through zero across the next interval instead of
+    // starting at zero and drifting out.
     const double horizon_s =
         static_cast<double>(fix_interval_ns_) / 1e9;
     const double predicted = e + drift_ms_per_s * horizon_s;
+    const double drift_centering = drift_ms_per_s * horizon_s / 2.0;
+
     if (std::abs(e) >= cfg_.deadband_ms ||
         std::abs(predicted) >= cfg_.deadband_ms) {
-        // Aim so the post-seek error drifts through zero across the next
-        // interval instead of starting at zero and drifting out.
-        const double drift_centering = drift_ms_per_s * horizon_s / 2.0;
         action.kind = ActionKind::kSeek;
         action.seek_to_ms = static_cast<int64_t>(
             std::llround(projected_local_ms + cfg_.command_latency_ms - e -
@@ -103,6 +163,28 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
         seek_emitted_ns_ = now_ns;
         awaiting_verify_ = true;
         last_centering_ms_ = drift_centering;
+        ring_clear();  // a correction changes the operating point
+    } else if (est.converged &&
+               ring_count_ >= static_cast<std::size_t>(cfg_.confirm_min_fixes) &&
+               (ring_newest_ns() - ring_oldest_ns()) >= cfg_.confirm_window_ns &&
+               ring_all_agree(ring_mean(), cfg_.confirm_agree_ms) &&
+               std::abs(ring_mean()) > cfg_.confirm_floor_ms &&
+               std::abs(ring_mean()) < cfg_.lost_threshold_ms) {
+        // CTL-02 persistence trigger: the instantaneous path above keeps
+        // precedence (checked first, unfired here) — this is the second,
+        // slower gate for a stable, corroborated residual a widened
+        // deadband_ms would otherwise hold forever. Corrects from the
+        // cluster mean, not the instantaneous error.
+        const double mean = ring_mean();
+        action.kind = ActionKind::kSeek;
+        action.seek_to_ms = static_cast<int64_t>(std::llround(
+            projected_local_ms + cfg_.command_latency_ms - mean -
+            drift_centering));
+        seek_pending_ack_ = true;
+        seek_emitted_ns_ = now_ns;
+        awaiting_verify_ = true;
+        last_centering_ms_ = drift_centering;
+        ring_clear();
     }
     return action;
 }
