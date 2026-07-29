@@ -55,7 +55,7 @@
 | CFX-09 | ✅ Done — store sorts by `updatedAtMs`, shell promotes the connected device | `e82a518` |
 | CTL-01 | ⬜ Not started — referee validity collapse while LOCKED as the self-match sentinel (FT8's headline defect; see docs/field-test-8-results.md) | — |
 | CTL-02 | ✅ Done — CTL-02a/02b: persistence gate + residual ring in `CorrectionPolicy` per tech-req §2.7; closed-loop sims reproduce FT8's Vienna (one seek, −50 ms landing) and hold the deadband-150 lesson (0 seeks under scatter); five-cycle field re-verification pending | `5f03d08` |
-| CTL-03 | ⬜ Not started — comb-flatness score + large-correction corroboration per tech-req §2.8 (FT8's 1259 ms single-fix overshoot); split CTL-03a/03b below | — |
+| CTL-03 | ✅ Done — CTL-03a/03b: `comb_ratio` in `analyze_window`+CLI (graded path byte-identical), large-correction hold in `CorrectionPolicy`; phantom sim 0 large seeks / genuine-jump sim exactly 1; field re-verification pending | `9237e3a` |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.
