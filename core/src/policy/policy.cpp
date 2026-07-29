@@ -18,6 +18,9 @@ void CorrectionPolicy::reset() {
     awaiting_verify_ = false;
     last_centering_ms_ = 0.0;
     ring_clear();
+    large_pending_ = false;
+    large_pending_error_ms_ = 0.0;
+    large_pending_ns_ = 0;
 }
 
 void CorrectionPolicy::ring_append(double error_ms, uint64_t mono_ns) {
@@ -137,6 +140,14 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
         fix_interval_ns_ = cfg_.fix_interval_base_ns;
     }
 
+    // CTL-03b (tech-req §2.8): a live pending large-correction record is
+    // corroboration-hungry in exactly the same sense as CTL-02's cluster —
+    // override to the minimum interval so the confirming (or replacing) fix
+    // arrives fast. Re-applied at the end of this function too, since the
+    // large-correction branch below may (re)arm or clear the record for
+    // this very call.
+    if (large_pending_) fix_interval_ns_ = cfg_.fix_interval_min_ns;
+
     // A stale estimate is not evidence. Track-lost above still fires (a
     // wildly wrong error is worth acting on however we learned it), but a
     // micro-seek computed from a coasted state is a guess, and executing it
@@ -153,17 +164,62 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
     const double predicted = e + drift_ms_per_s * horizon_s;
     const double drift_centering = drift_ms_per_s * horizon_s / 2.0;
 
+    // CTL-03b (tech-req §2.8): a fresh estimate back under the large-
+    // correction threshold invalidates any stale pending record outright —
+    // independent of whether this estimate itself crosses the (possibly
+    // widened) instantaneous deadband below. The skew-preemption arm
+    // (|predicted| ≥ deadband with a small |e|) can therefore never reach
+    // the hold: |e| < threshold clears the record here and falls through
+    // to the ordinary instantaneous path unchanged.
+    if (std::abs(e) < cfg_.large_correction_threshold_ms) {
+        large_pending_ = false;
+    }
+
     if (std::abs(e) >= cfg_.deadband_ms ||
         std::abs(predicted) >= cfg_.deadband_ms) {
-        action.kind = ActionKind::kSeek;
-        action.seek_to_ms = static_cast<int64_t>(
-            std::llround(projected_local_ms + cfg_.command_latency_ms - e -
-                         drift_centering));
-        seek_pending_ack_ = true;
-        seek_emitted_ns_ = now_ns;
-        awaiting_verify_ = true;
-        last_centering_ms_ = drift_centering;
-        ring_clear();  // a correction changes the operating point
+        if (std::abs(e) >= cfg_.large_correction_threshold_ms) {
+            // Held instead of fired: FT8's own 1259 ms overshoot landed off
+            // one conf-0.74 fix because the estimator's outlier gate is
+            // inactive at mid-uncertainty. Expire a stale record first —
+            // corroboration must be genuinely fresh evidence.
+            if (large_pending_ &&
+                now_ns - large_pending_ns_ >= cfg_.large_pending_max_age_ns) {
+                large_pending_ = false;
+            }
+            if (large_pending_ &&
+                std::abs(e - large_pending_error_ms_) <=
+                    cfg_.large_corroborate_agree_ms) {
+                // Corroborated: fire from the FRESH error, not the stale
+                // pending one, through the existing target formula.
+                action.kind = ActionKind::kSeek;
+                action.seek_to_ms = static_cast<int64_t>(std::llround(
+                    projected_local_ms + cfg_.command_latency_ms - e -
+                    drift_centering));
+                seek_pending_ack_ = true;
+                seek_emitted_ns_ = now_ns;
+                awaiting_verify_ = true;
+                last_centering_ms_ = drift_centering;
+                ring_clear();
+                large_pending_ = false;
+            } else {
+                // No live, agreeing record: store/replace and hold — a
+                // disagreeing large error restarts the record rather than
+                // accumulating it.
+                large_pending_ = true;
+                large_pending_error_ms_ = e;
+                large_pending_ns_ = now_ns;
+            }
+        } else {
+            action.kind = ActionKind::kSeek;
+            action.seek_to_ms = static_cast<int64_t>(
+                std::llround(projected_local_ms + cfg_.command_latency_ms - e -
+                             drift_centering));
+            seek_pending_ack_ = true;
+            seek_emitted_ns_ = now_ns;
+            awaiting_verify_ = true;
+            last_centering_ms_ = drift_centering;
+            ring_clear();  // a correction changes the operating point
+        }
     } else if (est.converged &&
                ring_count_ >= static_cast<std::size_t>(cfg_.confirm_min_fixes) &&
                (ring_newest_ns() - ring_oldest_ns()) >= cfg_.confirm_window_ns &&
@@ -186,6 +242,10 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
         last_centering_ms_ = drift_centering;
         ring_clear();
     }
+
+    // Re-apply: this call's large-correction branch above may have just
+    // (re)armed, corroborated-and-cleared, or expired the pending record.
+    if (large_pending_) fix_interval_ns_ = cfg_.fix_interval_min_ns;
     return action;
 }
 

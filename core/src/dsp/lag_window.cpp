@@ -51,6 +51,29 @@ WindowLag analyze_window(const float* x, size_t n, int rate,
     result.lag_ms = 1000.0 * static_cast<double>(best) / rate;
     result.peak_ratio = mean > 0 ? best_v / mean : 0;
     result.found = result.peak_ratio > 4.0;
+
+    // CTL-03a: comb-flatness second pass. Additive only — everything above
+    // this point is byte-identical to the pre-CTL-03a computation. Mirrors
+    // the best-peak scan's raw-value comparison (max of v, not |v|) over the
+    // same `ac` array, excluding a +/-20 ms neighborhood around `best` so
+    // the best peak's own shoulder never scores as its own competitor.
+    const size_t excl_samples = static_cast<size_t>(20.0 * rate / 1000.0);
+    const size_t excl_lo = best > excl_samples ? best - excl_samples : 0;
+    const size_t excl_hi = best + excl_samples;
+    double second_v = -1e30;
+    size_t second = 0;
+    bool have_second = false;
+    for (size_t k = min_lag; k <= max_lag; ++k) {
+        if (k >= excl_lo && k <= excl_hi) continue;
+        const double v = ac[k];
+        if (v > second_v) { second_v = v; second = k; have_second = true; }
+    }
+    if (have_second) {
+        result.second_lag_ms = 1000.0 * static_cast<double>(second) / rate;
+        // Division guard only; the ratio itself is never clamped (see
+        // WindowLag's doc comment — it can be negative or enormous).
+        result.comb_ratio = second_v != 0.0 ? best_v / second_v : 0.0;
+    }
     return result;
 }
 

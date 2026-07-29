@@ -95,13 +95,13 @@ int run(const Wav& wav, double min_lag_ms, double max_lag_ms) {
     const int rate = wav.sample_rate;
     const size_t win = static_cast<size_t>(8.0 * rate);   // 8 s windows
     const size_t hop = static_cast<size_t>(2.0 * rate);   // 2 s hop
-    std::printf("window_start_s,lag_ms,peak_ratio,confident\n");
+    std::printf("window_start_s,lag_ms,peak_ratio,confident,comb_ratio\n");
     for (size_t start = 0; start + win <= wav.mono.size(); start += hop) {
         const auto r = analyze_window(wav.mono.data() + start, win, rate,
                                       min_lag_ms, max_lag_ms);
-        std::printf("%.1f,%.1f,%.2f,%d\n",
+        std::printf("%.1f,%.1f,%.2f,%d,%.2f\n",
                     static_cast<double>(start) / rate, r.lag_ms, r.peak_ratio,
-                    r.found ? 1 : 0);
+                    r.found ? 1 : 0, r.comb_ratio);
     }
     return 0;
 }
@@ -121,7 +121,7 @@ int run_stream(int rate, int channels, double min_lag_ms, double max_lag_ms) {
 
     std::fprintf(stderr, "stream: %d Hz, %d ch, 8s window / 2s hop\n", rate,
                  channels);
-    std::printf("t_s,lag_ms,peak_ratio,confident,rms_db\n");
+    std::printf("t_s,lag_ms,peak_ratio,confident,rms_db,comb_ratio\n");
     std::fflush(stdout);
 
     for (;;) {
@@ -150,8 +150,8 @@ int run_stream(int rate, int channels, double min_lag_ms, double max_lag_ms) {
 
         const auto r =
             analyze_window(buf.data(), win, rate, min_lag_ms, max_lag_ms);
-        std::printf("%.0f,%.0f,%.2f,%d,%.1f\n", t, r.lag_ms, r.peak_ratio,
-                    r.found ? 1 : 0, rms_db);
+        std::printf("%.0f,%.0f,%.2f,%d,%.1f,%.2f\n", t, r.lag_ms, r.peak_ratio,
+                    r.found ? 1 : 0, rms_db, r.comb_ratio);
         std::fflush(stdout);
     }
     return 0;
@@ -180,8 +180,12 @@ int selftest() {
     }
     const auto r = analyze_window(wav.mono.data(), static_cast<size_t>(8.0 * rate),
                                   rate, 40, 2500);
-    std::printf("selftest: lag=%.1fms (expect 800±5) ratio=%.2f found=%d\n",
-                r.lag_ms, r.peak_ratio, r.found ? 1 : 0);
+    std::printf(
+        "selftest: lag=%.1fms (expect 800±5) ratio=%.2f found=%d "
+        "comb_ratio=%.2f\n",
+        r.lag_ms, r.peak_ratio, r.found ? 1 : 0, r.comb_ratio);
+    // Pass/fail is unchanged by CTL-03a: comb_ratio is printed for
+    // visibility only and never enters the ok computation below.
     const bool ok = r.found && std::abs(r.lag_ms - 800.0) <= 5.0;
     std::printf(ok ? "selftest PASS\n" : "selftest FAIL\n");
     return ok ? 0 : 1;

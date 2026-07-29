@@ -353,26 +353,52 @@ void test_correction_leads_by_recognition_age() {
     }
 
     // A fix CAPTURED at t0+5 s (local was 15 000 then) reporting the room at
-    // 13 500 → we are 1 500 ms ahead and must seek back. But by now it is
-    // t0+6 s and local is 16 000, so the target must be computed from 16 000,
-    // not 15 000 — a 1 000 ms difference that is exactly the lag we heard.
+    // 13 500 → we are 1 500 ms ahead and must seek back. tech-req §2.8
+    // (CTL-03b): 1 500 ms is at/above large_correction_threshold_ms, so this
+    // FIRST fix is held pending corroboration — no correction may fire off
+    // it alone (FT8's 1259 ms single-fix overshoot class).
     sc_recognition_fix_t fix{};
     fix.source = SC_FIX_SHAZAMKIT;
     fix.match_offset_ms = 13500;
     fix.capture_mono_ns = t0 + 5 * kSec;
     fix.confidence = 0.9f;
+    const int est_before = log.estimates.load();
     CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    for (int i = 0; i < 400 && log.estimates.load() == est_before; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.corrections.load() == 0);  // held, not fired
+
+    // Advance session time to t0+8 s and corroborate: a second fix captured
+    // at t0+7 s (local was 17 000) reporting the room at 15 500 — the same
+    // 1 500 ms error, within large_corroborate_agree_ms of the pending one.
+    for (uint64_t k = 13; k <= 16; ++k)
+        sc_push_capture(s, block.data(), 24000, t0 + k * 500'000'000ull);
+    for (int i = 0; i < 200; ++i) {
+        uint64_t end_ns = 0;
+        std::vector<float> sink(1024);
+        if (sc_copy_recent_capture(s, sink.data(), 1024, &end_ns) > 0 &&
+            end_ns >= t0 + 8 * kSec)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    sc_recognition_fix_t fix2{};
+    fix2.source = SC_FIX_SHAZAMKIT;
+    fix2.match_offset_ms = 15500;
+    fix2.capture_mono_ns = t0 + 7 * kSec;
+    fix2.confidence = 0.9f;
+    CHECK(sc_submit_recognition_fix(s, &fix2) == SC_OK);
     for (int i = 0; i < 400 && log.corrections.load() < 1; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
     CHECK(log.corrections.load() == 1);
-    // Session time is the END of the last capture block, so now = t0+6.5 s
-    // and local = 16 500. Correct target: 16 500 + command latency (250) −
-    // 1 500 = 15 250. The capture-time bug gives 15 000 + 250 − 1 500 =
-    // 13 750 — a 1.5 s deficit that lands the phone behind the room and that
-    // the next correction would recreate.
+    // Session time is the END of the last capture block (k=16 starts at
+    // t0+8 s, ends t0+8.5 s), so now = t0+8.5 s and local = 18 500. Correct
+    // target: 18 500 + command latency (250) − 1 500 = 17 250. The
+    // capture-time bug would compute from the fix's capture-time local
+    // (17 000 + 250 − 1 500 = 15 750) — a 1.5 s deficit that lands the
+    // phone behind the room and that the next correction would recreate.
     const int64_t seek = log.last_seek_to_ms.load();
-    CHECK(seek > 15100 && seek < 15400);
+    CHECK(seek > 17100 && seek < 17400);
 
     sc_destroy(s);
 }

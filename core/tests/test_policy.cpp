@@ -83,7 +83,14 @@ void test_no_correction_on_stale_estimate() {
 
 void test_track_lost_threshold() {
     synccore::CorrectionPolicy pol;
+    // tech-req §2.8's "Deliberate test change" (CTL-03b): a 1999 ms error is
+    // now below lost_threshold_ms but at/above large_correction_threshold_ms
+    // (1000), so it is held pending corroboration rather than fired off one
+    // estimate — this replaces the pre-CTL-03 immediate-kSeek expectation.
     CHECK(pol.on_estimate(make_est(1999.0), 0.0, kSec).kind ==
+          synccore::ActionKind::kNone);
+    // A second, agreeing estimate fires it.
+    CHECK(pol.on_estimate(make_est(1999.0), 0.0, 2 * kSec).kind ==
           synccore::ActionKind::kSeek);
     CHECK(pol.on_estimate(make_est(2000.0), 0.0, 20 * kSec).kind ==
           synccore::ActionKind::kTrackLost);
@@ -577,6 +584,255 @@ void test_closed_loop_stability_no_churn_at_350() {
     CHECK(seeks_applied == 0);
 }
 
+// ---- CTL-03b: large-correction corroboration hold ----------------------
+// tech-req §2.8 Part B. Field test 8's song 2 took a single conf-0.74 fix
+// 1259 ms off and it stood uncorrected. These tests drive the pending-
+// record hold directly through on_estimate with make_est, in the same
+// style as the CTL-02a ring tests above.
+
+void test_large_correction_single_hold() {
+    synccore::CorrectionPolicy pol;
+    const auto a = pol.on_estimate(make_est(1200.0), 100000.0, 10 * kSec);
+    CHECK(a.kind == synccore::ActionKind::kNone);
+    CHECK(pol.current_fix_interval_ns() == 8 * kSec);  // fix_interval_min_ns
+}
+
+void test_large_correction_corroborated_pair() {
+    synccore::CorrectionPolicy pol;
+    CHECK(pol.on_estimate(make_est(1200.0), 100000.0, 10 * kSec).kind ==
+          synccore::ActionKind::kNone);
+    const auto a =
+        pol.on_estimate(make_est(1210.0), 100100.0, 15 * kSec);
+    CHECK(a.kind == synccore::ActionKind::kSeek);
+    // local + command latency (250) − the FRESH 1210 ms error, no drift.
+    CHECK(a.seek_to_ms == 99140);
+}
+
+void test_large_correction_disagreeing_pair() {
+    synccore::CorrectionPolicy pol;
+    // First large error opens a pending record.
+    CHECK(pol.on_estimate(make_est(1200.0), 100000.0, 10 * kSec).kind ==
+          synccore::ActionKind::kNone);
+    // A disagreeing large error replaces the record, not accumulates it.
+    CHECK(pol.on_estimate(make_est(1500.0), 100000.0, 15 * kSec).kind ==
+          synccore::ActionKind::kNone);
+    // Agrees with the replaced (1500) record: fires.
+    CHECK(pol.on_estimate(make_est(1520.0), 100000.0, 20 * kSec).kind ==
+          synccore::ActionKind::kSeek);
+}
+
+void test_large_correction_sub_threshold_clears() {
+    synccore::PolicyConfig cfg;
+    cfg.deadband_ms = 350.0;  // so a 300 ms error stays sub-deadband
+    synccore::CorrectionPolicy pol(cfg);
+
+    CHECK(pol.on_estimate(make_est(1200.0), 100000.0, 10 * kSec).kind ==
+          synccore::ActionKind::kNone);
+    // A sub-large-threshold (and here sub-deadband) estimate clears the
+    // stale 1200 ms record outright.
+    CHECK(pol.on_estimate(make_est(300.0), 100000.0, 15 * kSec).kind ==
+          synccore::ActionKind::kNone);
+    // The long-gone 1200 ms record must not corroborate this fresh 1210:
+    // it opens a brand-new hold instead of firing.
+    CHECK(pol.on_estimate(make_est(1210.0), 100000.0, 20 * kSec).kind ==
+          synccore::ActionKind::kNone);
+}
+
+void test_large_correction_expiry() {
+    synccore::CorrectionPolicy pol;
+    CHECK(pol.on_estimate(make_est(1200.0), 100000.0, 10 * kSec).kind ==
+          synccore::ActionKind::kNone);
+    // An otherwise-corroborating 1210 ms estimate arrives after
+    // large_pending_max_age_ns (30 s) has elapsed: the stale record has
+    // expired, so this becomes a fresh pending record rather than firing.
+    CHECK(pol.on_estimate(make_est(1210.0), 100000.0, 10 * kSec + 31 * kSec)
+              .kind == synccore::ActionKind::kNone);
+}
+
+void test_large_correction_track_lost_precedence() {
+    // lost_threshold_ms keeps absolute precedence, checked first exactly as
+    // today: an error this large is a re-listen, not a seek to hold.
+    synccore::CorrectionPolicy pol;
+    CHECK(pol.on_estimate(make_est(2500.0), 100000.0, 10 * kSec).kind ==
+          synccore::ActionKind::kTrackLost);
+}
+
+// ---- CTL-03b: closed-loop proof ------------------------------------------
+// Estimator + policy + simulated world, in the closed-loop sims' style
+// above. Proves the hold against real (not synthetic make_est) estimates,
+// so the estimator's own outlier gate — inactive at mid-uncertainty,
+// structurally why FT8's overshoot got through in the first place — is
+// genuinely exercised rather than assumed.
+
+// FT8's headline defect: a single conf-0.74 fix landed 1259 ms off mid-
+// stream and stood uncorrected. Reproduce it with one clean bootstrap fix,
+// then a long gap (letting the filter's posterior variance regrow past the
+// estimator's outlier_gate_max_p00 — "mid-uncertainty," matching FT8's own
+// gate-inactive acceptance) before the corrupted fix lands at fix #2. The
+// policy's hold must never let it fire as a seek, and clean fixes
+// afterward must pull the true error back under 25 ms.
+void test_closed_loop_phantom_large_fix_held() {
+    synccore::SyncEstimator est;
+    synccore::CorrectionPolicy pol;
+
+    const double true_error = 0.0;
+    double local_pos = 60'000.0;
+    int fixes = 0;
+    int large_seeks = 0;
+    int seeks_applied = 0;
+
+    const uint64_t step = kSec / 10;
+    const uint64_t horizon = 1400 * kSec;
+    // A single long gap between fix #1 and fix #2 lets the estimator's
+    // posterior variance regrow past outlier_gate_max_p00 before the
+    // phantom lands — the mid-uncertainty window FT8's own trace caught.
+    const uint64_t phantom_at = 1000 * kSec;
+    bool phantom_injected = false;
+
+    for (uint64_t t = step; t <= horizon; t += step) {
+        local_pos += static_cast<double>(step) / kSec * 1000.0;
+        if (t % kSec == 0)
+            est.on_player_state(static_cast<int64_t>(local_pos), false, t);
+
+        bool want_fix = (fixes == 0 && t >= kSec) ||
+                         (fixes == 1 && t >= phantom_at) ||
+                         (fixes >= 2 && pol.fix_request_due(t));
+        if (!want_fix) continue;
+
+        const bool is_phantom = (fixes == 1) && !phantom_injected;
+        const double external = local_pos - true_error;
+        double reported = external;
+        float conf = 0.9f;
+        if (is_phantom) {
+            reported = external + 1259.0;  // FT8's own overshoot magnitude
+            conf = 0.74f;                  // FT8's own accepted confidence
+        }
+        if (est.on_fix(static_cast<int64_t>(std::llround(reported)), t, 0.0,
+                       conf)) {
+            ++fixes;
+            if (is_phantom) phantom_injected = true;
+            pol.on_fix_accepted(t);
+            const auto e = est.estimate_at(t);
+            const auto a = pol.on_estimate(e, est.projected_local_ms(t), t);
+#ifdef SIM_TRACE
+            std::printf(
+                "t=%6.1f true=%8.2f est=%8.2f conf=%.2f act=%d "
+                "int=%llus\n",
+                t / 1e9, true_error, e.error_ms, e.confidence, (int)a.kind,
+                (unsigned long long)(pol.current_fix_interval_ns() / kSec));
+#endif
+            if (a.kind == synccore::ActionKind::kSeek) {
+                ++seeks_applied;
+                if (std::llround(std::abs(e.error_ms)) >= 1000) ++large_seeks;
+                pol.on_seek_issued(t);
+            }
+        }
+    }
+
+    const auto final_est = est.estimate_at(horizon);
+    std::printf(
+        "  phantom-fix sim: %d fixes, %d seeks (%d of magnitude >=1000ms), "
+        "final true |error| = %.1f ms\n",
+        fixes, seeks_applied, large_seeks, std::abs(final_est.error_ms));
+    CHECK(fixes >= 5);
+    CHECK(large_seeks == 0);
+    CHECK(std::abs(final_est.error_ms) <= 25.0);
+}
+
+// The companion case: the true error genuinely does step to ~1200 ms and
+// stays there (the room seeks). The hold must still fire — once agreeing
+// fixes corroborate it — and the loop must re-converge; exactly one large
+// seek over the whole run.
+//
+// For a single fix to read close enough to the true ~1200 ms step to cross
+// large_correction_threshold_ms at all, the filter must still be at (or
+// have regrown into) mid-uncertainty when that fix lands — a tightly
+// converged filter only partially believes any one observation (small
+// Kalman gain), which is exactly why FT8's own follow-up errors read small
+// even with a large true residual underneath. So: one clean bootstrap fix,
+// then the room seeks during a long gap that regrows the posterior
+// variance past the estimator's own outlier-gate threshold (the same
+// mid-uncertainty window the phantom sim exploits) before the next fix
+// lands — except here the jump is genuine and repeats, so the hold's
+// second-fix corroboration should fire, not hold forever.
+void test_closed_loop_genuine_large_jump_corrects() {
+    synccore::SyncEstimator est;
+    synccore::CorrectionPolicy pol;
+
+    double true_error = 0.0;
+    double local_pos = 60'000.0;
+    bool seek_scheduled = false;
+    double seek_target = 0.0;
+    uint64_t seek_apply_at = 0;
+    int fixes = 0;
+    int seeks_applied = 0;
+    int large_seeks = 0;
+
+    const uint64_t step = kSec / 10;
+    const uint64_t horizon = 1400 * kSec;
+    const uint64_t jump_at = 500 * kSec;         // the room seeks here
+    const uint64_t second_fix_at = 1000 * kSec;  // long gap after fix #1
+    const uint64_t apply_delay =
+        static_cast<uint64_t>(pol.command_latency_ms() / 1000.0 * kSec);
+
+    for (uint64_t t = step; t <= horizon; t += step) {
+        local_pos += static_cast<double>(step) / kSec * 1000.0;
+        if (t == jump_at) true_error = 1200.0;
+
+        if (seek_scheduled && t >= seek_apply_at) {
+            seek_scheduled = false;
+            const double external = local_pos - true_error;
+            local_pos = seek_target;
+            true_error = local_pos - external;
+            est.on_player_state(static_cast<int64_t>(local_pos), false, t);
+        }
+
+        if (t % kSec == 0)
+            est.on_player_state(static_cast<int64_t>(local_pos), false, t);
+
+        const bool bootstrap = (fixes == 0 && t >= kSec);
+        const bool second = (fixes == 1 && t >= second_fix_at);
+        const bool due = (fixes >= 2 && pol.fix_request_due(t));
+        if (bootstrap || second || due) {
+            const double noise = (fixes % 2 == 0) ? 3.0 : -3.0;
+            const double external = local_pos - true_error;
+            if (est.on_fix(static_cast<int64_t>(std::llround(external + noise)),
+                           t, 0.0, 0.9f)) {
+                ++fixes;
+                pol.on_fix_accepted(t);
+                const auto e = est.estimate_at(t);
+                const auto a = pol.on_estimate(e, est.projected_local_ms(t), t);
+#ifdef SIM_TRACE
+                std::printf(
+                    "t=%6.1f true=%8.2f est=%8.2f conf=%.2f act=%d "
+                    "int=%llus\n",
+                    t / 1e9, true_error, e.error_ms, e.confidence, (int)a.kind,
+                    (unsigned long long)(pol.current_fix_interval_ns() / kSec));
+#endif
+                if (a.kind == synccore::ActionKind::kSeek) {
+                    ++seeks_applied;
+                    if (std::llround(std::abs(e.error_ms)) >= 1000)
+                        ++large_seeks;
+                    est.on_local_seek(a.seek_to_ms, t, pol.command_latency_ms());
+                    pol.on_seek_issued(t);
+                    seek_scheduled = true;
+                    seek_target = static_cast<double>(a.seek_to_ms);
+                    seek_apply_at = t + apply_delay;
+                }
+                CHECK(a.kind != synccore::ActionKind::kTrackLost);
+            }
+        }
+    }
+
+    std::printf(
+        "  genuine-jump sim: %d fixes, %d seeks (%d of magnitude >=1000ms), "
+        "final true error = %.1f ms\n",
+        fixes, seeks_applied, large_seeks, true_error);
+    CHECK(fixes >= 5);
+    CHECK(large_seeks == 1);
+    CHECK(std::abs(true_error) <= 25.0);
+}
+
 }  // namespace
 
 int main() {
@@ -600,6 +856,14 @@ int main() {
     test_persistence_gate_cadence_adaptation();
     test_closed_loop_vienna_persistence();
     test_closed_loop_stability_no_churn_at_350();
+    test_large_correction_single_hold();
+    test_large_correction_corroborated_pair();
+    test_large_correction_disagreeing_pair();
+    test_large_correction_sub_threshold_clears();
+    test_large_correction_expiry();
+    test_large_correction_track_lost_precedence();
+    test_closed_loop_phantom_large_fix_held();
+    test_closed_loop_genuine_large_jump_corrects();
 
     if (g_failures == 0) {
         std::printf("policy_tests: all tests passed\n");

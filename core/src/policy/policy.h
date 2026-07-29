@@ -19,6 +19,12 @@
 //     confirm_window_ns, all within confirm_agree_ms of their mean and
 //     above confirm_floor_ms — earns one correction from the cluster mean
 //     even while sitting inside a widened deadband_ms
+//   - large-correction corroboration hold (tech-req §2.8 Part B, CTL-03b):
+//     a proposed seek with |error| ≥ large_correction_threshold_ms is held
+//     as a pending record instead of firing off one estimate; the next
+//     fresh estimate fires it — computed from that fresh error — only if
+//     it agrees within large_corroborate_agree_ms and is still ≥ threshold,
+//     else the record is replaced or, below threshold, cleared outright
 #ifndef SYNCCORE_POLICY_H
 #define SYNCCORE_POLICY_H
 
@@ -90,6 +96,31 @@ struct PolicyConfig {
     // reads 250–314 ms, so 125 sits well clear of both with margin either
     // way.
     double confirm_floor_ms = 125.0;
+
+    // tech-req §2.8 Part B (CTL-03b): large-correction corroboration hold.
+    // Field test 8's song 2 took a single conf-0.74 fix 1259 ms off and it
+    // stood uncorrected — the estimator's own outlier gate is inactive by
+    // design at mid-uncertainty ("post-reset first fixes always land"), so
+    // a wild single fix landed unchallenged, and the follow-up errors that
+    // would have exposed it hid near the deadband. This is the runtime
+    // defense at the policy layer; the estimator stays untouched.
+
+    // At or above this magnitude (but below lost_threshold_ms, which keeps
+    // its existing checked-first precedence), a proposed seek is never
+    // fired from one estimate alone — it is held as a pending record until
+    // a fresh estimate corroborates it.
+    double large_correction_threshold_ms = 1000.0;
+    // Max deviation between the pending error and the next fresh error to
+    // count as agreement. Deliberately 150, not the ~50 ms first
+    // suggested: sc_config_t.deadband_ms's own comment cites Field Test
+    // 2's measured ±100–150 ms single-fix recognition noise, and a 50 ms
+    // gate would starve real large corrections indefinitely on that noise
+    // floor alone — a worse failure than the overshoot it exists to
+    // prevent (tech-req §2.8's rationale for 150-not-50).
+    double large_corroborate_agree_ms = 150.0;
+    // The pending record expires unfired if no corroborating fix arrives
+    // within this span.
+    uint64_t large_pending_max_age_ns = 30'000'000'000ull;
 };
 
 enum class ActionKind { kNone, kSeek, kTrackLost };
@@ -160,6 +191,15 @@ private:
     RingSample ring_[kRingCapacity];
     std::size_t ring_count_ = 0;
     std::size_t ring_head_ = 0;  // index of the oldest sample
+
+    // Pending large-correction record (tech-req §2.8 Part B, CTL-03b). A
+    // sibling piece of state to the persistence ring above, but tracking a
+    // single held estimate rather than a cluster — see policy.cpp for the
+    // clearing rules (reset, any emitted seek, track-lost, expiry, and any
+    // fresh estimate whose |error| drops back below the threshold).
+    bool large_pending_ = false;
+    double large_pending_error_ms_ = 0.0;
+    uint64_t large_pending_ns_ = 0;
 };
 
 }  // namespace synccore

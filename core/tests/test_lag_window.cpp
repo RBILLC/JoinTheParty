@@ -124,12 +124,136 @@ void test_min_lag_ge_max_lag_yields_not_found() {
     CHECK(r.peak_ratio == 0);
 }
 
+// --- CTL-03a: comb-flatness score (second_lag_ms / comb_ratio) ---------
+
+// Two-copy signal (same construction as test_known_lag_recovered, kept as a
+// separate function per the "existing tests stay byte-identical" rule):
+// one dominant tooth should read a comb_ratio well above the ~2.0 consumer
+// threshold, with lag_ms unchanged from that test's existing expectation.
+void test_known_lag_comb_ratio_high() {
+    const int rate = 48000;
+    const double lag_s = 0.8;
+    const size_t n = static_cast<size_t>(20.0 * rate);
+    const auto sig = pseudo_music(n, 12345);
+
+    std::vector<float> mixed(n);
+    const size_t d = static_cast<size_t>(lag_s * rate);
+    for (size_t i = 0; i < n; ++i)
+        mixed[i] = sig[i] + (i >= d ? 0.5f * sig[i - d] : 0.0f);
+
+    const auto r = synccore::analyze_window(
+        mixed.data(), static_cast<size_t>(8.0 * rate), rate, 40, 2500);
+    CHECK(r.found);
+    CHECK(std::abs(r.lag_ms - 800.0) <= 5.0);
+    CHECK(r.comb_ratio > 2.0);
+}
+
+// A signal built from two equal-magnitude delayed copies (teeth 600 ms
+// apart, >= the 400 ms floor tech-req 2.8 calls out) should read as a flat
+// comb: the two teeth score close enough that comb_ratio drops below the
+// 2.0 threshold, and the runner-up genuinely competes from a different lag
+// (not the best lag's own excluded neighborhood).
+void test_flat_comb_low_ratio() {
+    const int rate = 48000;
+    const size_t n = static_cast<size_t>(20.0 * rate);
+    const auto sig = pseudo_music(n, 777);
+
+    const size_t d1 = static_cast<size_t>(0.8 * rate);   // 800 ms
+    const size_t d2 = static_cast<size_t>(1.4 * rate);   // 1400 ms
+
+    std::vector<float> mixed(n);
+    for (size_t i = 0; i < n; ++i) {
+        float v = sig[i];
+        if (i >= d1) v += 0.5f * sig[i - d1];
+        if (i >= d2) v += 0.5f * sig[i - d2];
+        mixed[i] = v;
+    }
+
+    const auto r = synccore::analyze_window(
+        mixed.data(), static_cast<size_t>(8.0 * rate), rate, 40, 2500);
+    CHECK(r.found);
+    CHECK(r.comb_ratio < 2.0);
+    CHECK(std::abs(r.second_lag_ms - r.lag_ms) > 20.0);
+}
+
+// A single-copy signal built from a much slower low-pass (correlation
+// length well past the +/-20 ms exclusion band) gives the best peak a
+// broad shoulder. The shoulder must never score as the "competitor" —
+// second_lag_ms has to land outside the exclusion neighborhood regardless.
+void test_broad_shoulder_excludes_neighbor() {
+    const int rate = 48000;
+    const size_t n = static_cast<size_t>(20.0 * rate);
+    std::vector<float> sig(n, 0.0f);
+    Lcg rng(2024);
+    float lp = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        lp += 0.001f * (rng.next() - lp);  // much slower than pseudo_music's 0.08
+        sig[i] = lp;
+    }
+
+    std::vector<float> mixed(n);
+    const size_t d = static_cast<size_t>(0.8 * rate);
+    for (size_t i = 0; i < n; ++i)
+        mixed[i] = sig[i] + (i >= d ? 0.5f * sig[i - d] : 0.0f);
+
+    const auto r = synccore::analyze_window(
+        mixed.data(), static_cast<size_t>(8.0 * rate), rate, 40, 2500);
+    CHECK(r.found);
+    CHECK(std::abs(r.second_lag_ms - r.lag_ms) > 20.0);
+}
+
+// Degenerate search range regression (mirrors
+// test_min_lag_ge_max_lag_yields_not_found): the new fields must sit at
+// their documented sentinel (0) when the window is unanalyzable, exactly
+// like lag_ms/peak_ratio already do.
+void test_min_lag_ge_max_lag_yields_zero_comb_fields() {
+    const int rate = 48000;
+    const size_t n = static_cast<size_t>(20.0 * rate);
+    const auto sig = pseudo_music(n, 42);
+
+    std::vector<float> mixed(n);
+    const size_t d = static_cast<size_t>(0.8 * rate);
+    for (size_t i = 0; i < n; ++i)
+        mixed[i] = sig[i] + (i >= d ? 0.5f * sig[i - d] : 0.0f);
+
+    const auto r = synccore::analyze_window(
+        mixed.data(), static_cast<size_t>(8.0 * rate), rate, 500, 500);
+    CHECK(r.second_lag_ms == 0);
+    CHECK(r.comb_ratio == 0);
+}
+
+// A search range narrower than the exclusion band leaves no candidate
+// outside it at all — comb_ratio/second_lag_ms must sentinel to 0 rather
+// than dividing by a nonexistent second value.
+void test_search_range_narrower_than_exclusion_yields_zero_comb_fields() {
+    const int rate = 48000;
+    const size_t n = static_cast<size_t>(20.0 * rate);
+    const auto sig = pseudo_music(n, 555);
+
+    std::vector<float> mixed(n);
+    const size_t d = static_cast<size_t>(0.8 * rate);  // 800 ms
+    for (size_t i = 0; i < n; ++i)
+        mixed[i] = sig[i] + (i >= d ? 0.5f * sig[i - d] : 0.0f);
+
+    // A 20 ms search window straddling the known 800 ms lag: entirely
+    // inside the +/-20 ms exclusion band around whatever lag scores best.
+    const auto r = synccore::analyze_window(
+        mixed.data(), static_cast<size_t>(8.0 * rate), rate, 790, 810);
+    CHECK(r.second_lag_ms == 0);
+    CHECK(r.comb_ratio == 0);
+}
+
 }  // namespace
 
 int main() {
     test_known_lag_recovered();
     test_single_source_lag_does_not_reproduce();
     test_min_lag_ge_max_lag_yields_not_found();
+    test_known_lag_comb_ratio_high();
+    test_flat_comb_low_ratio();
+    test_broad_shoulder_excludes_neighbor();
+    test_min_lag_ge_max_lag_yields_zero_comb_fields();
+    test_search_range_narrower_than_exclusion_yields_zero_comb_fields();
 
     if (g_failures == 0) {
         std::printf("dsp_tests: all tests passed\n");
