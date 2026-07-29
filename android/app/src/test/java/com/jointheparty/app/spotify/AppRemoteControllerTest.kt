@@ -112,6 +112,9 @@ private class FakeSyncEngine : SyncEngine {
         return true
     }
 
+    // CTL-01b: inert stand-in, unused by anything under test in this file.
+    override fun notifyProbeExecuted(): Boolean = true
+
     override fun submitPlayerState(positionMs: Long, isPaused: Boolean, receivedMonoNs: Long): Boolean {
         submitPlayerStateCalls += Triple(positionMs, isPaused, receivedMonoNs)
         return true

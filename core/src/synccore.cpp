@@ -104,7 +104,8 @@ struct Command {
         kPushReference,
         kBeginCalibration,
         kCancelCalibration,
-        kSampleLatencyResidual
+        kSampleLatencyResidual,
+        kProbeExecuted
     } kind;
     sc_recognition_fix_t fix{};
     sc_player_state_t player{};
@@ -212,6 +213,11 @@ struct sc_session {
         // CAL-03: reused across calls to avoid a fresh 12 s allocation per
         // referee sample (sized lazily to kHistoryFrames on first use).
         std::vector<float> residual_scratch;
+        // CTL-01a (tech-req §2.9): worker-local mirror of the last
+        // sc_player_state_t's is_paused, fed to CorrectionPolicy::on_tick as
+        // playback_live — the estimator holds is_paused privately with no
+        // getter, and it stays that way (estimator.h is untouched).
+        bool playback_paused = false;
     } wk;
 
     std::thread worker;
@@ -394,6 +400,18 @@ struct sc_session {
         }
         if (wk.policy.fix_request_due(wk.now_ns))
             dispatch(SC_EVT_REQUEST_FIX, nullptr);
+
+        // CTL-01a (tech-req §2.9): the Wittenmark turn-off trigger and both
+        // probe-request expiries are time-driven, so on_tick runs every
+        // worker iteration off capture-time progress — independent of
+        // whether any fix is being accepted at all.
+        wk.policy.on_tick(est, !wk.playback_paused, wk.now_ns);
+        if (wk.policy.probe_request_due(wk.now_ns)) {
+            sc_evt_active_probe_t probe{};
+            probe.pause_ms = wk.policy.probe_pause_ms();
+            dispatch(SC_EVT_ACTIVE_PROBE, &probe);
+        }
+
         if (wk.detector.armed()) {
             const auto det = wk.detector.poll(wk.now_ns);
             if (det.done) {
@@ -532,6 +550,10 @@ struct sc_session {
                 wk.estimator.on_player_state(cmd.player.position_ms,
                                              cmd.player.is_paused,
                                              cmd.player.received_mono_ns);
+                // CTL-01a: the estimator holds is_paused privately with no
+                // getter (estimator.h stays untouched) — mirror it here so
+                // tick() can feed playback_live to CorrectionPolicy::on_tick.
+                wk.playback_paused = cmd.player.is_paused;
                 break;
             case Command::Kind::kSeekIssued:
                 wk.now_ns = std::max(wk.now_ns, cmd.mono_ns);
@@ -649,6 +671,27 @@ struct sc_session {
                 // route_latency_prior_ms, the estimator, or the policy —
                 // this command only measures and emits.
                 dispatch(SC_EVT_LATENCY_RESIDUAL, &out);
+
+                // CTL-01a (tech-req §2.9): the referee sentinel is a pure
+                // additional consumer of this same per-window result — feed
+                // it the exact lag value that just went out in the payload
+                // (out.residual_ms, the already-rounded WindowLag lag), not
+                // the raw unrounded lag.lag_ms.
+                wk.policy.on_referee_window(static_cast<double>(out.residual_ms),
+                                            out.valid, wk.now_ns);
+                break;
+            }
+            case Command::Kind::kProbeExecuted: {
+                // CTL-01a echo (mirrors kSeekIssued): stamps the probe
+                // epoch and snapshots the pre-probe error at the moment the
+                // shell reports the pause/resume actually completed, not at
+                // SC_EVT_ACTIVE_PROBE emission (App Remote command latency
+                // is 100-500 ms and unknowable at emission time). Unlike
+                // sc_notify_seek_issued, this call carries no timestamp of
+                // its own — session time (wk.now_ns), advanced only by
+                // capture-timestamp progress, IS the epoch stamp.
+                const synccore::Estimate est = wk.estimator.estimate_at(wk.now_ns);
+                wk.policy.on_probe_executed(est.error_ms, wk.now_ns);
                 break;
             }
         }
@@ -814,6 +857,14 @@ sc_status_t sc_notify_local_playback(sc_session_t* s, int64_t commanded_position
     Command cmd;
     cmd.kind = Command::Kind::kLocalPlayback;
     cmd.value_ms = commanded_position_ms;
+    s->enqueue(std::move(cmd));
+    return SC_OK;
+}
+
+sc_status_t sc_notify_probe_executed(sc_session_t* s) {
+    if (!s) return SC_ERR_INVALID_ARG;
+    Command cmd;
+    cmd.kind = Command::Kind::kProbeExecuted;
     s->enqueue(std::move(cmd));
     return SC_OK;
 }

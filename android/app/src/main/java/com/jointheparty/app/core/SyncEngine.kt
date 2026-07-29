@@ -89,6 +89,15 @@ interface SyncEngine {
 
     fun notifyLocalPlayback(commandedPositionMs: Long): Boolean
 
+    /**
+     * CTL-01b (technical-requirements.md §2.9): echoes an executed
+     * [SyncCore.Event.ActiveProbe] — the shell must call this only after
+     * actually pausing playback, waiting `pauseMs`, and resuming; mirrors
+     * [notifySeekIssued]'s echo shape over the new `sc_notify_probe_executed`
+     * ABI call.
+     */
+    fun notifyProbeExecuted(): Boolean
+
     fun submitPlayerState(positionMs: Long, isPaused: Boolean, receivedMonoNs: Long): Boolean
 
     fun submitRecognitionFix(

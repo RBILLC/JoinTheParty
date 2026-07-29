@@ -1576,6 +1576,45 @@ class SessionViewModel(
         }
     }
 
+    // ---- Active probe (CTL-01b, technical-requirements.md §2.9) -----------
+
+    /**
+     * Executes [SyncCore.Event.ActiveProbe]: pause -> delay(pauseMs) ->
+     * resume -> [SyncEngine.notifyProbeExecuted], exactly the sequence the
+     * engine's self-match verdict measures against. Two preconditions must
+     * both hold or this does nothing and never echoes — an inconclusive
+     * probe is inconclusive BY DESIGN (§2.9), not a bug to route around:
+     *  - playback must already be live ([SpotifyController
+     *    .lastKnownPlayerState]`.isPaused == false`) — pausing something
+     *    already paused can't produce the perturbation the verdict needs;
+     *  - no calibration may be running ([CalibrationState.Running]/
+     *    [CalibrationState.ByEarRunning]) — calibration already owns
+     *    playback/capture for its own measurement.
+     *
+     * Launched on the existing session [scope]/[dispatcher], same as every
+     * other suspend call in this file — deliberately NOT a free-running
+     * timer loop. [maybeSampleReferee]'s doc comment records the JVM-test
+     * hang a `while (true) { delay(...) }` caused earlier in this file: the
+     * fix there was to never start an unbounded loop against the tests'
+     * `StandardTestDispatcher` in the first place. This coroutine is
+     * bounded — it runs the fixed pause/delay/resume/echo sequence once and
+     * completes — so `advanceUntilIdle()` finishes normally.
+     */
+    private fun onActiveProbe(event: SyncCore.Event.ActiveProbe) {
+        val playbackLive = spotify?.lastKnownPlayerState?.isPaused == false
+        val calibrating = _syncState.value.calibration == CalibrationState.Running ||
+            _syncState.value.calibration == CalibrationState.ByEarRunning
+        if (!playbackLive || calibrating) return
+
+        val controller = spotify ?: return
+        scope.launch(dispatcher) {
+            controller.pause()
+            delay(event.pauseMs.toLong())
+            controller.resume()
+            engine.notifyProbeExecuted()
+        }
+    }
+
     // ---- Engine-driven transitions -----------------------------------------
 
     private fun onEngineEvent(event: SyncCore.Event) {
@@ -1593,6 +1632,7 @@ class SessionViewModel(
             SyncCore.Event.RequestFix -> runRecognitionPass()
             is SyncCore.Event.CalibrationResult -> onCalibrationResult(event)
             is SyncCore.Event.LatencyResidual -> onLatencyResidual(event)
+            is SyncCore.Event.ActiveProbe -> onActiveProbe(event)
             // INT-02: execute the engine's micro-seek; the controller echoes
             // notifySeekIssued (settle window + latency learning).
             is SyncCore.Event.Correction -> {

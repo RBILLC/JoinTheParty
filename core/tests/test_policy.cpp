@@ -833,6 +833,397 @@ void test_closed_loop_genuine_large_jump_corrects() {
     CHECK(std::abs(true_error) <= 25.0);
 }
 
+// ---- CTL-01a: referee sentinel, probe scheduling & verdict ---------------
+// tech-req §2.9. After any room discontinuity our own audio can become a
+// perfectly continuous timeline the FT4 self-match guard cannot see. Two
+// independent triggers request a deliberate pause/resume probe; the
+// post-echo verdict either clears the suspicion or declares the track lost.
+
+// Mutually-disagreeing referee lags (spread > 50 ms, the ring's agreement
+// tolerance) spanning >= referee_starve_min_windows (4) windows and
+// >= referee_starve_ns (45 s) while converged must request exactly one
+// probe (the cooldown blocks a second even if starvation continues).
+void test_referee_sentinel_starvation_requests_probe() {
+    synccore::CorrectionPolicy pol;
+    uint64_t t = 1 * kSec;
+    // Converge the policy's cached convergence flag.
+    pol.on_estimate(make_est(5.0, 0.0, true), 100000.0, t);
+
+    // 5 windows, 12 s apart (60 s span >= 45 s), lags spread wide apart so
+    // no 3 of them ever land within 50 ms of each other.
+    const double lags[] = {100.0, 400.0, 900.0, 1500.0, 2200.0};
+    bool probe_seen = false;
+    for (double lag : lags) {
+        t += 12 * kSec;
+        pol.on_referee_window(lag, true, t);
+        if (pol.probe_request_due(t)) probe_seen = true;
+    }
+    CHECK(probe_seen);
+
+    // Resolve the probe (echo + genuine verdict) so probe_outstanding_
+    // clears — isolating the cooldown gate specifically, rather than
+    // proving only "never requested again while outstanding." Values kept
+    // well clear of lost_threshold_ms (2000) so this resolution can't
+    // itself trigger a track-lost reset.
+    t += kSec;
+    pol.on_probe_executed(550.0, t);
+    t += kSec;
+    pol.on_estimate(make_est(350.0, 0.0, true), 100000.0, t);
+    t += kSec;
+    pol.on_estimate(make_est(350.0, 0.0, true), 100000.0, t);  // genuine:
+                                                                // shift -200
+
+
+    // Cooldown (120 s) still blocks a second request even though
+    // starvation continues and no probe is outstanding anymore.
+    bool second_probe = false;
+    for (int i = 0; i < 3; ++i) {
+        t += 12 * kSec;
+        pol.on_referee_window(100.0 + i * 700.0, true, t);
+        if (pol.probe_request_due(t)) second_probe = true;
+    }
+    CHECK(!second_probe);
+}
+
+// Any 3 ringed windows agreeing within referee_agree_ms keep
+// last_referee_agree_ns fresh, so starvation never accumulates and no
+// probe is ever requested.
+void test_referee_sentinel_agreement_never_requests_probe() {
+    synccore::CorrectionPolicy pol;
+    pol.on_estimate(make_est(5.0, 0.0, true), 100000.0, 1 * kSec);
+
+    uint64_t t = 1 * kSec;
+    bool probe_seen = false;
+    for (int i = 0; i < 10; ++i) {
+        t += 12 * kSec;
+        // All windows agree at ~200 ms (well within the 50 ms tolerance).
+        pol.on_referee_window(200.0 + (i % 2 == 0 ? 5.0 : -5.0), true, t);
+        if (pol.probe_request_due(t)) probe_seen = true;
+    }
+    CHECK(!probe_seen);
+}
+
+// The sentinel requires convergence: identical starving windows while the
+// policy has never seen a converged estimate must never request a probe.
+void test_referee_sentinel_requires_convergence() {
+    synccore::CorrectionPolicy pol;
+    // No on_estimate/on_tick call with converged=true — converged_seen_
+    // stays false from construction.
+    uint64_t t = 1 * kSec;
+    bool probe_seen = false;
+    const double lags[] = {100.0, 400.0, 900.0, 1500.0, 2200.0};
+    for (double lag : lags) {
+        t += 12 * kSec;
+        pol.on_referee_window(lag, true, t);
+        if (pol.probe_request_due(t)) probe_seen = true;
+    }
+    CHECK(!probe_seen);
+}
+
+// Wittenmark turn-off trigger: valid low-confidence estimates sustained
+// past probe_turnoff_dwell_ns (20 s) with no accepted fix in the span must
+// request a probe; an accepted fix mid-dwell resets it.
+void test_turnoff_trigger_requests_probe() {
+    synccore::CorrectionPolicy pol;
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = false;
+
+    uint64_t t = 0;
+    bool probe_seen = false;
+    for (int i = 0; i <= 21; ++i) {
+        t = static_cast<uint64_t>(i) * kSec;
+        pol.on_tick(low, /*playback_live=*/true, t);
+        if (pol.probe_request_due(t)) probe_seen = true;
+    }
+    CHECK(probe_seen);
+}
+
+void test_turnoff_trigger_resets_on_accepted_fix() {
+    synccore::CorrectionPolicy pol;
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = false;
+
+    uint64_t t = 0;
+    // Dwell for 15 s (short of the 20 s threshold), then a fix is accepted.
+    for (int i = 0; i <= 15; ++i) {
+        t = static_cast<uint64_t>(i) * kSec;
+        pol.on_tick(low, true, t);
+    }
+    pol.on_fix_accepted(t);  // resets the dwell (t == 15 s here)
+
+    // The NEXT on_tick call restarts the dwell clock at its own timestamp
+    // (16 s) — not at the reset call's own 15 s. Confirm no probe through
+    // 19 s of the fresh dwell (i.e. up to 35 s absolute), then the 20th
+    // second (36 s absolute) completes it.
+    bool probe_seen = false;
+    for (int i = 1; i <= 20; ++i) {
+        t = 15 * kSec + static_cast<uint64_t>(i) * kSec;  // 16 s..35 s
+        pol.on_tick(low, true, t);
+        if (pol.probe_request_due(t)) probe_seen = true;
+    }
+    CHECK(!probe_seen);
+
+    t = 15 * kSec + 21 * kSec;  // 36 s: fresh dwell = 36 - 16 = 20 s
+    pol.on_tick(low, true, t);
+    CHECK(pol.probe_request_due(t));
+}
+
+// Rate-limit test: no probe while settling, even once the turn-off dwell
+// has technically elapsed — and the same dwell DOES fire once settling
+// ends, proving the settling check (not something else) was the blocker.
+void test_no_probe_while_settling() {
+    synccore::PolicyConfig cfg;
+    cfg.settle_ns = 30 * kSec;  // wide enough to outlast the 20 s dwell
+    synccore::CorrectionPolicy pol(cfg);
+
+    // Fire an ordinary seek at t=0, then ack it so the long settle_ns
+    // window (not the 5 s ack timeout) is what's under test.
+    const auto seek = pol.on_estimate(make_est(100.0), 100000.0, 0);
+    CHECK(seek.kind == synccore::ActionKind::kSeek);
+    pol.on_seek_issued(0);
+    CHECK(pol.is_settling(1));
+
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = false;
+
+    uint64_t t = 0;
+    bool probe_seen = false;
+    for (uint64_t sec = 1; sec <= 25; ++sec) {  // 25 s < 30 s settle window
+        t = sec * kSec;
+        pol.on_tick(low, /*playback_live=*/true, t);
+        if (pol.probe_request_due(t)) probe_seen = true;
+    }
+    CHECK(!probe_seen);  // dwell (20 s) elapsed, but settling blocked it
+
+    // Past the settle window: the same still-active dwell now fires.
+    t = 31 * kSec;
+    pol.on_tick(low, true, t);
+    CHECK(pol.probe_request_due(t));
+}
+
+void test_no_probe_while_paused() {
+    synccore::CorrectionPolicy pol;
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = false;
+
+    uint64_t t = 0;
+    bool probe_seen = false;
+    for (int i = 0; i <= 21; ++i) {
+        t = static_cast<uint64_t>(i) * kSec;
+        pol.on_tick(low, /*playback_live=*/false, t);
+        if (pol.probe_request_due(t)) probe_seen = true;
+    }
+    CHECK(!probe_seen);
+}
+
+// Verdict, genuine: two post-echo estimates shifted by ~-pause_ms clear the
+// probe without a track-lost, and the shifted residual subsequently reaches
+// §2.7's persistence gate (composition pinned in the same test).
+void test_probe_verdict_genuine_composes_with_persistence_gate() {
+    synccore::PolicyConfig cfg;
+    cfg.deadband_ms = 350.0;  // so the post-probe residual doesn't
+                              // instantaneously correct
+    synccore::CorrectionPolicy pol(cfg);
+
+    // Converge the sentinel's cached flag and arm a probe via the turn-off
+    // trigger (simplest deterministic path to an outstanding request).
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = true;
+    uint64_t t = 0;
+    for (int i = 0; i <= 20; ++i) {
+        t = static_cast<uint64_t>(i) * kSec;
+        pol.on_tick(low, true, t);
+    }
+    CHECK(pol.probe_request_due(t));
+
+    // Shell echoes: pre-probe error snapshot is whatever estimate_at reads
+    // at the echo (the worker wiring passes this in; here we drive
+    // on_probe_executed directly per the policy-level test convention).
+    // 350 ms, Vienna-class, so the post-shift residual (150) clears
+    // confirm_floor_ms (125) and can go on to reach the persistence gate.
+    t += kSec;
+    pol.on_probe_executed(/*current_error_ms=*/350.0, t);
+
+    // Two post-echo estimates shifted by -200 (== -pause_ms) qualify as
+    // genuine (mean_shift <= -pause_ms/2 == -100): 150 - 350 = -200.
+    t += kSec;
+    const auto a1 = pol.on_estimate(make_est(150.0, 0.0, true), 100000.0, t);
+    CHECK(a1.kind != synccore::ActionKind::kTrackLost);
+    t += 10 * kSec;
+    const auto a2 = pol.on_estimate(make_est(150.0, 0.0, true), 100000.0, t);
+    CHECK(a2.kind != synccore::ActionKind::kTrackLost);
+
+    // Composition: the (now-unsuppressed) ring accumulates these two
+    // above-floor converged samples; a third, spanning >= confirm_window_ns
+    // and agreeing, fires the persistence gate.
+    t += 10 * kSec;
+    const auto a3 = pol.on_estimate(make_est(150.0, 0.0, true), 100000.0, t);
+    CHECK(a3.kind == synccore::ActionKind::kSeek);
+}
+
+// Verdict, self-match: two post-echo estimates essentially unshifted (mean
+// shift near zero, nowhere close to -pause_ms/2) must return kTrackLost.
+void test_probe_verdict_self_match_returns_track_lost() {
+    synccore::CorrectionPolicy pol;
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = true;
+    uint64_t t = 0;
+    for (int i = 0; i <= 20; ++i) {
+        t = static_cast<uint64_t>(i) * kSec;
+        pol.on_tick(low, true, t);
+    }
+    CHECK(pol.probe_request_due(t));
+
+    t += kSec;
+    pol.on_probe_executed(50.0, t);
+
+    t += kSec;
+    pol.on_estimate(make_est(52.0), 100000.0, t);  // ~unshifted
+    t += kSec;
+    const auto a = pol.on_estimate(make_est(48.0), 100000.0, t);  // ~unshifted
+    CHECK(a.kind == synccore::ActionKind::kTrackLost);
+}
+
+// Verdict, inconclusive via a never-echoed request: the request simply
+// expires after probe_verdict_window_ns; the cooldown still applies (no
+// second request within probe_cooldown_ns of the first).
+void test_probe_never_echoed_expires_and_cooldown_holds() {
+    synccore::CorrectionPolicy pol;
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = true;
+    uint64_t t = 0;
+    for (int i = 0; i <= 20; ++i) {
+        t = static_cast<uint64_t>(i) * kSec;
+        pol.on_tick(low, true, t);
+    }
+    CHECK(pol.probe_request_due(t));
+    const uint64_t requested_at = t;
+
+    // No echo. Advance past probe_verdict_window_ns (20 s) with plain
+    // on_tick calls (playback still live, still low confidence, but the
+    // dwell has already fired once — a fresh dwell can't restart the probe
+    // before the cooldown anyway).
+    for (int i = 1; i <= 21; ++i) {
+        t = requested_at + static_cast<uint64_t>(i) * kSec;
+        pol.on_tick(low, true, t);
+    }
+    // Well within probe_cooldown_ns (120 s) of the first request: no second
+    // probe, confirming the expiry didn't waive the cooldown.
+    CHECK(!pol.probe_request_due(t));
+}
+
+// Verdict, inconclusive via too few post-echo fixes: fewer than
+// probe_verdict_min_fixes arrive before probe_verdict_window_ns elapses —
+// no verdict (no track-lost), and the cooldown still applies.
+void test_probe_verdict_window_expires_with_too_few_fixes() {
+    synccore::CorrectionPolicy pol;
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = true;
+    uint64_t t = 0;
+    for (int i = 0; i <= 20; ++i) {
+        t = static_cast<uint64_t>(i) * kSec;
+        pol.on_tick(low, true, t);
+    }
+    CHECK(pol.probe_request_due(t));
+
+    t += kSec;
+    pol.on_probe_executed(50.0, t);
+    const uint64_t echo_at = t;
+
+    // Exactly one post-echo estimate (probe_verdict_min_fixes is 2) — not
+    // enough to reach a verdict.
+    t += 5 * kSec;
+    const auto a = pol.on_estimate(make_est(50.0, 0.0, true), 100000.0, t);
+    CHECK(a.kind != synccore::ActionKind::kTrackLost);
+
+    // Advance past the verdict window (20 s from the echo) via on_tick:
+    // the pending verdict must expire, not linger.
+    for (uint64_t tt = echo_at + 6 * kSec; tt <= echo_at + 25 * kSec;
+         tt += kSec) {
+        t = tt;
+        pol.on_tick(low, true, t);
+    }
+    // No probe re-requested within the cooldown of the original request.
+    CHECK(!pol.probe_request_due(t));
+}
+
+// Seek suppression: an out-of-deadband estimate arriving while a probe is
+// outstanding must return kNone, never kSeek — but the lost-threshold
+// kTrackLost check keeps precedence over the suppression.
+void test_seek_suppressed_while_probe_outstanding() {
+    synccore::CorrectionPolicy pol;
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = true;
+    uint64_t t = 0;
+    for (int i = 0; i <= 20; ++i) {
+        t = static_cast<uint64_t>(i) * kSec;
+        pol.on_tick(low, true, t);
+    }
+    CHECK(pol.probe_request_due(t));  // probe now outstanding, no echo yet
+
+    // An ordinary out-of-deadband, high-confidence estimate: would fire a
+    // kSeek without a probe outstanding, but must return kNone here.
+    t += kSec;
+    const auto a = pol.on_estimate(make_est(200.0), 100000.0, t);
+    CHECK(a.kind == synccore::ActionKind::kNone);
+
+    // Track-lost precedence still holds even while a probe is outstanding.
+    t += kSec;
+    const auto lost = pol.on_estimate(make_est(2500.0), 100000.0, t);
+    CHECK(lost.kind == synccore::ActionKind::kTrackLost);
+}
+
+// Epoch: reset() clears all sentinel/probe state — starvation accumulated
+// before the reset must never fire a probe after it. Deliberately built so
+// a broken (no-op) reset would be CAUGHT: 4 disagreeing windows fed close
+// together satisfy the ring's count threshold (>=4) without yet satisfying
+// the elapsed-time threshold (45 s) — proving the ring reached capacity
+// pre-reset. After reset, converged is re-established and a single window
+// is fed at a far-future timestamp. If reset had left the ring/last-agree
+// state intact, that single call would complete a stale count>=4 PLUS read
+// a huge elapsed time off the stale last-agree stamp — arming a probe from
+// pre-reset accumulation alone. A correct reset starts the ring over at 1,
+// which can never satisfy the count threshold by itself.
+void test_probe_state_cleared_on_reset() {
+    synccore::CorrectionPolicy pol;
+    pol.on_estimate(make_est(5.0, 0.0, true), 100000.0, 1 * kSec);
+
+    uint64_t t = 1 * kSec;
+    const double lags[] = {100.0, 400.0, 900.0, 1500.0};  // meets the count
+                                                           // threshold, all
+                                                           // close together
+    for (double lag : lags) {
+        t += kSec;
+        pol.on_referee_window(lag, true, t);
+    }
+    CHECK(!pol.probe_request_due(t));  // count satisfied; elapsed time isn't
+
+    pol.reset();
+    pol.on_estimate(make_est(5.0, 0.0, true), 100000.0, 1 * kSec);
+
+    const uint64_t far_future = 10'000 * kSec;
+    pol.on_referee_window(2200.0, true, far_future);
+    CHECK(!pol.probe_request_due(far_future));
+}
+
 }  // namespace
 
 int main() {
@@ -864,6 +1255,19 @@ int main() {
     test_large_correction_track_lost_precedence();
     test_closed_loop_phantom_large_fix_held();
     test_closed_loop_genuine_large_jump_corrects();
+    test_referee_sentinel_starvation_requests_probe();
+    test_referee_sentinel_agreement_never_requests_probe();
+    test_referee_sentinel_requires_convergence();
+    test_turnoff_trigger_requests_probe();
+    test_turnoff_trigger_resets_on_accepted_fix();
+    test_no_probe_while_settling();
+    test_no_probe_while_paused();
+    test_probe_verdict_genuine_composes_with_persistence_gate();
+    test_probe_verdict_self_match_returns_track_lost();
+    test_probe_never_echoed_expires_and_cooldown_holds();
+    test_probe_verdict_window_expires_with_too_few_fixes();
+    test_seek_suppressed_while_probe_outstanding();
+    test_probe_state_cleared_on_reset();
 
     if (g_failures == 0) {
         std::printf("policy_tests: all tests passed\n");

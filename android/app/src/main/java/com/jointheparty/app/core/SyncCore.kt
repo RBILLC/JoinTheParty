@@ -68,6 +68,14 @@ class SyncCore(
             val peakRatio: Float,
             val valid: Boolean,
         ) : Event
+
+        /**
+         * CTL-01b (technical-requirements.md §2.9): the referee sentinel or
+         * the Wittenmark turn-off trigger suspects our own audio has become
+         * the timeline. The shell must pause playback, wait [pauseMs],
+         * resume, then call [notifyProbeExecuted].
+         */
+        data class ActiveProbe(val pauseMs: Int) : Event
     }
 
     private val eventFlow = MutableSharedFlow<Event>(
@@ -156,6 +164,13 @@ class SyncCore(
     override fun notifyLocalPlayback(commandedPositionMs: Long): Boolean =
         nativeNotifyLocalPlayback(handle, commandedPositionMs) == 0
 
+    /**
+     * CTL-01b: echoes an executed [Event.ActiveProbe] (pause -> delay ->
+     * resume already performed by the caller), mirroring [notifySeekIssued]'s
+     * echo pattern over the new `sc_notify_probe_executed` ABI call.
+     */
+    override fun notifyProbeExecuted(): Boolean = nativeNotifyProbeExecuted(handle) == 0
+
     fun pushReference(samples: FloatArray, frames: Int, trackPositionMs: Long): Boolean =
         nativePushReference(handle, samples, frames, trackPositionMs) == 0
 
@@ -204,6 +219,7 @@ class SyncCore(
             4 -> Event.TrackLost
             5 -> Event.CalibrationResult(i0, i1 != 0)
             6 -> Event.LatencyResidual(i0, d0.toFloat(), i1 != 0)
+            7 -> Event.ActiveProbe(i0)
             else -> return
         }
         eventFlow.tryEmit(event)
@@ -236,6 +252,7 @@ class SyncCore(
     private external fun nativeSetAecMode(handle: Long, mode: Int): Int
     private external fun nativeNotifySeekIssued(handle: Long, targetMs: Long, issuedMonoNs: Long): Int
     private external fun nativeNotifyLocalPlayback(handle: Long, commandedPositionMs: Long): Int
+    private external fun nativeNotifyProbeExecuted(handle: Long): Int
     private external fun nativePushReference(
         handle: Long, samples: FloatArray, frames: Int, trackPositionMs: Long,
     ): Int

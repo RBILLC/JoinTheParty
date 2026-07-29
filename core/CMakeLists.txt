@@ -93,10 +93,10 @@ if(SYNCCORE_BUILD_TESTS)
     add_test(NAME lag_analyzer_selftest COMMAND lag_analyzer --selftest)
 
     # The public header must stay consumable as plain C99 — compile a pure C
-    # translation unit that includes it.
-    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/abi_c_check.c
-        "#include <synccore/synccore.h>\nint main(void) { return (int)SC_OK; }\n")
-    add_executable(synccore_abi_c_check ${CMAKE_CURRENT_BINARY_DIR}/abi_c_check.c)
+    # translation unit that includes it. Checked in under tests/ (CTL-01a)
+    # instead of generated inline, so it can carry real ABI coverage as new
+    # surface is added instead of staying a permanent one-liner.
+    add_executable(synccore_abi_c_check tests/abi_c_check.c)
     target_link_libraries(synccore_abi_c_check PRIVATE synccore)
     add_test(NAME synccore_abi_c_check COMMAND synccore_abi_c_check)
 endif()

@@ -1311,6 +1311,77 @@ class SessionViewModelTest {
         assertEquals(listOf("spotify:track:abc"), spotify.played)
     }
 
+    // ---- CTL-01b: Event.ActiveProbe (technical-requirements.md §2.9) ------
+
+    @Test
+    fun activeProbeExecutesPauseDelayResumeThenEchoesWhenPlaybackLive() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        val callLog = mutableListOf<String>()
+        spotify.probeCallLog = callLog
+        engine.probeCallLog = callLog
+        spotify.lastKnownPlayerState = livePlayerState()
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, spotify = spotify)
+
+        engine.emit(SyncCore.Event.ActiveProbe(pauseMs = 200))
+
+        // No virtual-time hang (ticket AC): a bounded 200 ms virtual delay
+        // completes instantly here rather than the free-running-timer hang
+        // maybeSampleReferee's doc comment describes — the whole suite stays
+        // ~10 s because nothing here loops.
+        advanceUntilIdle()
+
+        assertEquals(listOf("pause", "resume", "notifyProbeExecuted"), callLog)
+        assertEquals(1, engine.notifyProbeExecutedCount)
+        // The 200 ms gap was virtual (TestCoroutineScheduler time), not a
+        // real-wall-clock sleep — this test returns instantly either way.
+        assertEquals(200L, testDispatcher.scheduler.currentTime)
+    }
+
+    @Test
+    fun activeProbeDoesNothingWhenAlreadyPaused() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        val callLog = mutableListOf<String>()
+        spotify.probeCallLog = callLog
+        engine.probeCallLog = callLog
+        spotify.lastKnownPlayerState = livePlayerState(isPaused = true)
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, spotify = spotify)
+
+        engine.emit(SyncCore.Event.ActiveProbe(pauseMs = 200))
+        advanceUntilIdle()
+
+        assertEquals(emptyList<String>(), callLog)
+        assertEquals(0, engine.notifyProbeExecutedCount)
+    }
+
+    @Test
+    fun activeProbeDoesNothingDuringCalibration() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        val callLog = mutableListOf<String>()
+        spotify.probeCallLog = callLog
+        engine.probeCallLog = callLog
+        spotify.lastKnownPlayerState = livePlayerState()
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, spotify = spotify)
+
+        vm.startCalibration()
+        assertEquals(CalibrationState.Running, vm.syncState.value.calibration)
+
+        engine.emit(SyncCore.Event.ActiveProbe(pauseMs = 200))
+        advanceUntilIdle()
+
+        assertEquals(emptyList<String>(), callLog)
+        assertEquals(0, engine.notifyProbeExecutedCount)
+    }
+
+    private fun livePlayerState(isPaused: Boolean = false) = SpotifyController.RemotePlayerState(
+        trackUri = "spotify:track:abc",
+        positionMs = 1_000L,
+        isPaused = isPaused,
+        receivedMonoNs = 0L,
+    )
+
     private fun track() = TrackInfo(
         spotifyUri = "spotify:track:abc",
         isrc = "USABC1234567",
@@ -1401,6 +1472,19 @@ private class FakeSyncEngine : SyncEngine {
     override fun notifyLocalPlayback(commandedPositionMs: Long) = true
 
     override fun submitPlayerState(positionMs: Long, isPaused: Boolean, receivedMonoNs: Long) = true
+
+    // CTL-01b: shared call log, set by tests exercising Event.ActiveProbe so
+    // pause/delay/resume/notifyProbeExecuted order can be asserted across
+    // this fake and FakeSpotifyController together.
+    var probeCallLog: MutableList<String>? = null
+    var notifyProbeExecutedCount = 0
+        private set
+
+    override fun notifyProbeExecuted(): Boolean {
+        notifyProbeExecutedCount += 1
+        probeCallLog?.add("notifyProbeExecuted")
+        return true
+    }
 
     /**
      * Mirrors the real engine: an accepted fix produces an estimate. Without
@@ -1585,13 +1669,28 @@ private class FakeSpotifyController : SpotifyController {
     val played = mutableListOf<String>()
     override val playerStates: kotlinx.coroutines.flow.Flow<SpotifyController.RemotePlayerState> =
         kotlinx.coroutines.flow.MutableSharedFlow()
-    override val lastKnownPlayerState: SpotifyController.RemotePlayerState? = null
+    // CTL-01b: was a fixed-null val; ActiveProbe tests need to simulate a
+    // live (unpaused) or already-paused player state.
+    override var lastKnownPlayerState: SpotifyController.RemotePlayerState? = null
     override val isConnected: Boolean = true
     override suspend fun connect(): SpotifyController.ConnectionResult =
         SpotifyController.ConnectionResult.Connected
     override fun disconnect() = Unit
     override fun play(spotifyUri: String): Boolean { played += spotifyUri; return true }
-    override fun pause(): Boolean = true
-    override fun resume(): Boolean = true
+
+    // CTL-01b: shared call log, set by tests exercising Event.ActiveProbe —
+    // see FakeSyncEngine.probeCallLog.
+    var probeCallLog: MutableList<String>? = null
+
+    override fun pause(): Boolean {
+        probeCallLog?.add("pause")
+        return true
+    }
+
+    override fun resume(): Boolean {
+        probeCallLog?.add("resume")
+        return true
+    }
+
     override fun seekTo(positionMs: Long): Boolean = true
 }

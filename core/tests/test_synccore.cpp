@@ -600,6 +600,63 @@ void test_concurrent_capture_and_control() {
     sc_destroy(s);
 }
 
+// CTL-01a (tech-req §2.9) ABI coverage for SC_EVT_ACTIVE_PROBE /
+// sc_notify_probe_executed. The full sentinel/turn-off/verdict decision
+// logic already has a dedicated closed-form test suite at the policy level
+// (core/tests/test_policy.cpp's referee-sentinel/turn-off/verdict tests) —
+// driving that same logic end-to-end through the C ABI would mean either
+// faking a genuine acoustic echo well enough to satisfy the referee's
+// agreement ring, or reproducing the estimator's exact confidence-decay
+// curve from outside to cross the Wittenmark dwell threshold — both
+// heavier than this layer should carry, and the ticket's own acceptance
+// criteria explicitly sanction the lighter route taken here: (a) the ABI
+// check (tests/abi_c_check.c) covers the new enum value, payload struct,
+// and function compiling/linking as plain C99; (b) this test covers
+// sc_notify_probe_executed's documented contract — a null session is
+// rejected, and calling with no probe outstanding on a live session is
+// safely ignored (still SC_OK, no event fires as a side effect, and the
+// session keeps working normally afterward).
+void test_probe_executed_no_pending_is_safely_ignored() {
+    CHECK(sc_notify_probe_executed(nullptr) == SC_ERR_INVALID_ARG);
+
+    sc_config_t cfg = valid_config();
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    EventLog log;
+    CHECK(sc_set_event_callback(s, event_cb, &log) == SC_OK);
+
+    // No probe has ever been requested on this fresh session.
+    CHECK(sc_notify_probe_executed(s) == SC_OK);
+
+    // Give the worker a beat to process the command; confirm it produced
+    // no event of any kind — safely ignored, not silently mis-firing one.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(log.estimates.load() == 0);
+    CHECK(log.rejects.load() == 0);
+    CHECK(log.corrections.load() == 0);
+
+    // The session keeps working normally afterward — the stray echo left
+    // no corrupted state behind.
+    sc_player_state_t ps{};
+    ps.position_ms = 10000;
+    ps.is_paused = false;
+    ps.received_mono_ns = mono_ns();
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+
+    sc_recognition_fix_t fix{};
+    fix.source = SC_FIX_SHAZAMKIT;
+    fix.match_offset_ms = 9950;
+    fix.capture_mono_ns = mono_ns();
+    fix.confidence = 0.9f;
+    CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+
+    for (int i = 0; i < 200 && log.estimates.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.estimates.load() == 1);
+
+    sc_destroy(s);
+}
+
 }  // namespace
 
 // FIELD TEST 8 regression: the capture history must not survive a session
@@ -653,6 +710,7 @@ int main() {
     test_correction_leads_by_recognition_age();
     test_copy_recent_capture();
     test_concurrent_capture_and_control();
+    test_probe_executed_no_pending_is_safely_ignored();
 
     if (g_failures == 0) {
         std::printf("synccore_tests: all tests passed\n");

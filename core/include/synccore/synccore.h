@@ -125,6 +125,20 @@ sc_status_t sc_notify_seek_issued(sc_session_t*, int64_t target_ms,
 /* Arms the self-hearing guard (architecture-spec.md §7.3). */
 sc_status_t sc_notify_local_playback(sc_session_t*, int64_t commanded_position_ms);
 
+/* CTL-01a (technical-requirements.md §2.9): the shell MUST call this after
+ * actually executing an SC_EVT_ACTIVE_PROBE — pausing playback, waiting
+ * pause_ms, then resuming — mirroring sc_notify_seek_issued's echo shape.
+ * The core stamps the probe epoch and snapshots the pre-probe error HERE,
+ * not at SC_EVT_ACTIVE_PROBE emission, because App Remote command latency
+ * (100-500 ms) makes the true landing time unknowable at emission — the
+ * same reasoning the learned command_latency_ms already encodes for seeks.
+ * If the shell cannot execute the probe (already paused, mid-calibration),
+ * it must simply never call this; the request expires on its own after
+ * probe_verdict_window_ns and the probe cooldown still applies, so a
+ * silently-declined probe cannot be retried in a tight loop. Safe to call
+ * with no probe outstanding (silently ignored, still returns SC_OK). */
+sc_status_t sc_notify_probe_executed(sc_session_t*);
+
 /* Copies up to max_frames of the MOST RECENT capture audio (post-AEC, mono
  * float, chronological order) into out. Returns the number of frames
  * copied (0 if none yet). If out_end_mono_ns is non-NULL it receives the
@@ -223,7 +237,14 @@ typedef enum {
     SC_EVT_FIX_REJECTED,       /* payload: sc_evt_fix_rejected_t */
     SC_EVT_TRACK_LOST,         /* payload: NULL */
     SC_EVT_CALIBRATION_RESULT, /* payload: sc_evt_calibration_result_t */
-    SC_EVT_LATENCY_RESIDUAL    /* payload: sc_evt_latency_residual_t (CAL-03) */
+    SC_EVT_LATENCY_RESIDUAL,   /* payload: sc_evt_latency_residual_t (CAL-03) */
+    /* CTL-01a (technical-requirements.md §2.9): the referee sentinel or the
+     * Wittenmark turn-off trigger suspects our own audio has become the
+     * timeline (a self-match the FT4 guard cannot see). The shell must
+     * pause playback, wait pause_ms, resume, then call
+     * sc_notify_probe_executed. Appended at the END of this enum per the
+     * ticket's ABI-stability rule for existing values. */
+    SC_EVT_ACTIVE_PROBE       /* payload: sc_evt_active_probe_t */
 } sc_event_type_t;
 
 typedef struct {
@@ -265,6 +286,12 @@ typedef struct {
                             * still populated when false so callers can log
                             * the near-miss, but must not act on them */
 } sc_evt_latency_residual_t;
+
+/* CTL-01a (technical-requirements.md §2.9). The shell must pause playback,
+ * wait pause_ms, resume, then call sc_notify_probe_executed. */
+typedef struct {
+    int32_t pause_ms;
+} sc_evt_active_probe_t;
 
 typedef void (*sc_event_cb)(sc_event_type_t, const void* payload, void* user_data);
 

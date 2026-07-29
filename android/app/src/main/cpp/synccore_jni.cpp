@@ -58,6 +58,7 @@ JNIEnv* attached_env() {
 // FIX_REJECTED:       i0=reason
 // CALIBRATION_RESULT: i0=measured_latency_ms i1=valid
 // LATENCY_RESIDUAL:   i0=residual_ms d0=peak_ratio i1=valid
+// ACTIVE_PROBE:       i0=pause_ms (CTL-01b)
 // REQUEST_FIX / TRACK_LOST: no payload
 void event_trampoline(sc_event_type_t type, const void* payload, void* user) {
     auto* h = static_cast<BridgeHandle*>(user);
@@ -96,6 +97,9 @@ void event_trampoline(sc_event_type_t type, const void* payload, void* user) {
             i1 = r->valid ? 1 : 0;
             break;
         }
+        case SC_EVT_ACTIVE_PROBE:
+            i0 = static_cast<const sc_evt_active_probe_t*>(payload)->pause_ms;
+            break;
         case SC_EVT_REQUEST_FIX:
         case SC_EVT_TRACK_LOST:
             break;
@@ -265,6 +269,16 @@ Java_com_jointheparty_app_core_SyncCore_nativeNotifySeekIssued(
     return h ? sc_notify_seek_issued(h->session, target_ms,
                                      static_cast<uint64_t>(issued_mono_ns))
              : SC_ERR_INVALID_ARG;
+}
+
+// CTL-01b: the shell's echo after actually executing an SC_EVT_ACTIVE_PROBE
+// (pause -> delay(pause_ms) -> resume), mirroring nativeNotifySeekIssued's
+// echo shape (technical-requirements.md §2.9).
+JNIEXPORT jint JNICALL
+Java_com_jointheparty_app_core_SyncCore_nativeNotifyProbeExecuted(
+    JNIEnv*, jobject, jlong handle) {
+    auto* h = handle_of(handle);
+    return h ? sc_notify_probe_executed(h->session) : SC_ERR_INVALID_ARG;
 }
 
 JNIEXPORT jint JNICALL
