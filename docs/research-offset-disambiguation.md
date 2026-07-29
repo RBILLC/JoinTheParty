@@ -6,7 +6,7 @@
 
 ## 1. What each paper actually is
 
-### 1a. Avery Li-Chun Wang, "An Industrial-Strength Audio Search Algorithm," Shazam Entertainment Ltd., ICMIR 2003 (pp. 7–13; this is the paper docs/recognition-audit-2026.md's ACRCloud/ShazamKit comparison sits downstream of)
+### 1a. Avery Li-Chun Wang, "An Industrial-Strength Audio Search Algorithm," Shazam Entertainment Ltd., ISMIR 2003 (pp. 7–13; this is the paper docs/recognition-audit-2026.md's ACRCloud/ShazamKit comparison sits downstream of)
 
 Retrieved in full from `https://www.ee.columbia.edu/~dpwe/papers/Wang03-shazam.pdf` (7 pages, all text and figures legible). Confirmed byline: "Avery Li-Chun Wang, avery@shazamteam.com, Shazam Entertainment, Ltd."; abstract states the system was live "in Germany, Finland, and the UK" against "over 1.8M tracks" (§1).
 

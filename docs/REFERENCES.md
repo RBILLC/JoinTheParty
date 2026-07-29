@@ -24,7 +24,7 @@ the probe-magnitude formulas), that is stated plainly rather than implied.
 
 ## Read in full
 
-### 1. Avery Li-Chun Wang, "An Industrial-Strength Audio Search Algorithm," Shazam Entertainment Ltd., Proc. ICMIR 2003, pp. 7–13
+### 1. Avery Li-Chun Wang, "An Industrial-Strength Audio Search Algorithm," Shazam Entertainment Ltd., Proc. 4th International Conference on Music Information Retrieval (ISMIR 2003), pp. 7–13
 
 **Status: read in full** (7 pp., all text/figures legible), retrieved from
 `https://www.ee.columbia.edu/~dpwe/papers/Wang03-shazam.pdf`
@@ -258,7 +258,7 @@ delay/rate-estimate mismatch under a Smith-predictor-style feedback
 structure produces an internal **resonant** loop (H(s) =
 1 + e^(−s(L+ΔL)) − e^(−sL), with resonance peaks, not just a bounded bias)
 — is the caution behind retaining `latency_adapt_clamp_ms = 500.0` in
-`core/src/policy/policy.h` (line 59), the bound on how much a single fix
+`core/src/policy/policy.h` (`PolicyConfig`), the bound on how much a single fix
 can move the online-learned command latency. Field-test-8's 1259 ms
 overshoot from a single conf-0.74 fix is read as an instance of exactly the
 failure mode this equation predicts (research-closed-loop-control.md §3,
