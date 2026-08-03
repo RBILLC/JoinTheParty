@@ -57,7 +57,7 @@
 | CTL-02 | ✅ Done — CTL-02a/02b: persistence gate + residual ring in `CorrectionPolicy` per tech-req §2.7; closed-loop sims reproduce FT8's Vienna (one seek, −50 ms landing) and hold the deadband-150 lesson (0 seeks under scatter); five-cycle field re-verification pending | `5f03d08` |
 | CTL-03 | ✅ Done — CTL-03a/03b: `comb_ratio` in `analyze_window`+CLI (graded path byte-identical), large-correction hold in `CorrectionPolicy`; phantom sim 0 large seeks / genuine-jump sim exactly 1; field re-verification pending | `9237e3a` |
 | DSP-01a | ✅ Done — `OnsetStrengthRing` (`core/src/dsp/oss_ring.h/.cpp`) per §2.10: incremental OSS + on-demand tempogram, provisional constants named, zero-alloc guard; 8 tests incl. the orchestrator-added frozen-ring stability pin; 9/9 ctest suites | `cd1099f` |
-| DSP-01b | ⬜ Not started | — |
+| DSP-01b | ✅ Done — worker wiring (drain tap + residual-cadence estimate + kTrackLost epoch reset), `beat_comb_corroborated` (k=1..4) + `sc_test_get_beat_state` hook, `lag_analyzer --tempo`; orchestrator rewrote the flaky comb-wiring test onto coherent beat-aligned copies; 9/9 ctest ×3 | `2f63485` |
 | DSP-02a | ⬜ Not started | — |
 | DSP-02b | ⬜ Not started | — |
 | DSP-03a | ⬜ Not started | — |
