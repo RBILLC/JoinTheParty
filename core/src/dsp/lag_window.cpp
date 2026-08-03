@@ -10,7 +10,8 @@
 namespace synccore {
 
 WindowLag analyze_window(const float* x, size_t n, int rate,
-                         double min_lag_ms, double max_lag_ms) {
+                         double min_lag_ms, double max_lag_ms,
+                         double whiten_beta) {
     WindowLag result;
     const size_t nfft = next_pow2(n * 2);
     std::vector<float> padded(nfft, 0.0f);
@@ -21,14 +22,44 @@ WindowLag analyze_window(const float* x, size_t n, int rate,
 
     std::vector<kiss_fft_cpx> spec;
     fft.forward(padded, spec);
-    for (auto& b : spec) {
-        // Mild whitening (power^0.5 kept) sharpens the copy-lag peak while
-        // tolerating the music's own periodicity. See lag_window.h for why
-        // this differs from gcc_phat's full PHAT.
-        const float mag = std::sqrt(b.r * b.r + b.i * b.i) + 1e-9f;
-        const float p = (b.r * b.r + b.i * b.i) / mag;
-        b.r = p;
-        b.i = 0.0f;
+    // DSP-02a (tech-req §2.11): whiten_beta == 0.5 is the shipped default
+    // and MUST run through the exact legacy expressions below -- this is
+    // the non-negotiable byte-identical rule from the header/spec.
+    // std::pow(power, 0.5f) is NOT bit-identical to the epsilon-guarded
+    // sqrt+divide path (different rounding), and the field-test corpus
+    // grades this computation byte-for-byte, so the legacy branch is kept
+    // textually verbatim rather than "unified" into the pow() path below,
+    // even though the two are mathematically equal at beta = 0.5 in exact
+    // arithmetic.
+    if (whiten_beta == 0.5) {
+        for (auto& b : spec) {
+            // Mild whitening (power^0.5 kept) sharpens the copy-lag peak
+            // while tolerating the music's own periodicity. See
+            // lag_window.h for why this differs from gcc_phat's full PHAT.
+            const float mag = std::sqrt(b.r * b.r + b.i * b.i) + 1e-9f;
+            const float p = (b.r * b.r + b.i * b.i) / mag;
+            b.r = p;
+            b.i = 0.0f;
+        }
+    } else {
+        // Non-default beta (offline A/B only, per §2.11 -- never reached
+        // from on-device code since every existing call site omits this
+        // argument). p = |X|^{2(1-beta)}; the +1e-18f guard keeps the pow()
+        // base well-defined for silent bins (power == 0) without relying on
+        // pow(0, x)'s edge-case behavior, and avoids subnormal-magnitude
+        // blowups if a future beta > 1 (more whitening than full PHAT) were
+        // ever passed -- this function does not reject beta values itself
+        // (the range guard lives in lag_analyzer's CLI, since a library
+        // function called from tests/tools should stay total); a beta <= 0
+        // or > 1 outside §2.11's design space will produce a mathematically
+        // well-defined but untested result.
+        const float beta_f = static_cast<float>(whiten_beta);
+        for (auto& b : spec) {
+            const float power = b.r * b.r + b.i * b.i;
+            const float p = std::pow(power + 1e-18f, 1.0f - beta_f);
+            b.r = p;
+            b.i = 0.0f;
+        }
     }
     std::vector<float> ac;
     fft.inverse(spec, ac);

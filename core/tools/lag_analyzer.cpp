@@ -19,6 +19,16 @@
 // comb_ratio), the CTL-03a additive-column precedent — omitting --tempo
 // leaves output byte-identical to pre-DSP-01b behavior.
 //
+// DSP-02a (tech-req §2.11): --beta <v> threads a parameterized whitening
+// exponent through analyze_window (offline A/B tooling only -- see
+// dsp/lag_window.h; the on-device default stays 0.5 and is untouched by
+// this flag). The CSV gains a trailing `beta` column carrying the value,
+// appended ONLY when --beta is passed, so runs that don't exercise the flag
+// keep byte-identical output. When combined with --tempo, column order is
+// ...,comb_ratio,beta,beat_period_ms -- beta slots in BEFORE beat_period_ms
+// so §2.10's "beat_period_ms is appended last" stays literally true in
+// every flag combination (docs/dsp02a-review.md has the rationale).
+//
 // Desktop-only tool; built beside the test suite.
 
 #include <algorithm>
@@ -101,12 +111,20 @@ bool read_wav_pcm16(const char* path, Wav* out) {
     return false;
 }
 
-int run(const Wav& wav, double min_lag_ms, double max_lag_ms, bool tempo) {
+int run(const Wav& wav, double min_lag_ms, double max_lag_ms, bool tempo,
+       bool beta_passed, double beta) {
     const int rate = wav.sample_rate;
     const size_t win = static_cast<size_t>(8.0 * rate);   // 8 s windows
     const size_t hop = static_cast<size_t>(2.0 * rate);   // 2 s hop
-    if (tempo)
+    // DSP-02a: column order when both flags are passed is
+    // ...,comb_ratio,beta,beat_period_ms -- beta before beat_period_ms so
+    // "beat_period_ms appended last" (§2.10) stays literally true.
+    if (tempo && beta_passed)
+        std::printf("window_start_s,lag_ms,peak_ratio,confident,comb_ratio,beta,beat_period_ms\n");
+    else if (tempo)
         std::printf("window_start_s,lag_ms,peak_ratio,confident,comb_ratio,beat_period_ms\n");
+    else if (beta_passed)
+        std::printf("window_start_s,lag_ms,peak_ratio,confident,comb_ratio,beta\n");
     else
         std::printf("window_start_s,lag_ms,peak_ratio,confident,comb_ratio\n");
 
@@ -122,7 +140,7 @@ int run(const Wav& wav, double min_lag_ms, double max_lag_ms, bool tempo) {
 
     for (size_t start = 0; start + win <= wav.mono.size(); start += hop) {
         const auto r = analyze_window(wav.mono.data() + start, win, rate,
-                                      min_lag_ms, max_lag_ms);
+                                      min_lag_ms, max_lag_ms, beta);
         double beat_period_ms = 0.0;
         if (tempo) {
             // Push every sample that feeds the windowing, each exactly
@@ -138,11 +156,20 @@ int run(const Wav& wav, double min_lag_ms, double max_lag_ms, bool tempo) {
             const BeatEstimate est = oss.estimate_beat_period(ns_at(target));
             beat_period_ms = est.period_ms;  // 0.0 when no estimate yet
         }
-        if (tempo) {
+        if (tempo && beta_passed) {
+            std::printf("%.1f,%.1f,%.2f,%d,%.2f,%.2f,%.1f\n",
+                        static_cast<double>(start) / rate, r.lag_ms,
+                        r.peak_ratio, r.found ? 1 : 0, r.comb_ratio, beta,
+                        beat_period_ms);
+        } else if (tempo) {
             std::printf("%.1f,%.1f,%.2f,%d,%.2f,%.1f\n",
                         static_cast<double>(start) / rate, r.lag_ms,
                         r.peak_ratio, r.found ? 1 : 0, r.comb_ratio,
                         beat_period_ms);
+        } else if (beta_passed) {
+            std::printf("%.1f,%.1f,%.2f,%d,%.2f,%.2f\n",
+                        static_cast<double>(start) / rate, r.lag_ms,
+                        r.peak_ratio, r.found ? 1 : 0, r.comb_ratio, beta);
         } else {
             std::printf("%.1f,%.1f,%.2f,%d,%.2f\n",
                         static_cast<double>(start) / rate, r.lag_ms,
@@ -157,7 +184,7 @@ int run(const Wav& wav, double min_lag_ms, double max_lag_ms, bool tempo) {
 // be watched WHILE the app is running instead of after the fact — which is
 // what makes it usable as a test instrument rather than a post-mortem.
 int run_stream(int rate, int channels, double min_lag_ms, double max_lag_ms,
-              bool tempo) {
+              bool tempo, bool beta_passed, double beta) {
     const size_t win = static_cast<size_t>(8.0 * rate);
     const size_t hop = static_cast<size_t>(2.0 * rate);
     std::vector<float> buf;
@@ -176,8 +203,14 @@ int run_stream(int rate, int channels, double min_lag_ms, double max_lag_ms,
 
     std::fprintf(stderr, "stream: %d Hz, %d ch, 8s window / 2s hop\n", rate,
                  channels);
-    if (tempo)
+    // DSP-02a: same combined column order as file mode -- beta before
+    // beat_period_ms (see run()'s header comment).
+    if (tempo && beta_passed)
+        std::printf("t_s,lag_ms,peak_ratio,confident,rms_db,comb_ratio,beta,beat_period_ms\n");
+    else if (tempo)
         std::printf("t_s,lag_ms,peak_ratio,confident,rms_db,comb_ratio,beat_period_ms\n");
+    else if (beta_passed)
+        std::printf("t_s,lag_ms,peak_ratio,confident,rms_db,comb_ratio,beta\n");
     else
         std::printf("t_s,lag_ms,peak_ratio,confident,rms_db,comb_ratio\n");
     std::fflush(stdout);
@@ -214,13 +247,22 @@ int run_stream(int rate, int channels, double min_lag_ms, double max_lag_ms,
         const double rms = std::sqrt(sum_sq / static_cast<double>(win));
         const double rms_db = 20.0 * std::log10(rms + 1e-9);
 
-        const auto r =
-            analyze_window(buf.data(), win, rate, min_lag_ms, max_lag_ms);
-        if (tempo) {
+        const auto r = analyze_window(buf.data(), win, rate, min_lag_ms,
+                                      max_lag_ms, beta);
+        if (tempo && beta_passed) {
+            const BeatEstimate est = oss.estimate_beat_period(mono_ns);
+            std::printf("%.0f,%.0f,%.2f,%d,%.1f,%.2f,%.2f,%.1f\n", t,
+                        r.lag_ms, r.peak_ratio, r.found ? 1 : 0, rms_db,
+                        r.comb_ratio, beta, est.period_ms);
+        } else if (tempo) {
             const BeatEstimate est = oss.estimate_beat_period(mono_ns);
             std::printf("%.0f,%.0f,%.2f,%d,%.1f,%.2f,%.1f\n", t, r.lag_ms,
                         r.peak_ratio, r.found ? 1 : 0, rms_db, r.comb_ratio,
                         est.period_ms);
+        } else if (beta_passed) {
+            std::printf("%.0f,%.0f,%.2f,%d,%.1f,%.2f,%.2f\n", t, r.lag_ms,
+                        r.peak_ratio, r.found ? 1 : 0, rms_db, r.comb_ratio,
+                        beta);
         } else {
             std::printf("%.0f,%.0f,%.2f,%d,%.1f,%.2f\n", t, r.lag_ms,
                         r.peak_ratio, r.found ? 1 : 0, rms_db, r.comb_ratio);
@@ -272,7 +314,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: lag_analyzer <recording.wav> | --stream | "
                      "--selftest [--min-lag-ms N] [--max-lag-ms N] "
-                     "[--rate N] [--channels N] [--tempo]\n");
+                     "[--rate N] [--channels N] [--tempo] [--beta V]\n");
         return 2;
     }
     double min_lag = 40, max_lag = 2500;
@@ -289,11 +331,35 @@ int main(int argc, char** argv) {
         }
         rest.push_back(argv[i]);
     }
+    // DSP-02a: --beta <v> is a value-carrying flag, parsed in the existing
+    // pair scan (the vector DSP-01b's --tempo extraction leaves behind) so
+    // it coexists cleanly with --min-lag-ms/--max-lag-ms/--rate/--channels.
+    // `beta_passed` gates CSV column emission on the flag being PASSED, not
+    // on the value differing from 0.5 -- --beta 0.5 is a valid A/B sweep
+    // point and must still show the column.
+    double beta = 0.5;
+    bool beta_passed = false;
     for (size_t i = 0; i + 1 < rest.size(); i += 2) {
         if (rest[i] == "--min-lag-ms") min_lag = std::atof(rest[i + 1].c_str());
         if (rest[i] == "--max-lag-ms") max_lag = std::atof(rest[i + 1].c_str());
         if (rest[i] == "--rate") rate = std::atoi(rest[i + 1].c_str());
         if (rest[i] == "--channels") channels = std::atoi(rest[i + 1].c_str());
+        if (rest[i] == "--beta") {
+            beta = std::atof(rest[i + 1].c_str());
+            beta_passed = true;
+        }
+    }
+    // DSP-02a (tech-req §2.11): the design space is (0, 1] -- beta = 0 is
+    // plain autocorrelation (no whitening) and beta > 1 is more aggressive
+    // than full PHAT; both are outside §2.11's scope and a typo'd sweep
+    // value would silently produce garbage A/B data for DSP-02b, so this is
+    // a hard usage error rather than a clamp.
+    if (beta_passed && !(beta > 0.0 && beta <= 1.0)) {
+        std::fprintf(stderr,
+                     "bad --beta %.4g: must be in (0, 1] (§2.11 sweep range "
+                     "is 0.5-0.8)\n",
+                     beta);
+        return 2;
     }
     if (std::string(argv[1]) == "--stream") {
         if (rate <= 0 || channels <= 0) {
@@ -304,7 +370,8 @@ int main(int argc, char** argv) {
         // Without this the CRT mangles 0x0A/0x1A in the PCM stream.
         _setmode(_fileno(stdin), _O_BINARY);
 #endif
-        return run_stream(rate, channels, min_lag, max_lag, tempo);
+        return run_stream(rate, channels, min_lag, max_lag, tempo,
+                          beta_passed, beta);
     }
     Wav wav;
     if (!read_wav_pcm16(argv[1], &wav)) {
@@ -314,5 +381,5 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "loaded %.1fs @ %dHz\n",
                  static_cast<double>(wav.mono.size()) / wav.sample_rate,
                  wav.sample_rate);
-    return run(wav, min_lag, max_lag, tempo);
+    return run(wav, min_lag, max_lag, tempo, beta_passed, beta);
 }

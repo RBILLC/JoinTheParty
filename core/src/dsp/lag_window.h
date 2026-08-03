@@ -65,6 +65,19 @@ struct WindowLag {
 // i.e. p = (r²+i²)/mag with mag = sqrt(r²+i²)+1e-9) sharpens the peak while
 // tolerating that structure. Do not unify the two.
 //
+// DSP-02a (tech-req §2.11): the whitening exponent is now parameterized via
+// the trailing `whiten_beta` argument. In the Knapp-Carter weighted-spectrum
+// framing (Psi(f) = G(f)/|G(f)|^beta, G = |X|^2), the shipped math above is
+// exactly beta = 0.5 -- so the default below reproduces shipped behavior
+// byte-for-byte (see analyze_window's .cpp for the non-negotiable
+// byte-identical rule) and is safe to leave unpassed at every existing call
+// site, including the on-device referee. Non-default beta values are an
+// OFFLINE A/B-ONLY path for `lag_analyzer --beta`, corpus-gated per §2.11;
+// they must never be reached from on-device code until a future spec
+// section promotes a new default. This paragraph does not replace the
+// full-PHAT rejection above -- beta = 1.0 (flat) is still the same rejected
+// endpoint for single-buffer program material.
+//
 // `n` should be the 8 s window length; `nfft` internally is
 // next_pow2(n*2). `min_lag_ms`/`max_lag_ms` bound the search and are
 // clamped to nfft/2 - 1; if min_lag >= max_lag after clamping, the window is
@@ -75,7 +88,8 @@ struct WindowLag {
 // array fills WindowLag::second_lag_ms/comb_ratio — see WindowLag's doc
 // comment for the exclusion rule and sentinel semantics.
 WindowLag analyze_window(const float* x, size_t n, int rate,
-                         double min_lag_ms, double max_lag_ms);
+                         double min_lag_ms, double max_lag_ms,
+                         double whiten_beta = 0.5);
 
 }  // namespace synccore
 

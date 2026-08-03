@@ -243,6 +243,105 @@ void test_search_range_narrower_than_exclusion_yields_zero_comb_fields() {
     CHECK(r.comb_ratio == 0);
 }
 
+// --- DSP-02a: parameterized whitening exponent (beta-PHAT, §2.11) ------
+
+// Pins that the default (unpassed) whiten_beta argument routes through the
+// exact same legacy branch as an explicit 0.5 -- i.e. the two call forms
+// are not just "close," they are bit-identical across every WindowLag
+// field. This is the byte-identical rule's regression pin.
+void test_beta_default_matches_explicit_05() {
+    const int rate = 48000;
+    const double lag_s = 0.8;
+    const size_t n = static_cast<size_t>(20.0 * rate);
+    const auto sig = pseudo_music(n, 12345);
+
+    std::vector<float> mixed(n);
+    const size_t d = static_cast<size_t>(lag_s * rate);
+    for (size_t i = 0; i < n; ++i)
+        mixed[i] = sig[i] + (i >= d ? 0.5f * sig[i - d] : 0.0f);
+
+    const auto r_default = synccore::analyze_window(
+        mixed.data(), static_cast<size_t>(8.0 * rate), rate, 40, 2500);
+    const auto r_explicit = synccore::analyze_window(
+        mixed.data(), static_cast<size_t>(8.0 * rate), rate, 40, 2500, 0.5);
+
+    CHECK(r_default.lag_ms == r_explicit.lag_ms);
+    CHECK(r_default.peak_ratio == r_explicit.peak_ratio);
+    CHECK(r_default.found == r_explicit.found);
+    CHECK(r_default.second_lag_ms == r_explicit.second_lag_ms);
+    CHECK(r_default.comb_ratio == r_explicit.comb_ratio);
+}
+
+// The pow-based non-default path is functional, not merely present: it
+// still finds the known lag on the house two-copy synthetic, for every beta
+// in the §2.11 sweep range. This does NOT claim the pow path is better than
+// 0.5 -- only that it's a working lag finder, per DSP-02a's scope (the
+// promotion decision is DSP-02b's, not this ticket's).
+void test_beta_nondefault_finds_known_lag() {
+    const int rate = 48000;
+    const double lag_s = 0.8;
+    const size_t n = static_cast<size_t>(20.0 * rate);
+    const auto sig = pseudo_music(n, 12345);
+
+    std::vector<float> mixed(n);
+    const size_t d = static_cast<size_t>(lag_s * rate);
+    for (size_t i = 0; i < n; ++i)
+        mixed[i] = sig[i] + (i >= d ? 0.5f * sig[i - d] : 0.0f);
+
+    const double betas[] = {0.6, 0.7, 0.8};
+    for (double beta : betas) {
+        const auto r = synccore::analyze_window(
+            mixed.data(), static_cast<size_t>(8.0 * rate), rate, 40, 2500,
+            beta);
+        CHECK(r.found);
+        CHECK(std::abs(r.lag_ms - 800.0) <= 5.0);
+    }
+}
+
+// Guards against a future "simplification" that unifies the 0.5 branch and
+// the pow branch into one expression (they agree in exact arithmetic at
+// beta = 0.5, which is exactly the trap): at a non-default beta, at least
+// one raw output field must differ from the beta = 0.5 run on the same
+// input, proving the pow path is a genuinely different computation.
+void test_beta_nondefault_differs_from_legacy() {
+    const int rate = 48000;
+    const double lag_s = 0.8;
+    const size_t n = static_cast<size_t>(20.0 * rate);
+    const auto sig = pseudo_music(n, 12345);
+
+    std::vector<float> mixed(n);
+    const size_t d = static_cast<size_t>(lag_s * rate);
+    for (size_t i = 0; i < n; ++i)
+        mixed[i] = sig[i] + (i >= d ? 0.5f * sig[i - d] : 0.0f);
+
+    const auto r_legacy = synccore::analyze_window(
+        mixed.data(), static_cast<size_t>(8.0 * rate), rate, 40, 2500, 0.5);
+    const auto r_beta = synccore::analyze_window(
+        mixed.data(), static_cast<size_t>(8.0 * rate), rate, 40, 2500, 0.7);
+
+    CHECK(r_legacy.peak_ratio != r_beta.peak_ratio);
+}
+
+// Silent-bin guard: an all-zeros input at a non-default beta must not
+// produce NaN/inf anywhere in WindowLag, and must land on the r0-degenerate
+// "not found" path (mean|ac| == 0, same as the legacy branch's behavior on
+// silence) rather than crashing or reporting a spurious lag.
+void test_beta_silent_input_safe() {
+    const int rate = 48000;
+    const size_t n = static_cast<size_t>(20.0 * rate);
+    std::vector<float> silence(n, 0.0f);
+
+    const auto r = synccore::analyze_window(
+        silence.data(), static_cast<size_t>(8.0 * rate), rate, 40, 2500,
+        0.7);
+
+    CHECK(!std::isnan(r.lag_ms) && !std::isinf(r.lag_ms));
+    CHECK(!std::isnan(r.peak_ratio) && !std::isinf(r.peak_ratio));
+    CHECK(!std::isnan(r.second_lag_ms) && !std::isinf(r.second_lag_ms));
+    CHECK(!std::isnan(r.comb_ratio) && !std::isinf(r.comb_ratio));
+    CHECK(!r.found);
+}
+
 }  // namespace
 
 int main() {
@@ -254,6 +353,10 @@ int main() {
     test_broad_shoulder_excludes_neighbor();
     test_min_lag_ge_max_lag_yields_zero_comb_fields();
     test_search_range_narrower_than_exclusion_yields_zero_comb_fields();
+    test_beta_default_matches_explicit_05();
+    test_beta_nondefault_finds_known_lag();
+    test_beta_nondefault_differs_from_legacy();
+    test_beta_silent_input_safe();
 
     if (g_failures == 0) {
         std::printf("dsp_tests: all tests passed\n");
