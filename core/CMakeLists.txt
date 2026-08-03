@@ -19,6 +19,7 @@ add_library(synccore STATIC
     src/correlate/correlate.cpp
     src/dsp/fft.cpp
     src/dsp/lag_window.cpp
+    src/dsp/oss_ring.cpp
     src/aec/aec.cpp
     third_party/kissfft/kiss_fft.c
     third_party/kissfft/kiss_fftr.c
@@ -82,6 +83,12 @@ if(SYNCCORE_BUILD_TESTS)
     synccore_add_test(correlate_tests tests/test_correlate.cpp)
     synccore_add_test(input_level_tests tests/test_input_level.cpp)
     synccore_add_test(dsp_tests tests/test_lag_window.cpp)
+    synccore_add_test(test_oss_ring tests/test_oss_ring.cpp)
+    # oss_ring.h (unlike lag_window.h) holds a RealFft member directly, so
+    # its header pulls in kissfft's own headers — give the test target the
+    # same private kissfft include dir the synccore library target has.
+    target_include_directories(test_oss_ring
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft)
 
     # Field-test ground-truth tool (desktop only): windowed autocorrelation
     # over a PC-mic recording of two devices playing the same song. Consumes
