@@ -231,6 +231,21 @@ BeatEstimate OnsetStrengthRing::estimate_beat_period(uint64_t now_ns) {
     return result;
 }
 
+bool beat_comb_corroborated(double second_lag_ms, const BeatEstimate& beat) {
+    // Sentinel/precondition guards (oss_ring.h's doc comment): 0 is
+    // WindowLag::second_lag_ms's own "no competitor" sentinel, not a claim
+    // of a competing lag at 0 ms; an unstable or degenerate beat estimate
+    // has nothing to corroborate against.
+    if (second_lag_ms <= 0.0 || !beat.stable || beat.period_ms <= 0.0)
+        return false;
+    for (int k = 1; k <= kMaxBeatHarmonicMultiplier; ++k) {
+        const double harmonic_ms = static_cast<double>(k) * beat.period_ms;
+        if (std::fabs(second_lag_ms - harmonic_ms) < kBeatCombAgreeMs)
+            return true;
+    }
+    return false;
+}
+
 void OnsetStrengthRing::reset() {
     stage_fill_ = 0;
 

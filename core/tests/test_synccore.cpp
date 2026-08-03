@@ -657,6 +657,271 @@ void test_probe_executed_no_pending_is_safely_ignored() {
     sc_destroy(s);
 }
 
+// ---- DSP-01b: tempogram consumer wiring (§2.10/§2.8) -------------------
+//
+// Self-contained click-track generator mirroring test_oss_ring.cpp's own
+// Lcg/write_click/click_track helpers (ticket instruction: keep this file's
+// test data inline rather than sharing a source file across test targets).
+
+struct DspClickLcg {
+    uint32_t s;
+    explicit DspClickLcg(uint32_t seed) : s(seed) {}
+    float next() {
+        s = s * 1664525u + 1013904223u;
+        return (static_cast<float>(s >> 8) / 8388608.0f) - 1.0f;
+    }
+};
+
+void dsp_write_click(std::vector<float>& sig, size_t start, DspClickLcg& rng) {
+    const size_t burst_len = static_cast<size_t>(0.004 * 48000);  // ~4 ms
+    for (size_t i = 0; i < burst_len && start + i < sig.size(); ++i) {
+        const float decay = std::exp(-3.0f * static_cast<float>(i) /
+                                     static_cast<float>(burst_len));
+        sig[start + i] += decay * rng.next();
+    }
+}
+
+// A uniform click track at `period_ms` spacing over `duration_s` seconds at
+// 48 kHz — the same band-limited-decaying-burst shape test_oss_ring.cpp's
+// click_track uses, kept independent so this file has no cross-target
+// source dependency.
+std::vector<float> dsp_click_track(double period_ms, double duration_s,
+                                   uint32_t seed) {
+    const size_t n = static_cast<size_t>(duration_s * 48000);
+    std::vector<float> sig(n, 0.0f);
+    DspClickLcg rng(seed);
+    const size_t period_samples =
+        static_cast<size_t>(period_ms * 48000.0 / 1000.0);
+    for (size_t start = 0; start < n; start += period_samples)
+        dsp_write_click(sig, start, rng);
+    return sig;
+}
+
+// Pushes sig[off, off+count) into the session's capture path via
+// sc_push_capture, 10 ms (480-sample) blocks, chunked into ~4 s bursts with
+// a short real-time drain margin between bursts so the ~12 s capture ring
+// never overflows on pushes longer than its own span — the same
+// burst-then-drain idiom test_correlate.cpp's push_two_copy_capture uses,
+// extended here for streams longer than 12 s. *ts is the running capture
+// timestamp, advanced by exactly count/48000 seconds on return.
+void dsp_push_click_range(sc_session_t* s, const std::vector<float>& sig,
+                          size_t off, size_t count, uint64_t* ts) {
+    CHECK(off + count <= sig.size());  // catch an out-of-range slice, not read past it
+    constexpr int block = 480;              // 10 ms @ 48 kHz
+    constexpr uint64_t block_ns = 10'000'000ull;
+    constexpr size_t kBurstBlocks = 400;    // ~4 s per burst
+    size_t blocks_since_drain = 0;
+    size_t pushed = 0;
+    while (pushed + static_cast<size_t>(block) <= count) {
+        sc_push_capture(s, sig.data() + off + pushed, block, *ts);
+        pushed += static_cast<size_t>(block);
+        *ts += block_ns;
+        if (++blocks_since_drain >= kBurstBlocks) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            blocks_since_drain = 0;
+        }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));  // drain margin
+}
+
+// Worker wiring + cadence (DSP-01b AC): pushing a click track through the
+// normal capture path feeds OnsetStrengthRing::push at the drain loop's
+// post-AEC tap, but estimate_beat_period is invoked ONLY on the
+// kSampleLatencyResidual cadence — never spontaneously, however much audio
+// has flowed. Three residual samples spaced >=20 s of capture time apart
+// (the module's own stability window, tech-req §2.10) should land the
+// beat_period_ms mirror near the click period.
+void test_oss_ring_wiring_and_cadence() {
+    sc_config_t cfg = valid_config();
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+
+    constexpr double kPeriodMs = 500.0;  // 120 BPM
+    // 4 chunks of 20 s each get pushed below (the initial pre-command push
+    // plus one per residual-command loop iteration) = 80 s consumed; a few
+    // seconds of margin avoids reading past the generated track's end.
+    constexpr double kTotalS = 85.0;
+    const auto click = dsp_click_track(kPeriodMs, kTotalS, 5150);
+    const size_t chunk_samples = static_cast<size_t>(20.0 * 48000);  // 20 s
+
+    uint64_t ts = 1'000'000'000ull;
+    size_t off = 0;
+
+    // First 20 s of audio, no residual command issued yet.
+    dsp_push_click_range(s, click, off, chunk_samples, &ts);
+    off += chunk_samples;
+
+    int32_t beat_comb = -1;
+    double beat_period_ms = -1.0;
+    sc_test_get_beat_state(s, &beat_comb, &beat_period_ms);
+    CHECK(beat_comb == 0);
+    CHECK(beat_period_ms == 0.0);  // never polled -> still the {0,0,false} default
+
+    // Three residual samples, each preceded by another 20 s of capture --
+    // spaced far enough apart in capture time for the module's own
+    // last-3-agree-over->=20s stability rule to have a chance to latch.
+    for (int i = 0; i < 3; ++i) {
+        dsp_push_click_range(s, click, off, chunk_samples, &ts);
+        off += chunk_samples;
+        CHECK(sc_sample_latency_residual(s) == SC_OK);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }
+
+    sc_test_get_beat_state(s, &beat_comb, &beat_period_ms);
+    if (std::abs(beat_period_ms - kPeriodMs) > 10.0) {
+        std::printf("  [cadence] beat_period_ms=%.2f (expect ~%.1f)\n",
+                   beat_period_ms, kPeriodMs);
+    }
+    CHECK(std::abs(beat_period_ms - kPeriodMs) <= 10.0);
+
+    sc_destroy(s);
+}
+
+// §2.8 cross-check wiring (DSP-01b AC). Construction matters here: a bare
+// click track of independent noise bursts has NO coherent autocorrelation
+// teeth -- burst i and burst i+k are different noise realizations, so
+// their lag-k products sum to realization noise and second_lag_ms lands
+// essentially anywhere (an earlier draft of this test asserted off such a
+// track and was a coin flip that happened to pass a few runs in a row).
+// The deterministic acoustic form of the Billie Jean ambiguity is
+// BEAT-ALIGNED COHERENT COPIES: the same underlying track superposed at
+// delays of one and two beat periods, x(t) = c(t) + c(t-625ms) +
+// c(t-1250ms). Coherent pairs then put true teeth at 625 ms (two pair
+// contributions: c0-c1, c1-c2) and 1250 ms (one: c0-c2), so
+// analyze_window's best lag is ~625 and its second_lag_ms ~1250 -- landing
+// on k=2 of the beat period the tempogram reads off the (unchanged) 625 ms
+// click grid. Every quantity the flag depends on is coherent, not
+// realization noise.
+void test_beat_comb_cross_check_wiring() {
+    sc_config_t cfg = valid_config();
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+
+    constexpr double kPeriodMs = 625.0;
+    constexpr double kTotalS = 90.0;
+    constexpr size_t kPeriodSamples = 30000;  // 625 ms @ 48 kHz, exact
+    const auto base = dsp_click_track(kPeriodMs, kTotalS, 9001);
+    std::vector<float> click(base.size());
+    for (size_t i = 0; i < base.size(); ++i) {
+        float v = base[i];
+        if (i >= kPeriodSamples) v += base[i - kPeriodSamples];
+        if (i >= 2 * kPeriodSamples) v += base[i - 2 * kPeriodSamples];
+        click[i] = v / 3.0f;  // headroom: three superposed copies
+    }
+    const size_t chunk_samples = static_cast<size_t>(20.0 * 48000);
+
+    uint64_t ts = 1'000'000'000ull;
+    size_t off = 0;
+
+    int32_t beat_comb = -1;
+    double beat_period_ms = -1.0;
+    // Poll every 20 s until the estimate stabilizes AND the comb flag
+    // latches (bounded attempts so a genuine wiring regression fails fast
+    // instead of hanging). Requiring both in the loop condition -- rather
+    // than breaking on stability and asserting the flag from that single
+    // window -- keeps one window-boundary artifact from failing the run
+    // while still requiring the flag to genuinely latch off the acoustics.
+    bool corroborated = false;
+    for (int i = 0; i < 6 && off + chunk_samples <= click.size(); ++i) {
+        dsp_push_click_range(s, click, off, chunk_samples, &ts);
+        off += chunk_samples;
+        CHECK(sc_sample_latency_residual(s) == SC_OK);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        sc_test_get_beat_state(s, &beat_comb, &beat_period_ms);
+        std::printf("  [comb] pass %d beat_period_ms=%.2f beat_comb=%d\n",
+                   i, beat_period_ms, beat_comb);
+        if (std::abs(beat_period_ms - kPeriodMs) <= 10.0 && beat_comb == 1 &&
+            i >= 2) {
+            corroborated = true;
+            break;
+        }
+    }
+    CHECK(corroborated);
+
+    sc_destroy(s);
+}
+
+// Dedicated, minimal event log/callback for the track-lost test below --
+// kept separate from the shared EventLog/event_cb above (which has no
+// SC_EVT_TRACK_LOST handling and is used by many other tests) rather than
+// widening a shared helper for one additive test.
+struct DspTrackLostLog {
+    std::atomic<int> track_lost{0};
+};
+
+void dsp_track_lost_cb(sc_event_type_t type, const void*, void* user) {
+    if (type == SC_EVT_TRACK_LOST)
+        static_cast<DspTrackLostLog*>(user)->track_lost.fetch_add(1);
+}
+
+// kTrackLost epoch (DSP-01b AC): after a stable beat estimate, forcing the
+// track-lost path must clear the beat-state mirrors -- a fresh epoch must
+// never let a beat estimate (or comb corroboration) survive into it, the
+// same rule §2.7's persistence ring and CorrectionPolicy::reset() already
+// follow. Track-lost is forced the same way test_policy.cpp's own
+// track-lost tests do it: a single huge-error fix (|error_ms| far past
+// lost_threshold_ms=2000) fires kTrackLost immediately, even on the very
+// first-ever fix, since the outlier gate only engages once the filter is
+// already confident (p00_ small) -- not true before any fix has landed.
+void test_track_lost_clears_beat_state() {
+    sc_config_t cfg = valid_config();
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+
+    constexpr double kPeriodMs = 500.0;
+    constexpr double kTotalS = 65.0;
+    const auto click = dsp_click_track(kPeriodMs, kTotalS, 3113);
+    const size_t chunk_samples = static_cast<size_t>(20.0 * 48000);
+
+    uint64_t ts = 1'000'000'000ull;
+    size_t off = 0;
+    for (int i = 0; i < 3; ++i) {
+        dsp_push_click_range(s, click, off, chunk_samples, &ts);
+        off += chunk_samples;
+        CHECK(sc_sample_latency_residual(s) == SC_OK);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }
+
+    int32_t beat_comb = -1;
+    double beat_period_ms = -1.0;
+    sc_test_get_beat_state(s, &beat_comb, &beat_period_ms);
+    if (std::abs(beat_period_ms - kPeriodMs) > 10.0) {
+        std::printf("  [track-lost] pre-lost beat_period_ms=%.2f "
+                   "(expect ~%.1f)\n",
+                   beat_period_ms, kPeriodMs);
+    }
+    CHECK(std::abs(beat_period_ms - kPeriodMs) <= 10.0);  // sanity: really did lock
+
+    // Force kTrackLost: first-ever fix, huge offset well past
+    // lost_threshold_ms (2000 ms) in magnitude.
+    const uint64_t fix_ns = ts + 1'000'000'000ull;
+    sc_player_state_t ps{};
+    ps.position_ms = 60'000;
+    ps.is_paused = false;
+    ps.received_mono_ns = fix_ns;
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+
+    DspTrackLostLog log;
+    CHECK(sc_set_event_callback(s, dsp_track_lost_cb, &log) == SC_OK);
+
+    sc_recognition_fix_t fix{};
+    fix.source = SC_FIX_SHAZAMKIT;
+    fix.match_offset_ms = 54'000;  // ~6 s off -> |error_ms| well past 2000
+    fix.capture_mono_ns = fix_ns;
+    fix.confidence = 0.9f;
+    CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+
+    for (int i = 0; i < 400 && log.track_lost.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.track_lost.load() >= 1);  // sanity: the forcing actually worked
+
+    sc_test_get_beat_state(s, &beat_comb, &beat_period_ms);
+    CHECK(beat_comb == 0);
+    CHECK(beat_period_ms == 0.0);
+
+    sc_destroy(s);
+}
+
 }  // namespace
 
 // FIELD TEST 8 regression: the capture history must not survive a session
@@ -711,6 +976,9 @@ int main() {
     test_copy_recent_capture();
     test_concurrent_capture_and_control();
     test_probe_executed_no_pending_is_safely_ignored();
+    test_oss_ring_wiring_and_cadence();
+    test_beat_comb_cross_check_wiring();
+    test_track_lost_clears_beat_state();
 
     if (g_failures == 0) {
         std::printf("synccore_tests: all tests passed\n");

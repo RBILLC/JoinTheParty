@@ -97,6 +97,11 @@ if(SYNCCORE_BUILD_TESTS)
     target_link_libraries(lag_analyzer PRIVATE synccore)
     target_include_directories(lag_analyzer
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    # DSP-01b: --tempo pulls in dsp/oss_ring.h, which (like test_oss_ring
+    # above) holds a RealFft member directly and so needs kissfft's private
+    # include dir too — same precedent, same reason.
+    target_include_directories(lag_analyzer
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft)
     add_test(NAME lag_analyzer_selftest COMMAND lag_analyzer --selftest)
 
     # The public header must stay consumable as plain C99 — compile a pure C

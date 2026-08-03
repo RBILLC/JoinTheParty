@@ -10,11 +10,18 @@
 // Output: CSV on stdout — window_start_s, lag_ms, peak_ratio — ready to
 // overlay against the engine's `sync err` trace.
 //
-//   lag_analyzer recording.wav [--min-lag-ms 40] [--max-lag-ms 2500]
+//   lag_analyzer recording.wav [--min-lag-ms 40] [--max-lag-ms 2500] [--tempo]
+//   lag_analyzer --stream [--rate 48000] [--channels 1] [--tempo]
 //   lag_analyzer --selftest
+//
+// DSP-01b (tech-req §2.10/§2.8): --tempo runs an OnsetStrengthRing over the
+// same audio stream and appends a beat_period_ms column LAST (after
+// comb_ratio), the CTL-03a additive-column precedent — omitting --tempo
+// leaves output byte-identical to pre-DSP-01b behavior.
 //
 // Desktop-only tool; built beside the test suite.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -29,9 +36,12 @@
 #endif
 
 #include "dsp/lag_window.h"
+#include "dsp/oss_ring.h"
 
 namespace {
 
+using synccore::BeatEstimate;
+using synccore::OnsetStrengthRing;
 using synccore::WindowLag;
 using synccore::analyze_window;
 
@@ -91,17 +101,53 @@ bool read_wav_pcm16(const char* path, Wav* out) {
     return false;
 }
 
-int run(const Wav& wav, double min_lag_ms, double max_lag_ms) {
+int run(const Wav& wav, double min_lag_ms, double max_lag_ms, bool tempo) {
     const int rate = wav.sample_rate;
     const size_t win = static_cast<size_t>(8.0 * rate);   // 8 s windows
     const size_t hop = static_cast<size_t>(2.0 * rate);   // 2 s hop
-    std::printf("window_start_s,lag_ms,peak_ratio,confident,comb_ratio\n");
+    if (tempo)
+        std::printf("window_start_s,lag_ms,peak_ratio,confident,comb_ratio,beat_period_ms\n");
+    else
+        std::printf("window_start_s,lag_ms,peak_ratio,confident,comb_ratio\n");
+
+    // DSP-01b: constructed unconditionally (cheap, a few KB once) but fed/
+    // polled only when --tempo is passed, so a plain run's OUTPUT is
+    // byte-identical to pre-DSP-01b behavior.
+    OnsetStrengthRing oss(rate);
+    size_t oss_pushed = 0;
+    const auto ns_at = [rate](size_t sample_pos) -> uint64_t {
+        return static_cast<uint64_t>(static_cast<double>(sample_pos) /
+                                     rate * 1e9);
+    };
+
     for (size_t start = 0; start + win <= wav.mono.size(); start += hop) {
         const auto r = analyze_window(wav.mono.data() + start, win, rate,
                                       min_lag_ms, max_lag_ms);
-        std::printf("%.1f,%.1f,%.2f,%d,%.2f\n",
-                    static_cast<double>(start) / rate, r.lag_ms, r.peak_ratio,
-                    r.found ? 1 : 0, r.comb_ratio);
+        double beat_period_ms = 0.0;
+        if (tempo) {
+            // Push every sample that feeds the windowing, each exactly
+            // once, in stream order: advance the ring's cursor up through
+            // the end of THIS window (win > hop, so consecutive windows
+            // overlap; only the newly-covered tail is pushed each time).
+            const size_t target = std::min(start + win, wav.mono.size());
+            if (target > oss_pushed) {
+                oss.push(wav.mono.data() + oss_pushed, target - oss_pushed,
+                         ns_at(target));
+                oss_pushed = target;
+            }
+            const BeatEstimate est = oss.estimate_beat_period(ns_at(target));
+            beat_period_ms = est.period_ms;  // 0.0 when no estimate yet
+        }
+        if (tempo) {
+            std::printf("%.1f,%.1f,%.2f,%d,%.2f,%.1f\n",
+                        static_cast<double>(start) / rate, r.lag_ms,
+                        r.peak_ratio, r.found ? 1 : 0, r.comb_ratio,
+                        beat_period_ms);
+        } else {
+            std::printf("%.1f,%.1f,%.2f,%d,%.2f\n",
+                        static_cast<double>(start) / rate, r.lag_ms,
+                        r.peak_ratio, r.found ? 1 : 0, r.comb_ratio);
+        }
     }
     return 0;
 }
@@ -110,7 +156,8 @@ int run(const Wav& wav, double min_lag_ms, double max_lag_ms) {
 // line every `hop` seconds. Same analysis as the file path, but the room can
 // be watched WHILE the app is running instead of after the fact — which is
 // what makes it usable as a test instrument rather than a post-mortem.
-int run_stream(int rate, int channels, double min_lag_ms, double max_lag_ms) {
+int run_stream(int rate, int channels, double min_lag_ms, double max_lag_ms,
+              bool tempo) {
     const size_t win = static_cast<size_t>(8.0 * rate);
     const size_t hop = static_cast<size_t>(2.0 * rate);
     std::vector<float> buf;
@@ -119,9 +166,20 @@ int run_stream(int rate, int channels, double min_lag_ms, double max_lag_ms) {
     size_t since_last = 0;
     double t = 0.0;
 
+    // DSP-01b: pushed chunk-by-chunk, in real stream order, independent of
+    // `buf`'s sliding window (which erases old samples). Constructed
+    // unconditionally but fed/polled only when --tempo is passed — a plain
+    // run's output stays byte-identical.
+    OnsetStrengthRing oss(rate);
+    std::vector<float> mono_chunk;
+    uint64_t mono_ns = 0;
+
     std::fprintf(stderr, "stream: %d Hz, %d ch, 8s window / 2s hop\n", rate,
                  channels);
-    std::printf("t_s,lag_ms,peak_ratio,confident,rms_db,comb_ratio\n");
+    if (tempo)
+        std::printf("t_s,lag_ms,peak_ratio,confident,rms_db,comb_ratio,beat_period_ms\n");
+    else
+        std::printf("t_s,lag_ms,peak_ratio,confident,rms_db,comb_ratio\n");
     std::fflush(stdout);
 
     for (;;) {
@@ -129,15 +187,23 @@ int run_stream(int rate, int channels, double min_lag_ms, double max_lag_ms) {
             std::fread(chunk.data(), sizeof(int16_t), chunk.size(), stdin);
         if (got == 0) break;
         const size_t frames = got / static_cast<size_t>(channels);
+        if (tempo) mono_chunk.clear();
         for (size_t i = 0; i < frames; ++i) {
             int32_t acc = 0;
             for (int c = 0; c < channels; ++c)
                 acc += chunk[i * static_cast<size_t>(channels) +
                              static_cast<size_t>(c)];
-            buf.push_back(static_cast<float>(acc) /
-                          (32768.0f * static_cast<float>(channels)));
+            const float mono = static_cast<float>(acc) /
+                               (32768.0f * static_cast<float>(channels));
+            buf.push_back(mono);
+            if (tempo) mono_chunk.push_back(mono);
         }
         t += static_cast<double>(frames) / rate;
+        if (tempo) {
+            mono_ns = static_cast<uint64_t>(t * 1e9);
+            if (!mono_chunk.empty())
+                oss.push(mono_chunk.data(), mono_chunk.size(), mono_ns);
+        }
         since_last += frames;
         if (buf.size() > win) buf.erase(buf.begin(), buf.begin() + static_cast<long>(buf.size() - win));
         if (buf.size() < win || since_last < hop) continue;
@@ -150,8 +216,15 @@ int run_stream(int rate, int channels, double min_lag_ms, double max_lag_ms) {
 
         const auto r =
             analyze_window(buf.data(), win, rate, min_lag_ms, max_lag_ms);
-        std::printf("%.0f,%.0f,%.2f,%d,%.1f,%.2f\n", t, r.lag_ms, r.peak_ratio,
-                    r.found ? 1 : 0, rms_db, r.comb_ratio);
+        if (tempo) {
+            const BeatEstimate est = oss.estimate_beat_period(mono_ns);
+            std::printf("%.0f,%.0f,%.2f,%d,%.1f,%.2f,%.1f\n", t, r.lag_ms,
+                        r.peak_ratio, r.found ? 1 : 0, rms_db, r.comb_ratio,
+                        est.period_ms);
+        } else {
+            std::printf("%.0f,%.0f,%.2f,%d,%.1f,%.2f\n", t, r.lag_ms,
+                        r.peak_ratio, r.found ? 1 : 0, rms_db, r.comb_ratio);
+        }
         std::fflush(stdout);
     }
     return 0;
@@ -198,16 +271,29 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: lag_analyzer <recording.wav> | --stream | "
-                     "--selftest\n");
+                     "--selftest [--min-lag-ms N] [--max-lag-ms N] "
+                     "[--rate N] [--channels N] [--tempo]\n");
         return 2;
     }
     double min_lag = 40, max_lag = 2500;
     int rate = 44100, channels = 1;
-    for (int i = 2; i + 1 < argc; i += 2) {
-        if (std::string(argv[i]) == "--min-lag-ms") min_lag = std::atof(argv[i + 1]);
-        if (std::string(argv[i]) == "--max-lag-ms") max_lag = std::atof(argv[i + 1]);
-        if (std::string(argv[i]) == "--rate") rate = std::atoi(argv[i + 1]);
-        if (std::string(argv[i]) == "--channels") channels = std::atoi(argv[i + 1]);
+    // DSP-01b: --tempo is a standalone flag (no value), pulled out of the
+    // argv tail before the existing flag/value pair scan below so that scan
+    // is untouched — and therefore byte-identical when --tempo is absent.
+    bool tempo = false;
+    std::vector<std::string> rest;
+    for (int i = 2; i < argc; ++i) {
+        if (std::string(argv[i]) == "--tempo") {
+            tempo = true;
+            continue;
+        }
+        rest.push_back(argv[i]);
+    }
+    for (size_t i = 0; i + 1 < rest.size(); i += 2) {
+        if (rest[i] == "--min-lag-ms") min_lag = std::atof(rest[i + 1].c_str());
+        if (rest[i] == "--max-lag-ms") max_lag = std::atof(rest[i + 1].c_str());
+        if (rest[i] == "--rate") rate = std::atoi(rest[i + 1].c_str());
+        if (rest[i] == "--channels") channels = std::atoi(rest[i + 1].c_str());
     }
     if (std::string(argv[1]) == "--stream") {
         if (rate <= 0 || channels <= 0) {
@@ -218,7 +304,7 @@ int main(int argc, char** argv) {
         // Without this the CRT mangles 0x0A/0x1A in the PCM stream.
         _setmode(_fileno(stdin), _O_BINARY);
 #endif
-        return run_stream(rate, channels, min_lag, max_lag);
+        return run_stream(rate, channels, min_lag, max_lag, tempo);
     }
     Wav wav;
     if (!read_wav_pcm16(argv[1], &wav)) {
@@ -228,5 +314,5 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "loaded %.1fs @ %dHz\n",
                  static_cast<double>(wav.mono.size()) / wav.sample_rate,
                  wav.sample_rate);
-    return run(wav, min_lag, max_lag);
+    return run(wav, min_lag, max_lag, tempo);
 }

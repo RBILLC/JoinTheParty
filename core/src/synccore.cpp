@@ -23,6 +23,7 @@
 #include "aec/aec.h"
 #include "correlate/correlate.h"
 #include "dsp/lag_window.h"
+#include "dsp/oss_ring.h"
 #include "estimator/estimator.h"
 #include "policy/policy.h"
 #include "spsc_ring.h"
@@ -144,6 +145,18 @@ struct sc_session {
     // is worker-thread-only, unsynchronized state).
     std::atomic<int32_t> aec_mode_mirror{static_cast<int32_t>(SC_AEC_PLATFORM_ONLY)};
 
+    // DSP-01b (tech-req §2.10/§2.8): worker-maintained mirrors of the OSS
+    // tempogram's most recent estimate, relaxed store by the worker /
+    // relaxed load by the test hook sc_test_get_beat_state. Not part of the
+    // public ABI (synccore_testing.h only) — same pattern as
+    // aec_mode_mirror above. beat_comb_mirror is 0/1 rather than bool so an
+    // atomic<int32_t> can be used uniformly with the other mirrors;
+    // beat_period_ms_mirror is 0.0 whenever no estimate has ever been
+    // computed (session start) or after a kTrackLost epoch reset, exactly
+    // mirroring BeatEstimate{}'s own default.
+    std::atomic<int32_t> beat_comb_mirror{0};
+    std::atomic<double> beat_period_ms_mirror{0.0};
+
     // NAT-06b capture-history tee: circular buffer of the last ~12 s of
     // post-AEC capture, written by the worker during drain, read by
     // sc_copy_recent_capture from any thread. Guarded by history_mtx (both
@@ -213,6 +226,13 @@ struct sc_session {
         // CAL-03: reused across calls to avoid a fresh 12 s allocation per
         // referee sample (sized lazily to kHistoryFrames on first use).
         std::vector<float> residual_scratch;
+        // DSP-01b (tech-req §2.10): worker-thread-only OSS beat-period
+        // tracker, alongside residual_scratch — same non-RT worker-thread
+        // home as the referee's own scratch buffer. push() runs at the
+        // drain loop's post-AEC tap (no new capture tap); estimate_beat_
+        // period() runs only on the kSampleLatencyResidual cadence, the
+        // one shared "analysis moment" per tech-req §2.10.
+        synccore::OnsetStrengthRing oss_ring{kSupportedRateHz};
         // CTL-01a (tech-req §2.9): worker-local mirror of the last
         // sc_player_state_t's is_paused, fed to CorrectionPolicy::on_tick as
         // playback_live — the estimator holds is_paused privately with no
@@ -279,6 +299,12 @@ struct sc_session {
                 // no new tap into the capture path.
                 update_input_level(wk.scratch);
                 append_history(wk.scratch.data(), wk.scratch.size(), block_end);
+                // DSP-01b (tech-req §2.10): same post-AEC tap, no new tap.
+                // Empty blocks (wk.scratch.size() == 0) are harmless — push
+                // just accumulates zero new bytes into the frame buffer —
+                // so no special-casing here, matching append_history's own
+                // treatment immediately above.
+                wk.oss_ring.push(wk.scratch.data(), wk.scratch.size(), block_end);
             }
             if (!drained_any) decay_input_level_idle();
 
@@ -377,12 +403,22 @@ struct sc_session {
             case synccore::ActionKind::kTrackLost:
                 wk.estimator.reset();
                 wk.policy.reset();
+                // DSP-01b epoch rule (tech-req §2.10): a re-listen is a new
+                // epoch — the tempogram's OSS ring and stability history
+                // must not survive into it, exactly like the estimator/
+                // policy resets alongside it. Not spelled out verbatim in
+                // §2.10's own text, but implied by the epoch rule §2.7's
+                // persistence ring and CorrectionPolicy::reset() already
+                // follow.
+                wk.oss_ring.reset();
                 // The room timeline we were predicting is gone; a stale
                 // reference would arbitrate the re-bootstrap fixes.
                 wk.room_anchor_offset_ms = -1;
                 wk.room_anchor_confirmed = false;
                 wk.consecutive_self_rejects = 0;
                 wk.cand_offset_ms = -1;
+                beat_comb_mirror.store(0, std::memory_order_relaxed);
+                beat_period_ms_mirror.store(0.0, std::memory_order_relaxed);
                 dispatch(SC_EVT_TRACK_LOST, nullptr);
                 break;
         }
@@ -653,12 +689,19 @@ struct sc_session {
                                       std::memory_order_relaxed);
 
                 sc_evt_latency_residual_t out{};
+                // Declared here (rather than inside the `if (n > 0)` block
+                // below, where the pre-DSP-01b code computed it) so the
+                // §2.8 cross-check after dispatch/on_referee_window can
+                // still read lag.second_lag_ms from this same window's
+                // result; WindowLag{}'s default (second_lag_ms = 0, its own
+                // "no competitor" sentinel) is exactly right when n <= 0.
+                synccore::WindowLag lag;
                 if (n > 0) {
                     // Single-buffer autocorrelation, no reference signal
                     // (tech-req §2.6): the mic hears two copies of the same
                     // song (ours and the room's); the peak between them is
                     // the acoustic error a listener perceives.
-                    const synccore::WindowLag lag = synccore::analyze_window(
+                    lag = synccore::analyze_window(
                         wk.residual_scratch.data(), static_cast<size_t>(n),
                         kSupportedRateHz, kResidualMinLagMs, kResidualMaxLagMs);
                     out.residual_ms = static_cast<int32_t>(std::lround(lag.lag_ms));
@@ -679,6 +722,28 @@ struct sc_session {
                 // the raw unrounded lag.lag_ms.
                 wk.policy.on_referee_window(static_cast<double>(out.residual_ms),
                                             out.valid, wk.now_ns);
+
+                // DSP-01b (tech-req §2.10): the kSampleLatencyResidual
+                // cadence is the one shared "analysis moment" the tempogram
+                // is polled on — estimate_beat_period is called nowhere
+                // else. The frozen-ring guard inside OnsetStrengthRing
+                // (docs/dsp01a-review.md's orchestrator addition) already
+                // makes duplicate polls harmless, so no extra caller-side
+                // "did capture actually progress" bookkeeping is needed
+                // here.
+                const synccore::BeatEstimate beat =
+                    wk.oss_ring.estimate_beat_period(wk.now_ns);
+                // §2.8 cross-check: corroborates (or not) the SAME window's
+                // second_lag_ms — read-only diagnostic, never gates
+                // anything above. When n <= 0, `lag` is still WindowLag{}'s
+                // default (second_lag_ms == 0), which
+                // beat_comb_corroborated already treats as "no competitor."
+                const bool beat_comb =
+                    synccore::beat_comb_corroborated(lag.second_lag_ms, beat);
+                beat_comb_mirror.store(beat_comb ? 1 : 0,
+                                       std::memory_order_relaxed);
+                beat_period_ms_mirror.store(beat.period_ms,
+                                            std::memory_order_relaxed);
                 break;
             }
             case Command::Kind::kProbeExecuted: {
@@ -981,6 +1046,20 @@ void sc_test_get_aec_mode(sc_session_t* s, sc_aec_mode_t* out_mode) {
     if (!s || !out_mode) return;
     *out_mode = static_cast<sc_aec_mode_t>(
         s->aec_mode_mirror.load(std::memory_order_relaxed));
+}
+
+// DSP-01b: last OSS tempogram state the worker computed, from the most
+// recent kSampleLatencyResidual analysis moment — lets a test confirm the
+// drain-loop wiring/cadence and the §2.8 cross-check without any ABI
+// surface (mirrors sc_test_get_aec_mode's pattern above).
+void sc_test_get_beat_state(sc_session_t* s, int32_t* out_beat_comb,
+                            double* out_beat_period_ms) {
+    if (!s) return;
+    if (out_beat_comb)
+        *out_beat_comb = s->beat_comb_mirror.load(std::memory_order_relaxed);
+    if (out_beat_period_ms)
+        *out_beat_period_ms =
+            s->beat_period_ms_mirror.load(std::memory_order_relaxed);
 }
 
 }  // extern "C"

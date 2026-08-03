@@ -384,6 +384,60 @@ void test_reset_clears_stability_and_ring() {
     CHECK(!after.stable);
 }
 
+// --- Test 8: DSP-01b's beat_comb_corroborated pure function -------------
+//
+// Pure-function tests, no OnsetStrengthRing instance needed — just
+// BeatEstimate values constructed directly, mirroring how the worker reads
+// them off oss_ring's own output. Cases straight from the DSP-01b ticket.
+
+synccore::BeatEstimate make_beat(double period_ms, bool stable) {
+    synccore::BeatEstimate b;
+    b.period_ms = period_ms;
+    b.stable = stable;
+    return b;
+}
+
+void test_beat_comb_corroborated_k2_within_tolerance() {
+    // stable beat 500 ms, second_lag_ms 1000.5 -> true (k=2, |0.5| < 30 ms).
+    const auto beat = make_beat(500.0, true);
+    CHECK(synccore::beat_comb_corroborated(1000.5, beat));
+}
+
+void test_beat_comb_corroborated_k4_within_range() {
+    // stable beat 500 ms, second_lag_ms 2000.0 -> true (k=4 exactly) --
+    // pins the PM-directed multiplier range (spec text alone only implies
+    // "a small integer," the ticket's own negative test only exercises
+    // k=1..3, so k=4 needs its own dedicated positive pin).
+    const auto beat = make_beat(500.0, true);
+    CHECK(synccore::beat_comb_corroborated(2000.0, beat));
+}
+
+void test_beat_comb_not_corroborated_no_nearby_harmonic() {
+    // stable beat 500 ms, second_lag_ms 760 -> false (no k in [1,4] lands
+    // within 30 ms: nearest candidates are 500ms(k=1, |260| off) and
+    // 1000ms(k=2, |240| off)).
+    const auto beat = make_beat(500.0, true);
+    CHECK(!synccore::beat_comb_corroborated(760.0, beat));
+}
+
+void test_beat_comb_not_corroborated_when_unstable() {
+    // non-stable beat, second_lag_ms exactly 2x period -> false: stability
+    // is required regardless of how exact the harmonic alignment is.
+    const auto beat = make_beat(500.0, /*stable=*/false);
+    CHECK(!synccore::beat_comb_corroborated(1000.0, beat));
+}
+
+void test_beat_comb_sentinels() {
+    // second_lag_ms == 0 is WindowLag's own "no competitor" sentinel.
+    const auto beat = make_beat(500.0, true);
+    CHECK(!synccore::beat_comb_corroborated(0.0, beat));
+
+    // beat.period_ms == 0 (e.g. a fresh/never-estimated BeatEstimate{}) has
+    // nothing to corroborate against, even if (degenerately) marked stable.
+    auto degenerate = make_beat(0.0, true);
+    CHECK(!synccore::beat_comb_corroborated(1000.0, degenerate));
+}
+
 }  // namespace
 
 int main() {
@@ -395,6 +449,11 @@ int main() {
     test_zero_allocation_after_construction();
     test_frozen_ring_does_not_latch_stable();
     test_reset_clears_stability_and_ring();
+    test_beat_comb_corroborated_k2_within_tolerance();
+    test_beat_comb_corroborated_k4_within_range();
+    test_beat_comb_not_corroborated_no_nearby_harmonic();
+    test_beat_comb_not_corroborated_when_unstable();
+    test_beat_comb_sentinels();
 
     if (g_failures == 0) {
         std::printf("test_oss_ring: all tests passed\n");

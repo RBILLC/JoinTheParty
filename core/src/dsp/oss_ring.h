@@ -26,6 +26,18 @@
 
 namespace synccore {
 
+// DSP-01b (§2.10/§2.8 cross-check): k ranges over
+// [1, kMaxBeatHarmonicMultiplier]. Per the PM directive,
+// kMaxBeatHarmonicMultiplier = 4 — §2.10's spec text says only "a small
+// integer k," so 4 is within that latitude; note this is wider than the
+// ticket's own negative test, which only exercises k = 1..3 (see
+// docs/dsp01b-review.md), so k = 4's corroborating behavior is pinned by a
+// dedicated positive test rather than inherited from that negative case.
+constexpr int kMaxBeatHarmonicMultiplier = 4;
+// Agreement tolerance for the cross-check, ms — matches §2.8/§2.10's own
+// "|second_lag_ms - k*beat_period_ms| < 30 ms" wording verbatim.
+constexpr double kBeatCombAgreeMs = 30.0;
+
 // tech-req §2.10's confidence contract, verbatim: `salience` is a
 // diagnostics/CSV-only export — `s(l*) / mean(s)` over the search band,
 // an extreme-value statistic computed over a single array, exactly the
@@ -33,11 +45,36 @@ namespace synccore {
 // §2.6) warns cannot be trusted as a threshold. `stable` is gated ONLY by
 // the three-estimate agreement-over-time rule below; no caller may add a
 // salience floor to `stable` or to anything downstream of it.
+//
+// MHT hypothesis-bank seeding contract (DSP-01b, tech-req §2.10's
+// "Consumers" list; research-closed-loop-control.md §5 item 3): the FUTURE
+// hypothesis bank — not implemented by this ticket, its own separately
+// specced work — seeds its per-fix hypothesis offsets at
+// `fix_offset ± k*beat_period_ms`, k = 1..3, once `stable` is true,
+// replacing a single-window guess at the comb spacing. No bank code exists
+// anywhere in this tree yet. Restated per the standing hard limits (§2.10):
+// neither the future bank nor the §2.8 cross-check below ever touches
+// self-match handling — CTL-01 (§2.9) owns that problem exclusively — and
+// `salience`/`peak_ratio` are never evidence for either.
 struct BeatEstimate {
     double period_ms = 0;
     double salience = 0;
     bool stable = false;
 };
+
+// §2.10/§2.8 cross-check (DSP-01b): true when second_lag_ms sits within
+// kBeatCombAgreeMs of a small integer multiple k in
+// [1, kMaxBeatHarmonicMultiplier] of a STABLE beat period — the competitor
+// autocorrelation peak analyze_window found is then corroborated as the
+// music's own beat comb (the Billie Jean harmonic-churn class), not a
+// genuine second copy. Read-only diagnostic; never gates a correction, and
+// never touches self-match handling (CTL-01's exclusive territory) — this
+// is a pure function of its two scalar/struct arguments, nothing else.
+//
+// False unless beat.stable, beat.period_ms > 0, and second_lag_ms > 0 (0
+// is WindowLag::second_lag_ms's own "no competitor" sentinel — see
+// lag_window.h).
+bool beat_comb_corroborated(double second_lag_ms, const BeatEstimate& beat);
 
 class OnsetStrengthRing {
 public:

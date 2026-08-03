@@ -22,6 +22,14 @@ void sc_test_stats(sc_session_t*, uint64_t* frames_consumed,
  * forced-OFF measurement window. */
 void sc_test_get_aec_mode(sc_session_t*, sc_aec_mode_t* out_mode);
 
+/* DSP-01b: reads the worker's most recent OSS tempogram state — the
+ * beat_period_ms mirror (0.0 if no estimate has been computed yet, or
+ * since the last kTrackLost epoch reset) and the §2.8 beat-comb
+ * cross-check flag (0/1) from the most recent kSampleLatencyResidual
+ * analysis moment, the only place estimate_beat_period is polled. */
+void sc_test_get_beat_state(sc_session_t*, int32_t* out_beat_comb,
+                            double* out_beat_period_ms);
+
 #ifdef __cplusplus
 }
 #endif
