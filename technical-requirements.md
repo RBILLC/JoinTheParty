@@ -397,6 +397,182 @@ The existing argmax, `peak_ratio` (max/mean — an extreme-value statistic over 
 
 ---
 
+### 2.10 OSS beat-period tracker (autocorrelation tempogram)
+
+**Status.** Design only — this section specs a new module (`core/src/dsp/oss_ring.h/.cpp`); nothing here is implemented. It is the mission-item-3 dependency the comb-ambiguity hypothesis bank (research-closed-loop-control.md §5 item 3, and §2.8's "no live correction-path consumer" note) has been waiting on: a principled beat-period estimate to seed the bank's hypothesis offsets, replacing "guess the comb spacing from one window."
+
+**Correction to the original brief, load bearing.** There is no 12 s STFT ring buffer anywhere in the tree. What exists is the 12 s **post-AEC PCM** history ring (`kHistoryFrames = 48000 × 12` mono floats in `synccore.cpp`, written by `append_history()` during worker drain, read via `sc_copy_recent_capture`) — no spectral structure is stored. This feature adds a new **incremental onset-strength ring**, computed as capture drains, alongside `append_history`'s existing post-AEC tap; it does not read a buffer that doesn't exist (research-dsp-upgrades.md §0.1).
+
+**Onset Strength Signal (spectral flux), computed incrementally.** Per-frame processing on the same post-AEC samples `append_history` already sees, no new capture tap:
+
+- Frame `N = 1024` samples (21.33 ms at 48 kHz), hop `H = 512` (10.67 ms), Hann window. OSS rate `F_oss = 48000/512 = 93.75 Hz`.
+- Real FFT per frame (the existing kissfft wrapper, `RealFft(1024)`): `X(m,k)`, `k = 0..512`.
+- Log compression: `Y(m,k) = ln(1 + γ·|X(m,k)|)` — flattens dynamics so quiet passages still contribute onsets.
+- Half-wave-rectified spectral flux: `Δ(m) = Σ_k max(0, Y(m,k) − Y(m−1,k))`.
+- Local-mean removal (kills slow loudness ramps, keeps pulses): `o(m) = max(0, Δ(m) − mean(Δ(m−W..m+W)))`, `W ≈ 47` (≈ ±0.5 s), implemented causally via a 94-sample running-sum delay line — the ~0.5 s output delay is irrelevant, the consumer looks at 12 s of history, not the newest sample.
+- Storage: fixed ring `M = 1125` OSS values ≈ 12 s, mirroring the PCM history's span. All buffers sized at init, zero allocation after init, worker-thread-only (same non-RT position as the referee).
+
+Cost: ~94 FFTs of 1024/s plus O(N) bin math, well under 1 ms CPU per second of audio.
+
+**Beat period via on-demand 1D autocorrelation of the OSS.** Not run every frame — proposed cadence is alongside each referee sample (the `kSampleLatencyResidual` rhythm), one shared "analysis moment" per window:
+
+```
+r(ℓ) = (1 / (M − ℓ)) · Σ_{m=0}^{M−1−ℓ} o(m)·o(m+ℓ)      (unbiased)
+r̂(ℓ) = r(ℓ) / r(0)                                       (normalized)
+```
+
+Search `ℓ ∈ [24, 112]` bins ⇔ lag 250–1200 ms ⇔ 240–50 BPM. Tempo-octave disambiguation by harmonic reinforcement before the argmax:
+
+```
+s(ℓ) = r̂(ℓ) + 0.5·r̂(2ℓ)          (2ℓ ≤ 224 always exists in the full array)
+```
+
+Sub-bin refinement, parabolic interpolation around the winning `ℓ*`:
+
+```
+δ = 0.5·(r̂(ℓ*−1) − r̂(ℓ*+1)) / (r̂(ℓ*−1) − 2·r̂(ℓ*) + r̂(ℓ*+1))
+beat_period_ms = 1000 · (ℓ* + δ) / 93.75
+```
+
+Bin quantization alone is 10.67 ms; interpolation brings the estimate to ~2–3 ms, comfortably inside the MHT gates' tolerances.
+
+**Provisional constants — do not treat as final.** `γ = 100` (log-compression) and the `0.5` harmonic-sum weight are cited from model knowledge, not yet retrieved against the primary sources (Peeters 2007; Grosche & Müller 2011 — research-dsp-upgrades.md §5). Per `docs/REFERENCES.md`'s retrieval-honesty convention, both are **provisional pending primary-source retrieval, and field-tunable** — the implementing ticket must not silently freeze them as load-bearing constants the way `confirm_floor_ms` (§2.7) was after its RFC 5905 grounding was resolved. If the retrieved papers give different values, this section's numbers are wrong, not the papers.
+
+**Confidence: reproducibility across windows, never a single-array threshold.** The standing warning from §2.6/§2.9 applies verbatim here: a peak-vs-mean ratio computed over one array is an extreme-value statistic (§2.6's `sqrt(2 ln N)` analysis), not evidence. The contract:
+
+```cpp
+struct BeatEstimate { double period_ms; double salience; bool stable; };
+```
+
+`stable` requires the **last 3 estimates to agree within ±10 ms while spanning ≥ 20 s** — reusing the §2.7 `confirm_window_ns` idiom (a handful of estimates seconds apart is not yet "persistent") rather than inventing a new agreement rule. `salience = s(ℓ*) / mean(s)` is exported for **diagnostics/CSV only** — it is never an admission gate on `stable` or on anything a consumer treats as evidence, for exactly the reason `peak_ratio` cannot gate the §2.6 referee.
+
+**Placement.** New `core/src/dsp/oss_ring.h/.cpp`: `OnsetStrengthRing::push(samples, n)` called from the worker drain loop; `OnsetStrengthRing::estimate_beat_period()` called on demand. Owned by `sc_session::wk`, alongside `residual_scratch` — same non-RT worker-thread home as the referee's own scratch buffer.
+
+**Consumers.**
+
+- **MHT hypothesis-bank seeding (the point of this feature).** Hypothesis offsets for the bank = `fix_offset ± k·beat_period_ms`, `k = 1..3`, replacing a guess at the comb spacing from a single window. The χ²/existence machinery is per research-closed-loop-control.md §5 item 3 and is unchanged by this section.
+- **§2.8 cross-check.** If `|WindowLag.second_lag_ms − k·beat_period_ms| < 30 ms` for a small integer `k`, the competitor peak `analyze_window` found is the music's own beat comb — corroborating a low `comb_ratio` reading as *ambiguity* (the Billie Jean class) rather than a genuine second copy. `second_lag_ms` remains the free, already-shipped cross-check; the tempogram is the principled estimator, not a replacement for it.
+- Optional UI BPM readout, and a `beat_period_ms` column appended **last** to `lag_analyzer` CSVs behind a `--tempo` flag — the CTL-03a precedent (§2.8's `comb_ratio` column): additive columns only, so positional parsers on the field rig don't break.
+
+**Hard limits, restated verbatim from the research doc (standing warnings 3–4).** The hypothesis bank **never touches self-match** — its clutter is self-correlated by construction; CTL-01 (§2.9) owns that problem exclusively, and this feature must not grow a second self-match defense. And **nothing consumes `peak_ratio` as evidence** anywhere in this feature — not as a gate on `stable`, not as an input to `salience`, not anywhere.
+
+**Unchanged:** the C ABI, the state machine (§2.4), `analyze_window`'s graded behavior, `CorrectionPolicy`, and the estimator are all untouched — this section is a new, self-contained worker-side DSP module with a diagnostics CSV column and a future (not-yet-specified) MHT consumer. No existing test is authorized to change by this section.
+
+---
+
+### 2.11 Parameterized whitening exponent (β-PHAT)
+
+**Status.** Design only. This section specs the zero-risk first step of research-dsp-upgrades.md §2 — parameterize and A/B-test offline. It does **not** change the on-device default; that is an explicit non-goal of this section's scope (below).
+
+**Correction to the original brief, load bearing.** The shipped whitening in `lag_window.cpp` already *is* fractional GCC weighting, at β = 0.5. `lag_window.cpp` keeps `p = |X|²/|X| = |X|¹` (`const float mag = std::sqrt(power) + 1e-9f; const float p = power / mag;`), which in the Knapp–Carter weighted-spectrum framing (`Ψ(f) = G(f)/|G(f)|^β`, `G = |X|²`) is exactly `|X|^{2(1−β)}` at β = 0.5. "Move to β = 0.7" is therefore a move from 0.5 to 0.7 — *more* whitening, not the introduction of whitening — and `lag_window.h`'s own header carries a load-bearing warning that the field-test corpus grades the current math byte-for-byte, so any exponent change is corpus-gated (research-dsp-upgrades.md §0.2).
+
+**Derivation.**
+
+| β | retained spectrum | status |
+|---|---|---|
+| 0.0 | `\|X\|²` | plain autocorrelation — music's own comb dominates |
+| 0.5 | `\|X\|¹` | **shipped** (`lag_window.cpp`'s "mild whitening," `p = power/(mag + 1e-9f)`) |
+| 0.7 | `\|X\|^0.6` | **proposed** — unproven on our corpus (research-dsp-upgrades.md §2.2) |
+| 1.0 | `1` (flat) | full PHAT — explicitly **rejected** in `lag_window.h`'s header comment for single-buffer program material ("full PHAT would also whiten away the music's own spectral shape and make the copy-lag peak unstable against ordinary program material") |
+
+The reverberant-room hypothesis (Donohue et al. 2007, best β ≈ 0.6–0.8 — **not retrieved this session**, verify before treating 0.7 as anything but a starting point) is that late reverberation piles energy into the strong tonal bins, which β = 0.5 still weights ∝ `|X|`; lowering the retained exponent shrinks that dominance so the broadband phase-coherence evidence for the direct-path copy-lag sets the peak instead. The countervailing risk is exactly what the existing header documents: as β → 1 the noise floor is boosted toward equality and the peak destabilizes on ordinary non-flat music. This is a hypothesis to be corpus-tested, not a proof.
+
+**Interface change — new trailing defaulted parameter.**
+
+```cpp
+WindowLag analyze_window(const float* x, size_t n, int rate,
+                          double min_lag_ms, double max_lag_ms,
+                          double whiten_beta = 0.5);
+```
+
+**Non-negotiable byte-identical rule.** When `whiten_beta == 0.5`, the existing code branch runs **verbatim** — `p = power / (mag + 1e-9f)` with `mag = std::sqrt(power)` — because `std::pow(power, 0.5)` is **not** bit-identical to that epsilon-guarded division path. The legacy branch is kept exactly as written, never replaced by a generalized `pow` call that happens to agree at β = 0.5 in exact arithmetic; floating-point rounding differs, and `lag_window.h`'s corpus-grading guarantee is about bytes, not about mathematical equivalence. Non-default betas take a separate path:
+
+```cpp
+const float power = b.r * b.r + b.i * b.i;
+const float p = std::pow(power + 1e-18f, 1.0f - beta_f);  // |X|^{2(1-β)}
+```
+
+**Offline A/B tooling.** `lag_analyzer --beta <v>` threads the parameter through both file mode and `--stream` mode. The CSV gains a trailing `beta` column, following the CTL-03a precedent (§2.8) of additive-only columns — and, matching that precedent, the column appears **only when `--beta` is passed**, so runs that don't exercise this flag keep their existing column count and positional parsers on the field rig don't break.
+
+**Corpus gate — non-negotiable, per `lag_window.h`'s own "do not improve the math" warning.** Sweep `β ∈ {0.5, 0.6, 0.7, 0.8}` over the full field corpus: `docs/sync-test-results.md`'s recordings plus the FT8 captures. Promotion criteria that must **all** be met before any future spec section flips the on-device default:
+
+1. No lag flips and no `found` regressions on the corpus's healthy-lock windows.
+2. Measurable gain on the reverberant/echoey windows — higher `peak_ratio` margin, lower window-to-window lag jitter, or `comb_ratio` (§2.8) separation improving on the churn class.
+
+Only once both hold does a *future* spec section change the default — at which point the referee (`synccore.cpp`'s `kSampleLatencyResidual` handler) inherits the new default automatically through the parameter default, in a change the corpus will by then have re-graded.
+
+**What must NOT change, in this section's scope.** The on-device default stays `whiten_beta = 0.5`, byte-identical to shipped behavior. This section authorizes only: the new parameter, the legacy-preserving branch, and the offline `lag_analyzer --beta` tooling — nothing that ships to a device changes. No existing test's expected output changes; `lag_window.h`'s corpus-grading guarantee is fully preserved by construction (default argument, verbatim legacy branch).
+
+**Unchanged:** the C ABI, `WindowLag`'s shape (§2.8's `second_lag_ms`/`comb_ratio` additions included), the referee's gating (§2.6), and every existing `lag_window`/`lag_analyzer` test. This section is additive-parameter-only.
+
+---
+
+### 2.12 Volume-duck active probe & capture-energy verdict
+
+**Status.** Design only. This section specs a gentler probe tier that composes with the shipped CTL-01 pause probe (§2.9) — research-dsp-upgrades.md §0.3's correction applies: this is **not** a new subsystem, it is a new actuation and a new verdict channel wired into the existing sentinel/probe machinery in `CorrectionPolicy`.
+
+**Why the duck needs its own verdict channel.** The shipped §2.9 verdict reads the estimator's projected error shift after a pause, because a pause perturbs the *playback timeline*. A volume duck does not — it changes loudness, not position — so the estimate-shift verdict reads zero by construction against a duck and cannot be reused. The verdict source for a duck moves to **capture energy**: whether the mic's own energy dipped when we commanded our own output down.
+
+**Actuation (Kotlin, `SessionViewModel`).** Nominal 150 ms duck, −6 dB, via `AudioManager`, same bounded-coroutine shape as `onActiveProbe` — no free-running loop, the `maybeSampleReferee` hang precedent stands:
+
+```kotlin
+val am = context.getSystemService(AudioManager::class.java)
+val stream = AudioManager.STREAM_MUSIC
+val original = am.getStreamVolume(stream)
+val targetIdx = (original downTo 0).first { idx ->
+    am.getStreamVolumeDb(stream, idx, deviceType) <=
+        am.getStreamVolumeDb(stream, original, deviceType) - 6f
+}
+val achievedDb = am.getStreamVolumeDb(stream, original, deviceType) -
+                 am.getStreamVolumeDb(stream, targetIdx, deviceType)
+am.setStreamVolume(stream, targetIdx, 0)
+delay(duckMs.toLong())                       // 150 ms nominal
+am.setStreamVolume(stream, original, 0)
+engine.notifyDuckExecuted((achievedDb * 10).roundToInt())
+```
+
+Same shell gates as the pause probe: no-op (no echo) when playback is already paused or calibration is Running/ByEarRunning. Two caveats the pause probe doesn't have: **volume-index quantization** means −6.0 dB exactly is rarely reachable, so the shell echoes `achievedDb` (as a deci-dB int over JNI) and the core judges the dip against the depth *actually commanded*, never the nominal 6; and **Bluetooth absolute volume** propagates the index change to an A2DP sink with sink-dependent latency (tens to a few hundred ms), so detection searches a window rather than assuming the dip lands at the echo instant (below), and `duck_ms` is field-tunable upward (150 → 400 ms) exactly like `probe_pause_ms`.
+
+**ABI additions — append-only.** `SC_EVT_ACTIVE_DUCK` appended at the **end** of `sc_event_type_t`, after `SC_EVT_ACTIVE_PROBE`, payload `sc_evt_active_duck_t { int32_t duck_ms; }`; new `sc_status_t sc_notify_duck_executed(sc_session_t*, int32_t achieved_deci_db)`, mirroring `sc_notify_probe_executed`'s echo shape. `SC_EVT_ACTIVE_PROBE` and `sc_notify_probe_executed` are **untouched** — the shipped pause probe's ABI surface does not change. **Required deliverable of the implementing ticket:** `core/tests/abi_c_check.c`'s exhaustive `event_is_known` switch must gain a `case SC_EVT_ACTIVE_DUCK:` (the same `-Wswitch` exhaustiveness coverage §2.9 established for `SC_EVT_ACTIVE_PROBE`), plus basic compile/link/contract coverage for `sc_evt_active_duck_t` and `sc_notify_duck_executed`, matching the file's existing pattern. This spec does **not** make that edit itself — `SC_EVT_ACTIVE_DUCK` doesn't exist yet, so the edit wouldn't compile until the enum and struct land first.
+
+**Worker-side detection: matched-filter dip in capture-ring log-energy.** Runs over the existing 12 s post-AEC history via `sc_copy_recent_capture` — no new capture tap, same pattern as `kSampleLatencyResidual`:
+
+1. **Envelope:** 20 ms non-overlapping RMS hops → `e(j) = 10·log10(mean(x²) + ε)` at 50 Hz.
+2. **Search window:** capture-time `[echo_ns − 250 ms, echo_ns + duck_ms + 750 ms]` — wide enough to absorb App Remote and BT-absolute-volume actuation latency. Epoch rule holds: every sample consumed postdates the current epoch.
+3. **Matched filter:** slide a rectangular dip template of width `duck_ms / 20 ms` hops across the window; at each position, dip depth `D = median(flanking baseline hops) − mean(template hops)`, take the max-D position. Robustness: normalize by the baseline's MAD over the preceding 3 s of envelope → `z = D / (1.4826 · MAD)`, so a loud, choppy mix (which has deep natural 150 ms valleys) demands a deeper dip than a smooth ballad before it counts as evidence.
+
+**Verdict rationale — the mixture model.** Mic power is a mixture `P_mic = P_room + P_self`; ducking scales only `P_self` by `10^(−D_cmd/10)` (≈ 0.251 at 6 dB). The dip depth is therefore an estimator of *our fraction of captured energy*:
+
+| self fraction of mic energy | expected dip (6 dB duck) |
+|---|---|
+| 100 % (pure self-match) | 6.0 dB |
+| 80 % | 4.6 dB |
+| 50 % (true lock, both audible) | 2.9 dB |
+| 20 % | 1.0 dB |
+| 0 % (room only / BT headphones) | 0 dB |
+
+**Verdict bands, scaled to `achieved_db` when it differs from the nominal 6:**
+
+- `D_obs ≥ 4 dB` **and** `z ≥ 3` → self-dominant → the shipped `kTrackLost` path (re-listen; recovery via the §2.7 persistence gate, unchanged).
+- `D_obs ≤ 1.5 dB` → room-dominant → cleared, sentinel state resets.
+- Otherwise (including `z < 3`) → **inconclusive** → escalate **once** to the shipped §2.9 pause probe rather than re-ducking in a loop.
+
+**Division of labor — DSP in the worker, decision in `CorrectionPolicy`.** §3.3's matched-filter/z-score computation runs worker-side, exactly like `kSampleLatencyResidual`'s pattern. The worker hands the *result* — not raw samples — to the policy via a new entry point:
+
+```cpp
+void on_duck_result(double dip_db, double z, int32_t achieved_deci_db, uint64_t now_ns);
+```
+
+`policy.cpp`'s existing charter — "pure decision logic, no clocks, no DSP" — is preserved; `on_duck_result` decides the verdict band and issues `kTrackLost` or clears suspicion exactly as `on_probe_executed` does today for the pause probe, without itself touching capture data.
+
+**Trigger composition.** Both existing §2.9 triggers (`on_referee_window` agreement starvation, `on_tick` Wittenmark turn-off) arm a **duck request first**; the pause request becomes the escalation tier reached only through the inconclusive-verdict path above, not a second independent trigger path. Proposed cooldowns: **duck cooldown 60 s** (it's near-inaudible, so a shorter cooldown than the pause probe's is deliberate — flagged here as a proposed value, not a derived one, matching how `probe_pause_ms` itself was field-tuned rather than derived), pause keeps its shipped `probe_cooldown_ns` = 120 s unchanged. Seek suppression while a probe/duck is outstanding is unchanged from §2.9's rule. All new state (pending-duck record, verdict accumulation) clears in `reset()` — the same epoch rule §2.7/§2.8/§2.9 already apply to their own state; a fresh join must never judge a duck verdict against a previous session's or previous song's accumulated capture. The referee/probe subsystem remains a **verifier**: `on_duck_result`, like `on_probe_executed`, never writes the estimator or `output_latency_prior_ms` or any other latency prior — only `kTrackLost` or a suspicion clear.
+
+**Sequencing note (research-dsp-upgrades.md §3.5).** The CTL-01 device pass runs first with the pause probe as shipped — it validates the triggers and the verdict plumbing with the unambiguous actuator. The duck swaps in as the **default** tier only after the triggers are field-proven on-device; this section specs the mechanism, it does not resequence CTL-01's own rollout.
+
+**Unchanged:** the state machine (§2.4); `SC_EVT_ACTIVE_PROBE`, `sc_evt_active_probe_t`, and `sc_notify_probe_executed` (§2.9's ABI surface, byte-for-byte); the estimator; §2.6/§2.7/§2.8's mechanisms; and the pause probe's own verdict logic (§2.9), which this section composes with as an escalation tier rather than modifying.
+
+---
+
 ## 3. Authentication & Token Flows
 
 ### 3.1 Spotify — OAuth 2.0 Authorization Code + PKCE (no client secret in app)
