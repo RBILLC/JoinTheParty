@@ -56,6 +56,12 @@
 | CTL-01 | 🟡 Done — CTL-01a/01b: agreement-starvation sentinel + Wittenmark turn-off trigger + `SC_EVT_ACTIVE_PROBE`/echo/verdict in core, pause-resume-echo in the shell; 8/8 ctest + 129/129 JVM + assembleDebug; pending: the device pass (audible probe + forced self-match on the field rig, per CTL-01b's AC) | `7d0cc28` |
 | CTL-02 | ✅ Done — CTL-02a/02b: persistence gate + residual ring in `CorrectionPolicy` per tech-req §2.7; closed-loop sims reproduce FT8's Vienna (one seek, −50 ms landing) and hold the deadband-150 lesson (0 seeks under scatter); five-cycle field re-verification pending | `5f03d08` |
 | CTL-03 | ✅ Done — CTL-03a/03b: `comb_ratio` in `analyze_window`+CLI (graded path byte-identical), large-correction hold in `CorrectionPolicy`; phantom sim 0 large seeks / genuine-jump sim exactly 1; field re-verification pending | `9237e3a` |
+| DSP-01a | ⬜ Not started | — |
+| DSP-01b | ⬜ Not started | — |
+| DSP-02a | ⬜ Not started | — |
+| DSP-02b | ⬜ Not started | — |
+| DSP-03a | ⬜ Not started | — |
+| DSP-03b | ⬜ Not started | — |
 | Everything else | ⬜ Not started | — |
 
 **PM decisions logged 2026-07-21:** deadband stays 25 ms globally · learned command latency persists across sessions (ABI getter added) · self-hearing guard window confirmed ±30 ms. **Pivot:** MVP critical path moves to Android (INT-02 chain); SCAF-02/iOS deferred until a Mac is available.
@@ -638,6 +644,85 @@ Field test 8 (docs/field-test-8-results.md) measured three distinct control-loop
 
 ---
 
+## Epic 9 — DSP & Probe Upgrades
+
+Three independent spec sections (tech-req §2.10–§2.12, promoted from research-dsp-upgrades.md; docs/to-spec-review.md carries the flagged deviations and provisional markers below) decompose into six tickets. §2.10 (OSS beat-period tracker) splits into a DSP/consumer pair, DSP-01a/01b, mirroring CTL-03a/03b's DSP-module/CLI-column split. §2.11 (parameterized β-PHAT) splits into a tooling ticket and a corpus-sweep ticket, DSP-02a/02b — DSP-02b's deliverable is sweep data plus a written promotion *recommendation*, explicitly not a default-value change; per §2.11 the on-device default flip requires a *future* spec section this epic does not authorize. §2.12 (volume-duck active probe) splits into a core/ABI ticket and a Kotlin actuator ticket, DSP-03a/03b, composing with CTL-01a/01b's already-landed sentinel/probe machinery in `CorrectionPolicy`; per §2.12's field-sequencing note, the duck becomes the default probe tier only after the CTL-01 pause probe is field-proven on-device — DSP-03b lands the mechanism, not that promotion. The three chains (DSP-01, DSP-02, DSP-03) touch disjoint files and carry no ordering dependency on each other.
+
+### DSP-01a · C++ onset-strength ring & tempogram (§2.10)
+**Description:** New `core/src/dsp/oss_ring.h/.cpp` implementing incremental onset-strength tracking per tech-req §2.10: `OnsetStrengthRing::push(samples, n)` computes per-frame spectral flux (frame N=1024, hop H=512 at 48 kHz, Hann window, the existing kissfft `RealFft(1024)` wrapper), log compression `Y(m,k)=ln(1+γ·|X(m,k)|)`, half-wave-rectified flux `Δ(m)`, causal local-mean removal via a 94-sample running-sum delay line (W≈47, ±0.5 s), storage in a fixed M=1125-sample ring (~12 s, mirroring the PCM history's span). `OnsetStrengthRing::estimate_beat_period()` runs on-demand unbiased normalized autocorrelation over lag bins ℓ∈[24,112] (250–1200 ms / 240–50 BPM), harmonic-sum `s(ℓ)=r̂(ℓ)+0.5·r̂(2ℓ)` for octave disambiguation, parabolic sub-bin interpolation, returning `BeatEstimate{period_ms, salience, stable}` with `stable` requiring the last 3 estimates to agree within ±10 ms spanning ≥20 s (reusing the §2.7 `confirm_window_ns` idiom rather than a new agreement rule). All buffers sized at init, zero allocation after init — the same worker-thread, non-RT fixed-allocation discipline `CorrectionPolicy`'s existing rings already follow (CTL-02a's error ring, CTL-01a's referee ring).
+**Acceptance criteria:**
+- Allocation test: instrumented-allocator check that `push`/`estimate_beat_period` perform zero heap allocation after `OnsetStrengthRing` construction, same style as CORE-01's `sc_push_capture` allocation test.
+- Synthetic click-track tests (`core/tests`, inline LCG PRNG/synthetic generation, no fixture files or WAV assets, per `test_correlate.cpp`'s convention): a click track at a known BPM (e.g. 120 BPM → 500 ms period) → `estimate_beat_period().period_ms` within a few ms of truth once `stable`.
+- Octave-ambiguity test: a click track constructed so the raw autocorrelation peak sits at a tempo octave (e.g. a strong double-time subdivision) → the harmonic-sum reinforcement `s(ℓ)=r̂(ℓ)+0.5·r̂(2ℓ)` selects the correct fundamental period, not the octave.
+- No-beat test: synthetic noise with no periodic structure → `stable` stays false across a run spanning ≥20 s (never latches onto spurious agreement).
+- Constants check: `γ=100` and the `0.5` harmonic weight exist as named, explicitly-commented constants marked provisional/field-tunable per §2.10 — not inlined as bare literals, not silently treated as final the way `confirm_floor_ms` was after its RFC 5905 grounding resolved.
+- Code inspection: `salience` is never read by any condition gating `stable` or feeding a consumer as evidence — diagnostics/CSV-only, for the same reason `peak_ratio` cannot gate the §2.6 referee.
+- No existing test's expected output changes.
+**Dependencies:** none.
+
+### DSP-01b · Tempogram consumer wiring (§2.10)
+**Description:** Wire `OnsetStrengthRing::push` into the worker drain loop at the same post-AEC tap `append_history` already uses (no new capture tap); call `estimate_beat_period()` on the `kSampleLatencyResidual` cadence — the shared referee "analysis moment," per §2.10's proposed cadence. Implement the §2.8 cross-check: if `|WindowLag.second_lag_ms − k·beat_period_ms| < 30 ms` for a small integer k, the competitor peak `analyze_window` found is corroborated as the music's own beat comb (supporting a low `comb_ratio` reading as ambiguity — the Billie Jean class — rather than a genuine second copy); `second_lag_ms` remains the free, already-shipped cross-check, this is a read-only corroboration layer on top of it. `lag_analyzer --tempo` appends a `beat_period_ms` CSV column LAST, only when the flag is passed (CTL-03a's additive-column precedent). Document, in code comments, the MHT hypothesis-bank seeding contract (`fix_offset ± k·beat_period_ms`, k=1..3) as the downstream consumer — the bank itself is explicitly OUT of this ticket's scope, pending its own future spec (research-closed-loop-control.md §5 item 3).
+**Acceptance criteria:**
+- Worker wiring test: pushing synthetic post-AEC samples through the worker drain loop feeds `OnsetStrengthRing::push` at the same tap/cadence as `append_history` (log/hook-verified call correspondence).
+- Cadence test: `estimate_beat_period()` is invoked once per `kSampleLatencyResidual` analysis moment, not per-frame.
+- Cross-check test: a constructed `WindowLag` with `second_lag_ms` at exactly `2×beat_period_ms` → cross-check flags corroboration; `second_lag_ms` far from any `k·beat_period_ms` (k=1..3) within 30 ms → no corroboration.
+- CLI test: `lag_analyzer --tempo` output CSV ends with a `beat_period_ms` column; omitting `--tempo` produces the existing column set unchanged (byte-identical to pre-ticket output on the same input).
+- Hard-limit tests (restated verbatim from §2.10's standing warnings 3–4): grep/code inspection confirms no code path in this ticket feeds `beat_period_ms`, `BeatEstimate`, or the cross-check result into self-match handling (CTL-01's exclusive territory), and `peak_ratio` is not read anywhere in this ticket's new code.
+- MHT hypothesis-bank seeding is documented (header/code comment citing research-closed-loop-control.md §5 item 3) but no hypothesis-bank code is added by this ticket.
+- No existing test's expected output changes.
+**Dependencies:** DSP-01a.
+
+### DSP-02a · Parameterized β-PHAT & tooling (§2.11)
+**Description:** Per tech-req §2.11: add a trailing defaulted parameter `analyze_window(const float* x, size_t n, int rate, double min_lag_ms, double max_lag_ms, double whiten_beta = 0.5)` to `core/src/dsp/lag_window.cpp`/`.h`. At `whiten_beta == 0.5` the existing branch (`const float mag = std::sqrt(power) + 1e-9f; const float p = power / mag;`) runs VERBATIM — the non-negotiable byte-identical rule: never replaced by a generalized `pow(power, 0.5)` call, since that is not bit-identical to the shipped epsilon-guarded division. Non-default betas take a separate path: `p = std::pow(power + 1e-18f, 1.0f - beta_f)`. `lag_analyzer --beta <v>` threads the parameter through both file mode and `--stream` mode; the CSV gains a trailing `beta` column, following the CTL-03a/§2.8 additive-column precedent — appearing only when `--beta` is passed.
+**Acceptance criteria:**
+- Byte-identical regression: with no `whiten_beta` argument (or an explicit `0.5`), `analyze_window`'s output is byte-identical to pre-ticket output on the existing `lag_analyzer_selftest`/`test_lag_window.cpp` fixtures.
+- Every existing test in `test_lag_window.cpp` and `test_correlate.cpp` passes unmodified.
+- Non-default path test: `whiten_beta` at 0.6/0.7/0.8 on a synthetic two-copy signal exercises the `pow`-based branch (verified distinct from the default branch's output where beta ≠ 0.5).
+- CLI test: `lag_analyzer --beta 0.7` (file mode and `--stream` mode) appends a trailing `beta` column carrying the value; omitting `--beta` produces the existing column count/headers unchanged.
+- `--selftest` behavior and output unchanged.
+- Code inspection: the β=0.5 branch is textually the pre-ticket legacy code, not a `pow()` call evaluated at 0.5.
+**Dependencies:** none.
+
+### DSP-02b · β-PHAT corpus sweep & promotion recommendation (§2.11)
+**Description:** Using DSP-02a's `lag_analyzer --beta` tooling, run the β ∈ {0.5, 0.6, 0.7, 0.8} sweep over `docs/sync-test-results.md`'s recordings plus the FT8 captures. Record per-window lag/`peak_ratio`/`comb_ratio` deltas against the β=0.5 baseline. **Per §2.11, the on-device default flip requires a FUTURE spec section only after the promotion criteria are met — this ticket's deliverable is the sweep data plus a written promotion RECOMMENDATION under `docs/`, not a default change.** If the criteria (no lag flips/`found` regressions on healthy-lock windows; measurable reverberant-window gains) pass, the recommendation's output is to trigger a separate spec amendment, which then authorizes a follow-on default-change ticket; if criteria fail, the recommendation documents that and the default stays put with no further action implied. Worded so this ticket cannot be closed by silently editing the default.
+**Acceptance criteria:**
+- Sweep executed over the full corpus named in §2.11 (docs/sync-test-results.md recordings + FT8 captures) at all four β values; raw per-window sweep output (via `--beta`) retained under `docs/` or an accompanying data directory.
+- Written report committed to `docs/` presenting, per β, the lag-flip count, `found`-regression count, and reverberant-window `peak_ratio`/lag-jitter/`comb_ratio` deltas versus the β=0.5 baseline.
+- Report states explicitly, for each of §2.11's two promotion criteria, pass/fail against the corpus data — neither criterion left unaddressed.
+- Report's recommendation is phrased as a recommendation to open a future spec amendment, not as an instruction or action that changes `whiten_beta`'s default anywhere in `core/`.
+- **This ticket's own diff contains zero changes to any default parameter value, any `PolicyConfig` field, or `analyze_window`'s default argument** — verified by diff review; the ticket is not closeable by a default-flip edit.
+- No existing test's expected output changes; no on-device behavior changes.
+**Dependencies:** DSP-02a.
+
+### DSP-03a · Volume-duck C ABI, worker dip detector & policy verdict (§2.12)
+**Description:** Per tech-req §2.12: append `SC_EVT_ACTIVE_DUCK` at the END of `sc_event_type_t` (after `SC_EVT_ACTIVE_PROBE`), payload `sc_evt_active_duck_t { int32_t duck_ms; }`; add `sc_status_t sc_notify_duck_executed(sc_session_t*, int32_t achieved_deci_db)` mirroring `sc_notify_probe_executed`'s echo shape. REQUIRED deliverable named in §2.12: `core/tests/abi_c_check.c`'s exhaustive `event_is_known` switch gains `case SC_EVT_ACTIVE_DUCK:`, plus basic compile/link/contract coverage for `sc_evt_active_duck_t`/`sc_notify_duck_executed`, matching the file's existing `SC_EVT_ACTIVE_PROBE` pattern. Worker-side matched-filter dip detector over `sc_copy_recent_capture`'s existing 12 s post-AEC history (no new capture tap): 20 ms non-overlapping RMS hops → 50 Hz log-envelope `e(j)=10·log10(mean(x²)+ε)`; search window `[echo_ns−250 ms, echo_ns+duck_ms+750 ms]`; rectangular matched filter of width `duck_ms/20 ms` hops; dip depth `D = median(flanking baseline) − mean(template)`; robustness `z = D/(1.4826·MAD)` over the preceding 3 s of envelope. New policy entry point `on_duck_result(dip_db, z, achieved_deci_db, now_ns)` in `CorrectionPolicy`: verdict bands scaled to `achieved_db` — `D≥4 dB ∧ z≥3` → self-dominant → `kTrackLost`; `D≤1.5 dB` → room-dominant → cleared; otherwise (incl. `z<3`) → inconclusive → escalate ONCE to the shipped §2.9 pause probe (never a repeat duck). Both existing §2.9 triggers (`on_referee_window`, `on_tick`) arm a duck request FIRST; pause becomes the escalation tier reached only via the inconclusive path, not a second independent trigger. Duck cooldown 60 s (flagged proposed/field-tunable per §2.12, not derived — matching how `probe_pause_ms` itself was field-tuned); pause `probe_cooldown_ns` = 120 s unchanged. Seek suppression while a probe/duck is outstanding is unchanged from §2.9. All new state (pending-duck record, verdict accumulation) clears in `reset()` (epoch rule, matching §2.7/§2.8/§2.9). `policy.cpp` stays DSP-free — the matched-filter/z-score computation is worker-side only; `on_duck_result` receives a result, never raw capture samples. `SC_EVT_ACTIVE_PROBE`/`sc_evt_active_probe_t`/`sc_notify_probe_executed` are byte-untouched.
+**Acceptance criteria:**
+- `abi_c_check.c`: `event_is_known` switch compiles with `-Wswitch` exhaustiveness covering the new `SC_EVT_ACTIVE_DUCK` case; contract coverage exercises `sc_evt_active_duck_t`'s field and calls `sc_notify_duck_executed`.
+- Self-match sim (`core/tests/test_policy.cpp`, closed-loop style): duck commanded → deep capture-energy dip (D≥4 dB, z≥3) → `on_duck_result` returns `kTrackLost`.
+- Room-dominant sim: shallow dip (D≤1.5 dB) → cleared, no track-lost, suspicion state resets.
+- Inconclusive→pause-escalation sequence test: mid-band dip or z<3 → inconclusive verdict → the pending escalation is the shipped §2.9 pause probe request, exactly once, not a repeated duck request.
+- Trigger-composition test: both `on_referee_window`-starvation and `on_tick`-turnoff triggers arm a duck request first (not a pause request) when neither tier is already outstanding.
+- Cooldown tests: duck cooldown enforced at 60 s; pause `probe_cooldown_ns` remains 120 s, unchanged by this ticket (regression-checked against CTL-01a's existing tests).
+- Seek-suppression regression: an out-of-deadband estimate arriving while a duck or pause is outstanding still yields `kNone` (except track-lost magnitude), matching §2.9's existing rule.
+- Epoch test: `reset()` clears all new duck/verdict state; dip evidence accumulated pre-reset never fires a verdict post-reset.
+- Code inspection: no DSP/envelope/matched-filter computation exists in `policy.cpp`; `on_duck_result` only consumes its four scalar arguments.
+- Regression: `SC_EVT_ACTIVE_PROBE`, `sc_evt_active_probe_t`, and `sc_notify_probe_executed` are byte-unmodified; CTL-01a's existing tests pass unmodified.
+**Dependencies:** CTL-01a (composes with its existing sentinel/probe triggers and ABI enum; already landed).
+
+### DSP-03b · Kotlin volume-duck actuator & echo (§2.12)
+**Description:** Per tech-req §2.12: `SessionViewModel` handler for `Event.ActiveDuck(duckMs)` (JNI plumbing: event case in `synccore_jni.cpp`, `Event.ActiveDuck` in `SyncCore.kt`'s sealed interface, `SyncEngine`/`SyncCore.notifyDuckExecuted()` over a new `nativeNotifyDuckExecuted`, mirroring CTL-01b's probe plumbing). `AudioManager` `STREAM_MUSIC` duck via `getStreamVolumeDb`-driven index selection targeting −6 dB (`targetIdx = (original downTo 0).first { ... }`), achieved dB computed from the original/target index dB difference, echoed as a deci-dB int (`(achievedDb*10).roundToInt()`) via `notifyDuckExecuted`. Bounded coroutine shape — duck → `delay(duckMs)` → restore → `notifyDuckExecuted(achievedDeciDb)` — no free-running loop (the `maybeSampleReferee` hang precedent). Same shell gates as `onActiveProbe`: no-op (no echo) when playback is already paused or calibration is `Running`/`ByEarRunning`.
+**Acceptance criteria** (JVM tests, `SessionViewModelTest.kt` conventions with fake engine/`AudioManager`):
+- Happy path: `ActiveDuck` event with `duckMs=150` → exact sequence: volume set to target index, `delay(150)` (virtual time), volume restored to original, `notifyDuckExecuted(achievedDeciDb)` — order asserted via fake call log.
+- Achieved-deci-dB echo test: a fake `AudioManager.getStreamVolumeDb` returning index dB values that don't hit exactly −6 dB (quantization) → the echoed `achievedDeciDb` reflects the actually-commanded index delta, not a hardcoded 60.
+- Already-paused: event while player paused → zero `AudioManager` volume calls, no echo — mirrors CTL-01b's probe test.
+- Mid-calibration: event while calibration `Running`/`ByEarRunning` → zero volume calls, no echo — mirrors CTL-01b's probe test.
+- No virtual-time hang: the `delay` uses the test dispatcher's virtual time (suite stays fast; cite `maybeSampleReferee`'s doc comment on the free-running-timer hang this must avoid) — mirrors CTL-01b's corresponding test.
+- JNI round-trip test: `SC_EVT_ACTIVE_DUCK` maps to `Event.ActiveDuck(duckMs)` through `onNativeEvent`'s `when (type)`, and `notifyDuckExecuted` calls through to `nativeNotifyDuckExecuted`/`sc_notify_duck_executed`.
+- Build regression: the app's debug build succeeds with the new JNI surface wired.
+**Dependencies:** DSP-03a. **Field-sequencing note (§2.12, verbatim constraint):** the CTL-01 device pass runs first with the pause probe as shipped — the duck becomes the default tier only after the triggers are field-proven on-device. This ticket lands the mechanism only; it must not be read as promoting the duck ahead of that pass.
+
+---
+
 ## Dependency graph (summary)
 
 ```
@@ -674,6 +759,10 @@ CAL-08, CAL-10        ─▶ CFX-08   (consistent sibling-banner dismissal)
 CAL-04, CAL-08        ─▶ CFX-09   (deterministic shelf order, connected first)
 
 CTL-01a ─▶ CTL-01b ; CTL-02a ─▶ CTL-02b ; CTL-03a, CTL-03b independent   (Epic 8)
+
+DSP-01a ─▶ DSP-01b
+DSP-02a ─▶ DSP-02b ─▶ (future spec amendment) ─▶ (future default-flip ticket)
+CTL-01a ─▶ DSP-03a ─▶ DSP-03b ─▶ (CTL-01 device-pass field-sequencing gate on default-tier promotion)   (Epic 9)
 ```
 
 ## Critical path to MVP-on-device (INT-01, iOS)
