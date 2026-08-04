@@ -26,4 +26,15 @@ backend/node_modules/
 *.p8
 *.pem
 .env
+.env.*
+*.keystore
+*.jks
 android/.kotlin/
+
+# Packaged binaries
+*.apk
+*.aab
+
+# Windows litter
+Thumbs.db
+desktop.ini
