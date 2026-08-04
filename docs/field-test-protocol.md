@@ -261,6 +261,50 @@ long run of `ff`. `18 a9 f0 ff ff ff ff ff ff ff 01` decodes to −2007.
 Spotify auth tokens and forces a re-authorisation through the UI — prefer
 reading the value and fixing the code.
 
+### Decide the calibration state before any standardized test
+
+Every suite starts from SOME stored route profile, and not knowing which
+one invalidates comparisons between runs. Pre-flight, read the persisted
+profile (recipe above) and then decide deliberately, and write the choice
+into the run notes:
+
+- **Testing product behaviour** (convergence, perturbation, multi-song):
+  re-run the calibration flow for the active route first, so the run
+  measures the engine, not a stale constant.
+- **Testing the self-correction path itself** (the CTL-02 referee closing
+  a residual): deliberately KEEP the stale profile and say so — a fresh
+  calibration would mask exactly the behaviour under test.
+
+What is never acceptable is starting a suite with an unknown profile:
+Field Test 9 spent its first test discovering a stale +565 ms trim and an
+under-measured output chain the hard way.
+
+### Set both devices' media volumes before any standardized test
+
+Volume is part of the rig, not a nicety. The analyzer's confidence and the
+noise-floor reading both depend on the two sources being comparably audible
+at the mic (`rms_db` ~−35 with both playing), and the duck actuator's
+episodes are computed from the *current* stream volume — a session started
+at an odd volume changes what a duck episode measures. Pre-flight: set both
+phones' media volume to a known, repeatable level (and write it down in the
+run notes) before the first join. `adb -t N shell media volume --show
+--stream 3 --set <idx>` does it without touching the screen.
+
+### Reset the custom trim before any standardized test
+
+A user-set trim carried over from casual listening silently shifts every
+acoustic number in a run. Field Test 9's first test started with a cached
++565 ms trim from earlier manual testing — the mic read "almost in sync"
+while the uncalibrated chain was actually ~565 ms further behind, and a
+mid-run reset to 0 stepped the lag and split the segment.
+
+Pre-flight rule: **before joining, read the persisted trim (recipe above)
+and have the human zero it in the app UI** (do not `pm clear`). If a test
+specifically exercises trim behaviour, that test sets its own trim and says
+so. If the trim must change mid-run for any reason, record the wall time and
+the live CSV line number at the moment of the change and analyse the
+sub-segments separately — never average across a setpoint step.
+
 ## Two ways to fool yourself with the microphone
 
 **A low lag reading with only ONE source playing is meaningless.** The analyzer
