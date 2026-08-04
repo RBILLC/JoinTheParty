@@ -4,6 +4,17 @@
 **Sources:** `architecture-spec.md` · `technical-requirements.md` · `ui-ux-design-system.md`
 **Date:** 2026-07-21
 
+> **Tracking moved to GitHub Issues (2026-08-04):** all open work now lives at
+> <https://github.com/RBILLC/JoinTheParty/issues> — one issue per not-started ticket and per
+> partial ticket's remaining work. This file stays as the historical record of ticket
+> definitions and completed work; statuses are no longer updated here.
+>
+> Mapping: RES-02 #1 · SCAF-02 #2 · SCAF-04 #3 · CORE-05 #4 · CORE-07 #5 · NAT-01 #6 ·
+> NAT-02 #7 · NAT-03 #8 · NAT-05 #9 · NAT-06 #10 · NAT-07 #11 · NAT-08 #12 · AUTH-01 #13 ·
+> AUTH-02 #14 · AUTH-03 #15 · AUTH-04 #16 · AUTH-05 #17 · UI-01 #18 · UI-03 #19 · UI-04 #20 ·
+> UI-05 #21 · UI-06 #22 · INT-01 #23 · INT-02 #24 · INT-03 #25 · INT-05 #26 · CFX-03 #27 ·
+> CTL-01 #28 · CTL-02 #29 · CTL-03 #30 · INT-06 #31
+
 ## Status (updated 2026-07-21)
 
 | Ticket | Status | Commit |
