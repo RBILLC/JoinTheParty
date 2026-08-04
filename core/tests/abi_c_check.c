@@ -15,6 +15,9 @@
  * with no probe outstanding. The full sentinel/turn-off/verdict decision
  * logic is exercised at the policy level (core/tests/test_policy.cpp);
  * this file is compile/link/basic-contract coverage only.
+ *
+ * DSP-03a (technical-requirements.md §2.12) coverage: same shape, for
+ * SC_EVT_ACTIVE_DUCK / sc_evt_active_duck_t / sc_notify_duck_executed.
  */
 #include <synccore/synccore.h>
 
@@ -32,6 +35,7 @@ static int event_is_known(sc_event_type_t type) {
         case SC_EVT_CALIBRATION_RESULT:
         case SC_EVT_LATENCY_RESIDUAL:
         case SC_EVT_ACTIVE_PROBE:
+        case SC_EVT_ACTIVE_DUCK:
             return 1;
     }
     return 0;
@@ -42,6 +46,11 @@ int main(void) {
     probe.pause_ms = 200;
     if (probe.pause_ms != 200) return 1;
     if (!event_is_known(SC_EVT_ACTIVE_PROBE)) return 1;
+
+    sc_evt_active_duck_t duck;
+    duck.duck_ms = 150;
+    if (duck.duck_ms != 150) return 1;
+    if (!event_is_known(SC_EVT_ACTIVE_DUCK)) return 1;
 
     {
         sc_config_t cfg;
@@ -58,6 +67,10 @@ int main(void) {
          * ignored, still returns SC_OK (mirrors sc_notify_seek_issued's
          * unconditional-enqueue shape). */
         if (sc_notify_probe_executed(s) != SC_OK) return 1;
+
+        /* Same contract for the new duck echo: no duck outstanding on a
+         * fresh session, still SC_OK. */
+        if (sc_notify_duck_executed(s, 60) != SC_OK) return 1;
 
         sc_destroy(s);
     }

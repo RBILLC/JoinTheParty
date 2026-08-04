@@ -30,6 +30,13 @@ void sc_test_get_aec_mode(sc_session_t*, sc_aec_mode_t* out_mode);
 void sc_test_get_beat_state(sc_session_t*, int32_t* out_beat_comb,
                             double* out_beat_period_ms);
 
+/* DSP-03a: reads the worker's most recent duck-detector mirrors -- dip_db
+ * (matched-filter dip depth D, in dB) and z (its MAD-normalized
+ * significance) from the last completed deferred analysis. Both are 0.0 if
+ * no analysis has ever run, or since the last kTrackLost epoch reset. */
+void sc_test_get_duck_metrics(sc_session_t*, double* out_dip_db,
+                              double* out_z);
+
 #ifdef __cplusplus
 }
 #endif

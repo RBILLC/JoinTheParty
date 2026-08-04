@@ -10,6 +10,7 @@
 #include "synccore/synccore.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -93,6 +94,26 @@ constexpr double kResidualMinLagMs = 40.0;
 // (docs/sync-test-results.md). 2500 ms is the field-validated ceiling.
 constexpr double kResidualMaxLagMs = 2500.0;
 
+// DSP-03a (tech-req §2.12): volume-duck dip detector. 20 ms non-overlapping
+// RMS hops -> 50 Hz log-envelope, matching kSampleLatencyResidual's own
+// field-validated windowing granularity.
+constexpr int32_t kDuckHopFrames = 960;  // 20 ms @ 48 kHz
+constexpr long long kDuckHopNs = 20'000'000ll;
+// Preceding-3s baseline, expressed in hops (3000 ms / 20 ms) — fixed
+// regardless of duck_ms, since the baseline window's OWN span never
+// changes, only the search window past it does.
+constexpr long long kDuckBaselineHops = 150;
+constexpr uint64_t kDuckBaselineNs = 3'000'000'000ull;
+// Search window bounds (tech-req §2.12, R2): [echo_ns - 250 ms,
+// echo_ns + duck_ms + 750 ms] — wide enough to absorb App Remote and
+// BT-absolute-volume actuation latency around the echo.
+constexpr uint64_t kDuckPreWindowNs = 250'000'000ull;
+constexpr uint64_t kDuckPostMarginNs = 750'000'000ull;
+// R2: small margin on top of the search window's own +750 ms reach so
+// tick() only runs the deferred analysis once the LAST hop of that window
+// has actually drained into capture history.
+constexpr uint64_t kDuckAnalysisMarginNs = 250'000'000ull;
+
 struct Command {
     enum class Kind {
         kRecognitionFix,
@@ -106,7 +127,8 @@ struct Command {
         kBeginCalibration,
         kCancelCalibration,
         kSampleLatencyResidual,
-        kProbeExecuted
+        kProbeExecuted,
+        kDuckExecuted
     } kind;
     sc_recognition_fix_t fix{};
     sc_player_state_t player{};
@@ -156,6 +178,16 @@ struct sc_session {
     // mirroring BeatEstimate{}'s own default.
     std::atomic<int32_t> beat_comb_mirror{0};
     std::atomic<double> beat_period_ms_mirror{0.0};
+
+    // DSP-03a (tech-req §2.12): worker-maintained mirrors of the duck
+    // detector's most recent matched-filter result (dip depth D in dB,
+    // significance z), relaxed store by the worker / relaxed load by the
+    // test hook sc_test_get_duck_metrics. Same pattern as beat_comb_mirror/
+    // beat_period_ms_mirror above — not part of the public ABI. Both are
+    // 0.0 whenever no analysis has ever completed (session start) or after
+    // a kTrackLost epoch reset.
+    std::atomic<double> duck_dip_db_mirror{0.0};
+    std::atomic<double> duck_z_mirror{0.0};
 
     // NAT-06b capture-history tee: circular buffer of the last ~12 s of
     // post-AEC capture, written by the worker during drain, read by
@@ -238,6 +270,26 @@ struct sc_session {
         // playback_live — the estimator holds is_paused privately with no
         // getter, and it stays that way (estimator.h is untouched).
         bool playback_paused = false;
+        // DSP-03a (tech-req §2.12, R2): deferred duck-analysis state.
+        // kDuckExecuted stamps the echo epoch + achieved depth here and
+        // arms pending; tick() runs the matched-filter analysis once the
+        // search window's reach has actually drained into capture history,
+        // then clears pending. Worker-local, cleared on kTrackLost (epoch
+        // rule) alongside every other epoch-scoped worker state.
+        bool duck_analysis_pending = false;
+        uint64_t duck_echo_ns = 0;
+        int32_t duck_achieved_deci_db = 0;
+        // Reused across calls to avoid a fresh ~2.3 MB history copy per
+        // duck analysis (rate-limited by duck_cooldown_ns anyway, but the
+        // codebase's steady-state-zero-allocation convention — see
+        // residual_scratch above — is followed here too). Sized lazily to
+        // kHistoryFrames on first use.
+        std::vector<float> duck_scratch;
+        // 20 ms-hop log-envelope, reused across calls the same way
+        // (constant hop count per session, since duck_ms doesn't change at
+        // runtime — cleared, not reallocated, after the first call grows
+        // it).
+        std::vector<double> duck_hops;
     } wk;
 
     std::thread worker;
@@ -419,9 +471,165 @@ struct sc_session {
                 wk.cand_offset_ms = -1;
                 beat_comb_mirror.store(0, std::memory_order_relaxed);
                 beat_period_ms_mirror.store(0.0, std::memory_order_relaxed);
+                // DSP-03a epoch rule (tech-req §2.12): a re-listen is a new
+                // epoch for the duck detector too — pending analysis from
+                // before this reset must never resolve into it, exactly
+                // like the OSS ring's own reset just above.
+                wk.duck_analysis_pending = false;
+                wk.duck_echo_ns = 0;
+                wk.duck_achieved_deci_db = 0;
+                duck_dip_db_mirror.store(0.0, std::memory_order_relaxed);
+                duck_z_mirror.store(0.0, std::memory_order_relaxed);
                 dispatch(SC_EVT_TRACK_LOST, nullptr);
                 break;
         }
+    }
+
+    // DSP-03a (tech-req §2.12): matched-filter dip detector over the
+    // post-AEC capture history sc_copy_recent_capture already retains — no
+    // new capture tap, same pattern as kSampleLatencyResidual. Reads dip
+    // depth D (dB) and its MAD-normalized significance z from a rectangular
+    // template slid across the search window, then hands the RESULT (never
+    // raw samples) to the policy via on_duck_result — policy.cpp stays
+    // DSP-free per §2.12's division of labor. Called from tick() only once
+    // wk.duck_analysis_pending's deferred window has actually elapsed.
+    void run_duck_analysis() {
+        if (wk.duck_scratch.size() != kHistoryFrames)
+            wk.duck_scratch.assign(kHistoryFrames, 0.0f);
+        uint64_t out_end_ns = 0;
+        const int32_t n = sc_copy_recent_capture(
+            this, wk.duck_scratch.data(), static_cast<int32_t>(kHistoryFrames),
+            &out_end_ns);
+
+        const int32_t duck_ms = wk.policy.duck_ms();
+        const uint64_t duck_ns = static_cast<uint64_t>(duck_ms) * 1'000'000ull;
+        const uint64_t env_start_ns =
+            wk.duck_echo_ns - kDuckBaselineNs - kDuckPreWindowNs;
+        const uint64_t env_end_ns = wk.duck_echo_ns + duck_ns + kDuckPostMarginNs;
+
+        // Session too young / copy doesn't reach back far enough to cover
+        // the baseline: not enough evidence to say anything. Passing
+        // achieved_deci_db = 0 here is deliberate (orchestrator fix): it
+        // triggers on_duck_result's explicit no-depth guard, which forces
+        // the INCONCLUSIVE path (escalate once, never silently drop).
+        // Passing the real achieved depth with D = 0 would instead read as
+        // room-dominant (0 <= the scaled 1.5 dB band) and CLEAR sentinel
+        // suspicion off no evidence at all — the wrong resolution.
+        if (n <= 0 || out_end_ns < env_end_ns) {
+            duck_dip_db_mirror.store(0.0, std::memory_order_relaxed);
+            duck_z_mirror.store(0.0, std::memory_order_relaxed);
+            apply(wk.policy.on_duck_result(0.0, 0.0, /*achieved_deci_db=*/0,
+                                           wk.now_ns));
+            return;
+        }
+
+        // Map a capture-time to an index in the copied buffer: buffer[n-1]
+        // corresponds to out_end_ns, each preceding frame exactly one
+        // sample period earlier — the copy's own end-timestamp pairing
+        // (sc_copy_recent_capture's documented contract).
+        const double frame_period_ns =
+            1e9 / static_cast<double>(kSupportedRateHz);
+        auto index_for = [&](uint64_t t_ns) -> long long {
+            const double frames_before_end =
+                (static_cast<double>(out_end_ns) - static_cast<double>(t_ns)) /
+                frame_period_ns;
+            return static_cast<long long>(n - 1) -
+                   static_cast<long long>(std::llround(frames_before_end));
+        };
+        const long long start_idx = index_for(env_start_ns);
+        if (start_idx < 0) {
+            duck_dip_db_mirror.store(0.0, std::memory_order_relaxed);
+            duck_z_mirror.store(0.0, std::memory_order_relaxed);
+            // achieved 0 -> forced inconclusive; see the guard above.
+            apply(wk.policy.on_duck_result(0.0, 0.0, /*achieved_deci_db=*/0,
+                                           wk.now_ns));
+            return;
+        }
+
+        // 20 ms non-overlapping RMS hops -> 50 Hz log-envelope
+        // e(j) = 10*log10(mean(x^2) + eps) over the full combined
+        // baseline+search span.
+        const long long total_span_ns =
+            static_cast<long long>(env_end_ns - env_start_ns);
+        const long long n_hops = total_span_ns / kDuckHopNs;
+
+        wk.duck_hops.clear();  // keeps capacity — no realloc once stable
+        for (long long h = 0; h < n_hops; ++h) {
+            const long long frame0 = start_idx + h * kDuckHopFrames;
+            const long long frame1 = frame0 + kDuckHopFrames;
+            if (frame0 < 0 || frame1 > n) {
+                wk.duck_hops.push_back(-120.0);  // out of bounds: silence
+                continue;                        // floor, not a crash
+            }
+            double sum_sq = 0.0;
+            for (long long i = frame0; i < frame1; ++i) {
+                const double v =
+                    static_cast<double>(wk.duck_scratch[static_cast<size_t>(i)]);
+                sum_sq += v * v;
+            }
+            const double mean_sq = sum_sq / static_cast<double>(kDuckHopFrames);
+            wk.duck_hops.push_back(10.0 * std::log10(mean_sq + 1e-12));
+        }
+
+        if (static_cast<long long>(wk.duck_hops.size()) <= kDuckBaselineHops) {
+            duck_dip_db_mirror.store(0.0, std::memory_order_relaxed);
+            duck_z_mirror.store(0.0, std::memory_order_relaxed);
+            // achieved 0 -> forced inconclusive; see the guard above.
+            apply(wk.policy.on_duck_result(0.0, 0.0, /*achieved_deci_db=*/0,
+                                           wk.now_ns));
+            return;
+        }
+
+        // Baseline: the fixed 3 s of envelope preceding the search window
+        // (tech-req §2.12) -- median for the matched filter's D, MAD (about
+        // that same median) for the z normalization.
+        std::array<double, static_cast<size_t>(kDuckBaselineHops)> baseline_sorted;
+        for (long long i = 0; i < kDuckBaselineHops; ++i)
+            baseline_sorted[static_cast<size_t>(i)] =
+                wk.duck_hops[static_cast<size_t>(i)];
+        std::sort(baseline_sorted.begin(), baseline_sorted.end());
+        const double baseline_median =
+            baseline_sorted[static_cast<size_t>(kDuckBaselineHops) / 2];
+
+        std::array<double, static_cast<size_t>(kDuckBaselineHops)> abs_dev;
+        for (long long i = 0; i < kDuckBaselineHops; ++i)
+            abs_dev[static_cast<size_t>(i)] =
+                std::abs(wk.duck_hops[static_cast<size_t>(i)] - baseline_median);
+        std::sort(abs_dev.begin(), abs_dev.end());
+        const double mad = abs_dev[static_cast<size_t>(kDuckBaselineHops) / 2];
+
+        // Matched filter: rectangular dip template of width
+        // max(1, duck_ms/20 ms) hops slid across the search-window hops
+        // (everything after the baseline). D = median(baseline) -
+        // mean(template) at each position; keep the max.
+        const long long template_hops =
+            std::max<long long>(1, static_cast<long long>(duck_ms) / 20);
+        const long long search_hops_available =
+            static_cast<long long>(wk.duck_hops.size()) - kDuckBaselineHops;
+
+        double max_d = 0.0;
+        bool any = false;
+        for (long long pos = 0; pos + template_hops <= search_hops_available;
+            ++pos) {
+            double sum = 0.0;
+            for (long long k = 0; k < template_hops; ++k)
+                sum += wk.duck_hops[static_cast<size_t>(kDuckBaselineHops + pos + k)];
+            const double template_mean =
+                sum / static_cast<double>(template_hops);
+            const double d = baseline_median - template_mean;
+            if (!any || d > max_d) {
+                max_d = d;
+                any = true;
+            }
+        }
+        // Robustness normalization (tech-req §2.12): z = D / (1.4826*MAD),
+        // guarded against a perfectly flat baseline (mad == 0).
+        const double z = mad > 0.0 ? max_d / (1.4826 * mad) : 0.0;
+
+        duck_dip_db_mirror.store(max_d, std::memory_order_relaxed);
+        duck_z_mirror.store(z, std::memory_order_relaxed);
+        apply(wk.policy.on_duck_result(max_d, z, wk.duck_achieved_deci_db,
+                                       wk.now_ns));
     }
 
     // Time-driven duties: interpolated estimate emissions (≤ 15 Hz) and the
@@ -446,6 +654,28 @@ struct sc_session {
             sc_evt_active_probe_t probe{};
             probe.pause_ms = wk.policy.probe_pause_ms();
             dispatch(SC_EVT_ACTIVE_PROBE, &probe);
+        }
+        // DSP-03a (tech-req §2.12): duck-tier request, dispatched the exact
+        // same one-shot way as the pause probe just above.
+        if (wk.policy.duck_request_due(wk.now_ns)) {
+            sc_evt_active_duck_t duck{};
+            duck.duck_ms = wk.policy.duck_ms();
+            dispatch(SC_EVT_ACTIVE_DUCK, &duck);
+        }
+        // DSP-03a (tech-req §2.12, R2): deferred dip-detector analysis —
+        // audio PAST the echo hasn't been captured yet when kDuckExecuted
+        // processes, so the matched-filter analysis runs here instead, once
+        // the search window's own reach (duck_ms + 750 ms) plus a small
+        // drain margin has actually elapsed in capture time.
+        if (wk.duck_analysis_pending) {
+            const uint64_t ready_ns =
+                wk.duck_echo_ns +
+                static_cast<uint64_t>(wk.policy.duck_ms()) * 1'000'000ull +
+                kDuckPostMarginNs + kDuckAnalysisMarginNs;
+            if (wk.now_ns >= ready_ns) {
+                run_duck_analysis();
+                wk.duck_analysis_pending = false;
+            }
         }
 
         if (wk.detector.armed()) {
@@ -759,6 +989,21 @@ struct sc_session {
                 wk.policy.on_probe_executed(est.error_ms, wk.now_ns);
                 break;
             }
+            case Command::Kind::kDuckExecuted: {
+                // DSP-03a (tech-req §2.12, R2) echo: unlike kProbeExecuted,
+                // the policy has no per-echo state to snapshot here (the
+                // duck's verdict is computed entirely from the worker's own
+                // deferred capture-energy analysis, not from future
+                // estimates) — so this handler is purely worker-local
+                // bookkeeping. Stamp the echo epoch as wk.now_ns (session
+                // time, never a wall clock) and the achieved depth the
+                // shell actually commanded, then arm the deferred analysis
+                // tick() will run once the search window has elapsed.
+                wk.duck_echo_ns = wk.now_ns;
+                wk.duck_achieved_deci_db = static_cast<int32_t>(cmd.value_ms);
+                wk.duck_analysis_pending = true;
+                break;
+            }
         }
     }
 
@@ -934,6 +1179,15 @@ sc_status_t sc_notify_probe_executed(sc_session_t* s) {
     return SC_OK;
 }
 
+sc_status_t sc_notify_duck_executed(sc_session_t* s, int32_t achieved_deci_db) {
+    if (!s) return SC_ERR_INVALID_ARG;
+    Command cmd;
+    cmd.kind = Command::Kind::kDuckExecuted;
+    cmd.value_ms = achieved_deci_db;
+    s->enqueue(std::move(cmd));
+    return SC_OK;
+}
+
 sc_status_t sc_push_reference(sc_session_t* s, const float* mono, int32_t frames,
                               int64_t track_position_ms) {
     if (!s || !mono || frames <= 0 || track_position_ms < 0)
@@ -1060,6 +1314,18 @@ void sc_test_get_beat_state(sc_session_t* s, int32_t* out_beat_comb,
     if (out_beat_period_ms)
         *out_beat_period_ms =
             s->beat_period_ms_mirror.load(std::memory_order_relaxed);
+}
+
+// DSP-03a: last duck-detector result the worker computed (dip depth D in
+// dB, significance z) -- lets a test confirm the deferred-analysis wiring
+// and matched-filter math without any public ABI surface (mirrors
+// sc_test_get_beat_state's pattern above).
+void sc_test_get_duck_metrics(sc_session_t* s, double* out_dip_db,
+                              double* out_z) {
+    if (!s) return;
+    if (out_dip_db)
+        *out_dip_db = s->duck_dip_db_mirror.load(std::memory_order_relaxed);
+    if (out_z) *out_z = s->duck_z_mirror.load(std::memory_order_relaxed);
 }
 
 }  // extern "C"

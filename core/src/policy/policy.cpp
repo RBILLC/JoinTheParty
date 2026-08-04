@@ -43,6 +43,16 @@ void CorrectionPolicy::reset() {
     probe_verdict_start_ns_ = 0;
     probe_verdict_fixes_seen_ = 0;
     probe_verdict_shift_sum_ = 0.0;
+
+    // tech-req §2.12 (DSP-03a): duck state is epoch-scoped exactly like the
+    // probe state above — a fresh session must never judge a duck verdict
+    // against accumulation from before this reset.
+    duck_outstanding_ = false;
+    duck_pending_dispatch_ = false;
+    duck_ever_requested_ = false;
+    last_duck_request_ns_ = 0;
+    duck_request_ns_ = 0;
+    duck_escalated_ = false;
 }
 
 void CorrectionPolicy::ring_append(double error_ms, uint64_t mono_ns) {
@@ -116,6 +126,16 @@ bool CorrectionPolicy::referee_any_three_agree(double tol) const {
 }
 
 void CorrectionPolicy::try_request_probe(uint64_t now_ns) {
+    // tech-req §2.12 (DSP-03a, R1): the tier switch. false — the default,
+    // and every existing CTL-01a test's configuration — falls straight
+    // through to the legacy pause-request gates/cooldown below, UNCHANGED
+    // from shipped behavior. true routes both triggers to the duck tier
+    // instead; the pause probe then becomes reachable only through
+    // on_duck_result's inconclusive-escalation path, never from here.
+    if (cfg_.duck_tier_first) {
+        try_request_duck(now_ns);
+        return;
+    }
     if (probe_outstanding_) return;
     if (is_settling(now_ns)) return;
     if (!playback_live_) return;
@@ -127,6 +147,28 @@ void CorrectionPolicy::try_request_probe(uint64_t now_ns) {
     probe_ever_requested_ = true;
     last_probe_request_ns_ = now_ns;
     probe_request_ns_ = now_ns;
+}
+
+// tech-req §2.12 (DSP-03a, R1): duck-tier request path, gated exactly like
+// try_request_probe's legacy path above but against the duck's own
+// outstanding flag/cooldown. Also refuses to arm while the pause probe is
+// itself outstanding — with duck_tier_first set, the only way to reach the
+// pause tier is the escalation in on_duck_result, never a second
+// independent request racing it.
+void CorrectionPolicy::try_request_duck(uint64_t now_ns) {
+    if (duck_outstanding_) return;
+    if (probe_outstanding_) return;
+    if (is_settling(now_ns)) return;
+    if (!playback_live_) return;
+    if (duck_ever_requested_ &&
+        now_ns - last_duck_request_ns_ < cfg_.duck_cooldown_ns)
+        return;
+    duck_outstanding_ = true;
+    duck_pending_dispatch_ = true;
+    duck_ever_requested_ = true;
+    last_duck_request_ns_ = now_ns;
+    duck_request_ns_ = now_ns;
+    duck_escalated_ = false;  // fresh episode
 }
 
 void CorrectionPolicy::on_referee_window(double lag_ms, bool valid,
@@ -176,6 +218,22 @@ void CorrectionPolicy::on_tick(const Estimate& est, bool playback_live,
         probe_outstanding_ = false;
     }
 
+    // tech-req §2.12 (DSP-03a, R2): duck expiry, reusing §2.9's own
+    // never-echoed pattern above. The policy has no per-echo state of its
+    // own for the duck (unlike the probe, it doesn't need to snapshot
+    // anything at echo time — the worker's deferred analysis computes the
+    // whole verdict independently and hands it to on_duck_result in one
+    // shot), so a single time-driven check covers both "the shell never
+    // echoed" and "the echo landed but no verdict arrived in time": either
+    // way, an episode that hasn't resolved by probe_verdict_window_ns after
+    // the request expires unfired. The cooldown still anchors at
+    // last_duck_request_ns_ (request time), so a silently-declined or
+    // unresolved duck can't be retried in a tight loop.
+    if (duck_outstanding_ &&
+        now_ns - duck_request_ns_ >= cfg_.probe_verdict_window_ns) {
+        duck_outstanding_ = false;
+    }
+
     // Wittenmark turn-off trigger (research-closed-loop-control.md §5 item
     // 4): a starving filter never reaches on_estimate through an accepted
     // fix, so the trigger has to be time-driven from here instead.
@@ -207,6 +265,85 @@ void CorrectionPolicy::on_probe_executed(double current_error_ms,
     probe_verdict_start_ns_ = now_ns;
     probe_verdict_fixes_seen_ = 0;
     probe_verdict_shift_sum_ = 0.0;
+}
+
+bool CorrectionPolicy::duck_request_due(uint64_t now_ns) {
+    (void)now_ns;
+    if (!duck_pending_dispatch_) return false;
+    duck_pending_dispatch_ = false;
+    return true;
+}
+
+// tech-req §2.12 (DSP-03a): duck verdict. See policy.h's doc comment for why
+// this decides and returns an Action immediately rather than deferring to
+// on_estimate the way the pause probe's verdict does.
+Action CorrectionPolicy::on_duck_result(double dip_db, double z,
+                                        int32_t achieved_deci_db,
+                                        uint64_t now_ns) {
+    Action action;
+    if (!duck_outstanding_) return action;  // stray result; nothing pending
+    duck_outstanding_ = false;              // episode resolved one way or
+                                             // another below
+    duck_pending_dispatch_ = false;
+
+    // R4 scaling + guard: a duck that commanded no depth (achieved_db <= 0)
+    // proves nothing about self- vs. room-dominance — treat the whole
+    // verdict as inconclusive, but it still consumes the episode/escalation
+    // normally (falls through to the escalation branch below).
+    const double achieved_db = static_cast<double>(achieved_deci_db) / 10.0;
+    bool self_dominant = false;
+    bool room_dominant = false;
+    if (achieved_db > 0.0) {
+        // Verdict bands are specified at the nominal 6 dB duck; the mixture
+        // model's dip depth scales with commanded depth (§2.12), so the two
+        // D thresholds scale linearly with achieved_db/6.0. duck_min_z is
+        // deliberately left unscaled — it's a noise-floor significance
+        // test, not a depth-dependent quantity.
+        const double scale = achieved_db / 6.0;
+        const double self_thresh_db = cfg_.duck_self_dominant_db * scale;
+        const double room_thresh_db = cfg_.duck_room_dominant_db * scale;
+        self_dominant = dip_db >= self_thresh_db && z >= cfg_.duck_min_z;
+        room_dominant = dip_db <= room_thresh_db;
+    }
+
+    if (self_dominant) {
+        // Our own output dominates the mic's captured energy: the same
+        // self-match conclusion the pause probe's verdict reaches, via the
+        // same recovery path (re-listen; §2.7 persistence gate governs
+        // re-lock).
+        action.kind = ActionKind::kTrackLost;
+        reset();
+        return action;
+    }
+    if (room_dominant) {
+        // Cleared: the room dominates, sentinel suspicion resets. Mirrors
+        // the pause probe's "genuine" verdict outcome — no track-lost, no
+        // escalation.
+        duck_escalated_ = false;
+        return action;  // kNone
+    }
+
+    // Inconclusive (mid-band D, or z < duck_min_z, or the achieved_db <= 0
+    // guard above) — escalate ONCE per duck episode to the shipped §2.9
+    // pause probe rather than re-ducking in a loop (R3).
+    if (!duck_escalated_) {
+        duck_escalated_ = true;
+        // R3: this escalation continues the SAME probe episode the duck
+        // opened, not a fresh independent request — exempt from
+        // probe_cooldown_ns and armed immediately, bypassing
+        // try_request_probe's settling/playback/cooldown gates entirely.
+        // It still RE-ANCHORS last_probe_request_ns_, so any LATER,
+        // independent pause-probe trigger (impossible today while
+        // duck_tier_first is set, since try_request_probe always routes to
+        // the duck tier — but kept correct in case that composition ever
+        // changes) respects the cooldown from this point forward.
+        probe_outstanding_ = true;
+        probe_pending_dispatch_ = true;
+        probe_ever_requested_ = true;
+        last_probe_request_ns_ = now_ns;
+        probe_request_ns_ = now_ns;
+    }
+    return action;  // kNone
 }
 
 bool CorrectionPolicy::is_settling(uint64_t now_ns) const {
@@ -358,7 +495,11 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
     // hold below keep accumulating exactly as they would otherwise — only
     // the act of firing is withheld, so a cleared probe finds the same
     // evidence it would have without one ever having run.
-    const bool probe_suppresses_seeks = probe_outstanding_;
+    // tech-req §2.12 (DSP-03a): a duck outstanding suppresses seeks the
+    // exact same way — extended here rather than duplicated below, so every
+    // downstream use of this flag (instantaneous path and the persistence
+    // gate) treats a duck and a pause probe identically.
+    const bool probe_suppresses_seeks = probe_outstanding_ || duck_outstanding_;
 
     if (std::abs(e) >= cfg_.deadband_ms ||
         std::abs(predicted) >= cfg_.deadband_ms) {

@@ -139,6 +139,20 @@ sc_status_t sc_notify_local_playback(sc_session_t*, int64_t commanded_position_m
  * with no probe outstanding (silently ignored, still returns SC_OK). */
 sc_status_t sc_notify_probe_executed(sc_session_t*);
 
+/* DSP-03a (technical-requirements.md §2.12): the shell MUST call this after
+ * actually executing an SC_EVT_ACTIVE_DUCK — ducking STREAM_MUSIC by -6 dB
+ * for duck_ms then restoring it — mirroring sc_notify_probe_executed's echo
+ * shape. achieved_deci_db is the depth ACTUALLY commanded, in tenths of a
+ * dB (volume-index quantization means -6.0 dB exactly is rarely reachable),
+ * so the worker's dip detector judges the observed capture-energy dip
+ * against what was really commanded, never the nominal 6. If the shell
+ * cannot execute the duck (already paused, mid-calibration), it must simply
+ * never call this; the request expires on its own after
+ * probe_verdict_window_ns and the duck cooldown still applies, so a
+ * silently-declined duck cannot be retried in a tight loop. Safe to call
+ * with no duck outstanding (silently ignored, still returns SC_OK). */
+sc_status_t sc_notify_duck_executed(sc_session_t*, int32_t achieved_deci_db);
+
 /* Copies up to max_frames of the MOST RECENT capture audio (post-AEC, mono
  * float, chronological order) into out. Returns the number of frames
  * copied (0 if none yet). If out_end_mono_ns is non-NULL it receives the
@@ -244,7 +258,19 @@ typedef enum {
      * pause playback, wait pause_ms, resume, then call
      * sc_notify_probe_executed. Appended at the END of this enum per the
      * ticket's ABI-stability rule for existing values. */
-    SC_EVT_ACTIVE_PROBE       /* payload: sc_evt_active_probe_t */
+    SC_EVT_ACTIVE_PROBE,      /* payload: sc_evt_active_probe_t */
+    /* DSP-03a (technical-requirements.md §2.12): the SAME referee/turn-off
+     * triggers as SC_EVT_ACTIVE_PROBE above, but requesting the gentler
+     * volume-duck tier first (PolicyConfig::duck_tier_first) — the pause
+     * probe becomes reachable only as an inconclusive-verdict escalation.
+     * The shell must duck STREAM_MUSIC by -6 dB for duck_ms then restore
+     * it, echoing sc_notify_duck_executed(achieved_deci_db); no-op (no
+     * echo) when playback is already paused or calibration is
+     * Running/ByEarRunning — the same shell gates SC_EVT_ACTIVE_PROBE
+     * documents. Appended at the END of this enum per the same
+     * ABI-stability rule; SC_EVT_ACTIVE_PROBE/sc_evt_active_probe_t/
+     * sc_notify_probe_executed above are byte-untouched by this addition. */
+    SC_EVT_ACTIVE_DUCK        /* payload: sc_evt_active_duck_t */
 } sc_event_type_t;
 
 typedef struct {
@@ -292,6 +318,14 @@ typedef struct {
 typedef struct {
     int32_t pause_ms;
 } sc_evt_active_probe_t;
+
+/* DSP-03a (technical-requirements.md §2.12). The shell must duck
+ * STREAM_MUSIC by -6 dB for duck_ms then restore it, then call
+ * sc_notify_duck_executed with the ACTUALLY achieved depth (volume-index
+ * quantization means -6.0 dB exactly is rarely reachable). */
+typedef struct {
+    int32_t duck_ms;
+} sc_evt_active_duck_t;
 
 typedef void (*sc_event_cb)(sc_event_type_t, const void* payload, void* user_data);
 

@@ -1224,6 +1224,345 @@ void test_probe_state_cleared_on_reset() {
     CHECK(!pol.probe_request_due(far_future));
 }
 
+// ---- DSP-03a: volume-duck tier, deferred verdict, escalation -------------
+// tech-req §2.12. Composes with the CTL-01a machinery just above: the
+// duck_tier_first switch (ORCHESTRATOR RULING R1) routes both existing
+// triggers to a duck request instead of a pause request; the pause probe
+// becomes reachable only through on_duck_result's inconclusive-escalation
+// path (R3). All tests below set cfg.duck_tier_first = true unless
+// otherwise noted — the default-false regression test is the one
+// exception, proving shipped CTL-01a behavior is untouched at defaults.
+//
+// The duck verdict itself is driven by calling on_duck_result directly
+// (dip_db/z as if the worker's matched-filter analysis had already run) —
+// the policy-level test convention test_probe_verdict_* above already
+// established for on_probe_executed, and explicitly sanctioned for this
+// ticket's verdict tests. No on_duck_executed-equivalent exists in the
+// policy: unlike the pause probe, the duck's verdict needs no per-echo
+// snapshot (see on_duck_result's own doc comment for why), so there is
+// nothing for such a method to do.
+
+// Drives the Wittenmark turn-off trigger (simplest deterministic path to an
+// outstanding request, same technique the CTL-01a verdict tests above use)
+// far enough to arm exactly one request. Returns the timestamp the request
+// armed at. NOTE: the dwell condition it relies on stays satisfied
+// afterward (nothing here resets it) as long as on_tick keeps seeing a
+// low-confidence estimate — several tests below rely on that to probe
+// cooldown/re-arm behavior without rebuilding the dwell from scratch.
+uint64_t drive_turnoff_trigger(synccore::CorrectionPolicy& pol) {
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = true;
+    uint64_t t = 0;
+    for (int i = 0; i <= 20; ++i) {
+        t = static_cast<uint64_t>(i) * kSec;
+        pol.on_tick(low, true, t);
+    }
+    return t;
+}
+
+void test_duck_first_starvation_trigger_arms_duck() {
+    synccore::PolicyConfig cfg;
+    cfg.duck_tier_first = true;
+    synccore::CorrectionPolicy pol(cfg);
+    uint64_t t = 1 * kSec;
+    pol.on_estimate(make_est(5.0, 0.0, true), 100000.0, t);
+
+    // Same starvation drive as test_referee_sentinel_starvation_requests_
+    // probe above (mutually-disagreeing lags spanning >= 45 s while
+    // converged), but with duck_tier_first set: it must arm the DUCK
+    // request, never the pause probe.
+    const double lags[] = {100.0, 400.0, 900.0, 1500.0, 2200.0};
+    bool duck_seen = false;
+    bool probe_seen = false;
+    for (double lag : lags) {
+        t += 12 * kSec;
+        pol.on_referee_window(lag, true, t);
+        if (pol.duck_request_due(t)) duck_seen = true;
+        if (pol.probe_request_due(t)) probe_seen = true;
+    }
+    CHECK(duck_seen);
+    CHECK(!probe_seen);
+}
+
+void test_duck_first_turnoff_trigger_arms_duck() {
+    synccore::PolicyConfig cfg;
+    cfg.duck_tier_first = true;
+    synccore::CorrectionPolicy pol(cfg);
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = false;
+
+    uint64_t t = 0;
+    bool duck_seen = false;
+    bool probe_seen = false;
+    for (int i = 0; i <= 21; ++i) {
+        t = static_cast<uint64_t>(i) * kSec;
+        pol.on_tick(low, /*playback_live=*/true, t);
+        if (pol.duck_request_due(t)) duck_seen = true;
+        if (pol.probe_request_due(t)) probe_seen = true;
+    }
+    CHECK(duck_seen);
+    CHECK(!probe_seen);
+}
+
+// Default-config regression: with duck_tier_first left at its default
+// (false), the EXACT starvation drive from
+// test_referee_sentinel_starvation_requests_probe above must still arm the
+// pause probe and duck_request_due must never fire — pins that shipped
+// CTL-01a behavior is byte-identically untouched by this ticket at
+// defaults.
+void test_duck_tier_first_default_false_regression() {
+    synccore::CorrectionPolicy pol;  // default PolicyConfig
+    uint64_t t = 1 * kSec;
+    pol.on_estimate(make_est(5.0, 0.0, true), 100000.0, t);
+
+    const double lags[] = {100.0, 400.0, 900.0, 1500.0, 2200.0};
+    bool probe_seen = false;
+    bool duck_seen = false;
+    for (double lag : lags) {
+        t += 12 * kSec;
+        pol.on_referee_window(lag, true, t);
+        if (pol.probe_request_due(t)) probe_seen = true;
+        if (pol.duck_request_due(t)) duck_seen = true;
+    }
+    CHECK(probe_seen);
+    CHECK(!duck_seen);
+}
+
+// Verdict, self-dominant: deep, significant dip at the nominal 6 dB duck
+// (achieved_deci_db=60) reaches the same kTrackLost path a self-match pause
+// verdict does.
+void test_duck_verdict_self_dominant_track_lost() {
+    synccore::PolicyConfig cfg;
+    cfg.duck_tier_first = true;
+    synccore::CorrectionPolicy pol(cfg);
+    uint64_t t = drive_turnoff_trigger(pol);
+    CHECK(pol.duck_request_due(t));
+
+    t += kSec;
+    const auto a = pol.on_duck_result(/*dip_db=*/5.0, /*z=*/4.0,
+                                      /*achieved_deci_db=*/60, t);
+    CHECK(a.kind == synccore::ActionKind::kTrackLost);
+}
+
+// Verdict, room-dominant: shallow dip clears the episode without a
+// track-lost, and the reset sentinel state lets a later, independent
+// starvation re-arm a duck once its own cooldown has elapsed.
+void test_duck_verdict_room_dominant_clears_and_can_rearm() {
+    synccore::PolicyConfig cfg;
+    cfg.duck_tier_first = true;
+    synccore::CorrectionPolicy pol(cfg);
+    uint64_t t = drive_turnoff_trigger(pol);
+    CHECK(pol.duck_request_due(t));
+    const uint64_t requested_at = t;
+
+    t += kSec;
+    const auto a = pol.on_duck_result(1.0, 5.0, 60, t);
+    CHECK(a.kind == synccore::ActionKind::kNone);
+    CHECK(!pol.probe_request_due(t));  // cleared, no escalation
+
+    // Sentinel state resets: once the 60 s duck cooldown elapses, the
+    // still-active turn-off dwell (nothing above reset it) can re-arm a
+    // fresh duck request.
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = false;
+    t = requested_at + 61 * kSec;
+    pol.on_tick(low, true, t);
+    CHECK(pol.duck_request_due(t));
+}
+
+// Verdict, inconclusive: mid-band dip escalates exactly once to the pause
+// probe; a stray second on_duck_result call in the resolved episode fires
+// no second escalation.
+void test_duck_verdict_inconclusive_escalates_once() {
+    synccore::PolicyConfig cfg;
+    cfg.duck_tier_first = true;
+    synccore::CorrectionPolicy pol(cfg);
+    uint64_t t = drive_turnoff_trigger(pol);
+    CHECK(pol.duck_request_due(t));
+
+    t += kSec;
+    const auto a = pol.on_duck_result(2.5, 4.0, 60, t);
+    CHECK(a.kind == synccore::ActionKind::kNone);
+    CHECK(pol.probe_request_due(t));   // escalated exactly once
+    CHECK(!pol.probe_request_due(t));  // one-shot: already consumed
+
+    // duck_outstanding_ was already resolved by the call above, so this is
+    // a stray result — no second escalation.
+    t += kSec;
+    const auto a2 = pol.on_duck_result(2.5, 4.0, 60, t);
+    CHECK(a2.kind == synccore::ActionKind::kNone);
+    CHECK(!pol.probe_request_due(t));
+}
+
+// z-gate: a deep dip that fails the significance test (z < duck_min_z) is
+// inconclusive, not self-dominant, and still escalates.
+void test_duck_verdict_z_gate_inconclusive_escalates() {
+    synccore::PolicyConfig cfg;
+    cfg.duck_tier_first = true;
+    synccore::CorrectionPolicy pol(cfg);
+    uint64_t t = drive_turnoff_trigger(pol);
+    CHECK(pol.duck_request_due(t));
+
+    t += kSec;
+    const auto a = pol.on_duck_result(5.0, 1.0, 60, t);
+    CHECK(a.kind == synccore::ActionKind::kNone);
+    CHECK(pol.probe_request_due(t));
+}
+
+// R4 scaling: at half the nominal achieved depth (30 deci-dB = 3 dB), the
+// self-dominant D threshold halves (4.0 -> 2.0); at achieved_deci_db=0 the
+// verdict is inconclusive regardless of D (a duck that commanded no depth
+// proves nothing) but still escalates.
+void test_duck_verdict_scaling() {
+    {
+        synccore::PolicyConfig cfg;
+        cfg.duck_tier_first = true;
+        synccore::CorrectionPolicy pol(cfg);
+        uint64_t t = drive_turnoff_trigger(pol);
+        CHECK(pol.duck_request_due(t));
+        t += kSec;
+        const auto a = pol.on_duck_result(2.2, 4.0, 30, t);
+        CHECK(a.kind == synccore::ActionKind::kTrackLost);
+    }
+    {
+        synccore::PolicyConfig cfg;
+        cfg.duck_tier_first = true;
+        synccore::CorrectionPolicy pol(cfg);
+        uint64_t t = drive_turnoff_trigger(pol);
+        CHECK(pol.duck_request_due(t));
+        t += kSec;
+        const auto a = pol.on_duck_result(9.0, 9.0, 0, t);
+        CHECK(a.kind != synccore::ActionKind::kTrackLost);
+        CHECK(pol.probe_request_due(t));  // still consumes/escalates
+    }
+}
+
+// Cooldown: a second duck request is blocked inside duck_cooldown_ns
+// (60 s), allowed once it has elapsed. probe_cooldown_ns (120 s) is left
+// completely alone by this ticket — already regression-checked by every
+// existing CTL-01a cooldown test above, which this file does not modify.
+void test_duck_cooldown_enforced() {
+    synccore::PolicyConfig cfg;
+    cfg.duck_tier_first = true;
+    synccore::CorrectionPolicy pol(cfg);
+    uint64_t t = drive_turnoff_trigger(pol);
+    CHECK(pol.duck_request_due(t));
+    const uint64_t requested_at = t;
+
+    // Resolve the episode so duck_outstanding_ itself isn't what's blocking
+    // the next request, isolating the cooldown gate specifically.
+    t += kSec;
+    pol.on_duck_result(1.0, 5.0, 60, t);
+
+    // The turn-off dwell is still satisfied from the original drive (never
+    // reset above), so every subsequent on_tick call re-attempts a duck
+    // request — exactly what's needed to isolate the cooldown gate itself.
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = false;
+
+    t = requested_at + 30 * kSec;  // well within the 60 s cooldown
+    pol.on_tick(low, true, t);
+    CHECK(!pol.duck_request_due(t));
+
+    t = requested_at + 61 * kSec;  // past the 60 s cooldown
+    pol.on_tick(low, true, t);
+    CHECK(pol.duck_request_due(t));
+}
+
+// Seek suppression: an out-of-deadband estimate arriving while a duck is
+// outstanding must return kNone, never kSeek — mirrors
+// test_seek_suppressed_while_probe_outstanding above, for the duck tier.
+void test_seek_suppressed_while_duck_outstanding() {
+    synccore::PolicyConfig cfg;
+    cfg.duck_tier_first = true;
+    synccore::CorrectionPolicy pol(cfg);
+    uint64_t t = drive_turnoff_trigger(pol);
+    CHECK(pol.duck_request_due(t));  // duck now outstanding, no verdict yet
+
+    t += kSec;
+    const auto a = pol.on_estimate(make_est(200.0), 100000.0, t);
+    CHECK(a.kind == synccore::ActionKind::kNone);
+
+    // Track-lost precedence still holds even while a duck is outstanding.
+    t += kSec;
+    const auto lost = pol.on_estimate(make_est(2500.0), 100000.0, t);
+    CHECK(lost.kind == synccore::ActionKind::kTrackLost);
+}
+
+// Expiry (orchestrator-added): a duck the shell never echoes — or whose
+// verdict never arrives — must expire probe_verdict_window_ns after the
+// request, exactly like §2.9's never-echoed pause probe. Without on_tick's
+// duck-expiry block, duck_outstanding_ stays true forever: seeks are
+// suppressed indefinitely and no future duck can ever arm. Deleting that
+// expiry block fails this test.
+void test_duck_expires_when_never_echoed() {
+    synccore::PolicyConfig cfg;
+    cfg.duck_tier_first = true;
+    synccore::CorrectionPolicy pol(cfg);
+    uint64_t t = drive_turnoff_trigger(pol);
+    CHECK(pol.duck_request_due(t));  // duck outstanding, never echoed
+
+    // While outstanding: the existing suppression rule holds.
+    t += kSec;
+    const auto suppressed = pol.on_estimate(make_est(200.0), 100000.0, t);
+    CHECK(suppressed.kind == synccore::ActionKind::kNone);
+
+    // No echo ever arrives. Past probe_verdict_window_ns (20 s from the
+    // request), an on_tick pass expires the episode...
+    t += 21 * kSec;
+    synccore::Estimate low;
+    low.valid = true;
+    low.confidence = 0.19f;
+    low.converged = false;
+    pol.on_tick(low, true, t);  // within the 60 s cooldown: cannot re-arm
+    CHECK(!pol.duck_request_due(t));
+
+    // ...and the SAME out-of-deadband estimate that was suppressed above
+    // may now seek again — the outstanding flag no longer pins suppression.
+    t += kSec;
+    const auto freed = pol.on_estimate(make_est(200.0), 100000.0, t);
+    CHECK(freed.kind == synccore::ActionKind::kSeek);
+}
+
+// Epoch: reset() clears the duck outstanding flag (and, per its own
+// comment, the escalation flag alongside it). Deliberately built so a
+// broken (no-op) reset would be caught: without it, the post-reset
+// on_duck_result call below would proceed to decide a verdict (and
+// possibly escalate) instead of being ignored as a stray result.
+void test_duck_state_cleared_on_reset() {
+    synccore::PolicyConfig cfg;
+    cfg.duck_tier_first = true;
+    synccore::CorrectionPolicy pol(cfg);
+    uint64_t t = drive_turnoff_trigger(pol);
+    CHECK(pol.duck_request_due(t));
+
+    pol.reset();
+
+    t += kSec;
+    const auto a = pol.on_duck_result(2.5, 4.0, 60, t);
+    CHECK(a.kind == synccore::ActionKind::kNone);
+    CHECK(!pol.probe_request_due(t));  // no escalation from a stray result
+}
+
+// Stray result: on_duck_result with nothing outstanding is ignored — no
+// action, no escalation.
+void test_stray_duck_result_ignored() {
+    synccore::PolicyConfig cfg;
+    cfg.duck_tier_first = true;
+    synccore::CorrectionPolicy pol(cfg);
+    const auto a = pol.on_duck_result(5.0, 4.0, 60, 10 * kSec);
+    CHECK(a.kind == synccore::ActionKind::kNone);
+    CHECK(!pol.probe_request_due(10 * kSec));
+}
+
 }  // namespace
 
 int main() {
@@ -1268,6 +1607,20 @@ int main() {
     test_probe_verdict_window_expires_with_too_few_fixes();
     test_seek_suppressed_while_probe_outstanding();
     test_probe_state_cleared_on_reset();
+
+    test_duck_first_starvation_trigger_arms_duck();
+    test_duck_first_turnoff_trigger_arms_duck();
+    test_duck_tier_first_default_false_regression();
+    test_duck_verdict_self_dominant_track_lost();
+    test_duck_verdict_room_dominant_clears_and_can_rearm();
+    test_duck_verdict_inconclusive_escalates_once();
+    test_duck_verdict_z_gate_inconclusive_escalates();
+    test_duck_verdict_scaling();
+    test_duck_cooldown_enforced();
+    test_seek_suppressed_while_duck_outstanding();
+    test_duck_expires_when_never_echoed();
+    test_duck_state_cleared_on_reset();
+    test_stray_duck_result_ignored();
 
     if (g_failures == 0) {
         std::printf("policy_tests: all tests passed\n");

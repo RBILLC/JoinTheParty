@@ -36,6 +36,23 @@
 //     estimates either clears the suspicion or declares the track lost;
 //     seeks are suppressed (not the underlying ring/pending-hold
 //     accumulation) for as long as a probe request is outstanding
+//   - volume-duck tier + capture-energy verdict (tech-req §2.12, DSP-03a):
+//     composes with the pause probe above rather than replacing it.
+//     PolicyConfig::duck_tier_first (default false) is a TIER SWITCH: false
+//     keeps the pause probe as the triggers' only target, byte-identical to
+//     shipped CTL-01a behavior; true makes both triggers request a duck
+//     FIRST, with the pause probe reachable only as an inconclusive-verdict
+//     ESCALATION (never a second independent trigger path). The duck's own
+//     verdict — capture-energy dip depth/significance, computed entirely
+//     worker-side by a matched filter over post-AEC history — arrives
+//     already resolved (unlike the pause probe's, which needs several
+//     future estimates to see whether the residual moved), so
+//     on_duck_result decides and returns an Action immediately: self-
+//     dominant reaches the same kTrackLost path as a self-match pause
+//     verdict; room-dominant clears; inconclusive escalates ONCE per duck
+//     episode to the pause probe, exempt from the pause cooldown (it
+//     continues the same probe episode). Duck cooldown (60 s, proposed) is
+//     independent of and shorter than the pause cooldown (120 s, unchanged).
 #ifndef SYNCCORE_POLICY_H
 #define SYNCCORE_POLICY_H
 
@@ -183,6 +200,46 @@ struct PolicyConfig {
     // applies from the original request time, so a silently-declined probe
     // can't be retried in a tight loop.
     uint64_t probe_verdict_window_ns = 20'000'000'000ull;
+
+    // tech-req §2.12 (DSP-03a): volume-duck tier. ORCHESTRATOR RULING R1 —
+    // the ticket text says both "triggers arm duck FIRST" and "CTL-01a's
+    // existing tests pass unmodified," which conflict unless the promotion
+    // is gated behind a switch. false (default): both triggers request the
+    // pause probe exactly as shipped — every existing CTL-01a test passes
+    // UNMODIFIED, byte-identical behavior. true: both triggers request a
+    // duck first instead; the pause probe becomes reachable only through
+    // the inconclusive-escalation path (see on_duck_result). Per §2.12's
+    // own sequencing note, the duck becomes the DEFAULT tier on-device only
+    // after the CTL-01 pause probe is field-proven there — this field
+    // itself is DSP-03a's mechanism, not that promotion; flipping the
+    // default is explicitly a FUTURE change, not part of this ticket.
+    bool duck_tier_first = false;
+
+    // Nominal duck length. Field-tunable 150 -> 400 ms exactly like
+    // probe_pause_ms above — §2.12 notes Bluetooth absolute-volume
+    // propagation to an A2DP sink can run tens to a few hundred ms, so a
+    // field pass may need to widen this the same way probe_pause_ms was
+    // widened.
+    int32_t duck_ms = 150;
+
+    // Proposed/field-tunable, NOT derived (§2.12) — matches how
+    // probe_pause_ms itself was field-tuned rather than derived. Shorter
+    // than probe_cooldown_ns (120 s) is deliberate: a -6 dB, 150 ms duck is
+    // near-inaudible, so it can be retried more often without the pause
+    // probe's audible cost.
+    uint64_t duck_cooldown_ns = 60'000'000'000ull;
+
+    // Verdict bands (R4), at the NOMINAL 6 dB commanded duck. When the
+    // shell's actually-achieved depth (achieved_deci_db) differs from 6 dB
+    // — volume-index quantization makes exact -6.0 dB rare — on_duck_result
+    // scales duck_self_dominant_db and duck_room_dominant_db linearly by
+    // achieved_db / 6.0 (the mixture model's dip depth scales with
+    // commanded depth). duck_min_z is left UNSCALED: it is a noise-floor
+    // significance test (dip vs. the baseline's own MAD), not a quantity
+    // that should shrink just because we commanded a shallower duck.
+    double duck_self_dominant_db = 4.0;
+    double duck_room_dominant_db = 1.5;
+    double duck_min_z = 3.0;
 };
 
 enum class ActionKind { kNone, kSeek, kTrackLost };
@@ -249,6 +306,32 @@ public:
     // echo with no outstanding request is safely ignored.
     void on_probe_executed(double current_error_ms, uint64_t now_ns);
 
+    // tech-req §2.12 (DSP-03a): the worker reads this to fill
+    // sc_evt_active_duck_t.duck_ms when dispatching SC_EVT_ACTIVE_DUCK.
+    int32_t duck_ms() const { return cfg_.duck_ms; }
+
+    // Worker polls this once per tick(), mirroring probe_request_due's
+    // one-shot pattern: true at most once per armed duck request. The
+    // worker turns a true return into SC_EVT_ACTIVE_DUCK.
+    bool duck_request_due(uint64_t now_ns);
+
+    // tech-req §2.12 (DSP-03a): the duck verdict, computed entirely
+    // worker-side (matched-filter dip depth dip_db and its significance z
+    // over post-AEC capture history) and handed here as a RESULT — this
+    // function never touches capture data, keeping policy.cpp DSP-free.
+    // Unlike on_probe_executed (which only stamps an echo and defers the
+    // actual decision to future on_estimate calls, because the pause
+    // verdict needs several post-echo ESTIMATES to see whether the residual
+    // moved), the duck verdict is already fully resolved by the time this
+    // is called — so it decides immediately and returns an Action, the SAME
+    // mechanism on_estimate itself uses for kTrackLost, rather than adding
+    // a second, parallel notification path the worker would need separate
+    // plumbing for. A stray result with no duck outstanding is ignored
+    // (returns kNone, no state change), mirroring on_probe_executed's
+    // stray-echo rule.
+    Action on_duck_result(double dip_db, double z, int32_t achieved_deci_db,
+                          uint64_t now_ns);
+
     void reset();
 
 private:
@@ -304,10 +387,21 @@ private:
     // True if some valid ringed lag has at least 3 valid entries (itself
     // included) within tol of it — "any 3 ringed lags mutually agree".
     bool referee_any_three_agree(double tol) const;
-    // Shared rate-limit/gate check for both probe triggers. No-op if a
+    // Shared rate-limit/gate check for both probe triggers. Routes to
+    // try_request_duck when cfg_.duck_tier_first is set (R1); otherwise the
+    // pause-request gates/cooldown run exactly as shipped. No-op if a
     // probe is already outstanding, settling, playback is paused, or the
     // cooldown since the last armed request hasn't elapsed.
     void try_request_probe(uint64_t now_ns);
+
+    // tech-req §2.12 (DSP-03a): duck-tier request path (R1). Mirrors
+    // try_request_probe's gates (settling, playback live, nothing already
+    // outstanding, cooldown elapsed) against the duck's own outstanding
+    // flag/cooldown rather than the pause probe's, and additionally never
+    // arms while the pause probe itself is outstanding (the escalation
+    // path below is the only way to reach the pause tier while
+    // duck_tier_first is set).
+    void try_request_duck(uint64_t now_ns);
 
     RefereeSample referee_ring_[kRefereeRingCapacity];
     std::size_t referee_ring_count_ = 0;
@@ -339,6 +433,25 @@ private:
     uint64_t probe_verdict_start_ns_ = 0;
     int probe_verdict_fixes_seen_ = 0;
     double probe_verdict_shift_sum_ = 0.0;
+
+    // tech-req §2.12 (DSP-03a): duck request/verdict state. Mirrors the
+    // probe request bookkeeping above in shape (outstanding / one-shot
+    // pending-dispatch / ever-requested / cooldown anchor / never-echoed
+    // expiry anchor) but tracks the duck's own episode independently of the
+    // probe's. duck_escalated_ is the "at most ONE escalation per duck
+    // episode" guard (R3) — belt-and-suspenders alongside duck_outstanding_
+    // itself already gating stray on_duck_result calls. ALL cleared in
+    // reset() (epoch rule, matching every other §2.7/§2.8/§2.9 state).
+    bool duck_outstanding_ = false;      // armed request through verdict
+                                          // resolution/expiry
+    bool duck_pending_dispatch_ = false; // one-shot, consumed by
+                                          // duck_request_due
+    bool duck_ever_requested_ = false;   // first request skips the cooldown
+    uint64_t last_duck_request_ns_ = 0;  // cooldown anchor
+    uint64_t duck_request_ns_ = 0;       // never-echoed/unresolved expiry
+                                          // anchor
+    bool duck_escalated_ = false;        // R3: at most one pause-probe
+                                          // escalation per duck episode
 };
 
 }  // namespace synccore

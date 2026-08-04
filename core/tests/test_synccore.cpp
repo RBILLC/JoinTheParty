@@ -922,6 +922,214 @@ void test_track_lost_clears_beat_state() {
     sc_destroy(s);
 }
 
+// ---- DSP-03a: volume-duck echo contract + deferred detector math -------
+//
+// tech-req §2.12. The tier switch / trigger composition / verdict-band
+// decision logic already has a dedicated closed-form suite at the policy
+// level (core/tests/test_policy.cpp's DSP-03a block), matching the CTL-01a
+// precedent test_probe_executed_no_pending_is_safely_ignored's own comment
+// cites just above. This layer covers what that one can't: (a) the ABI
+// contract (abi_c_check.c covers compile/link; this file covers the echo's
+// runtime behavior end-to-end through the real C ABI), and (b) the
+// deferred matched-filter detector itself, which is worker-side DSP with
+// no policy-level equivalent to test against.
+
+// DSP-03a echo contract: a null session is rejected, and a stray echo (no
+// duck outstanding) on a live session is harmless — still SC_OK, no event
+// fires as a side effect, and the session keeps working normally
+// afterward. Mirrors test_probe_executed_no_pending_is_safely_ignored
+// above.
+void test_duck_executed_echo_contract() {
+    CHECK(sc_notify_duck_executed(nullptr, 60) == SC_ERR_INVALID_ARG);
+
+    sc_config_t cfg = valid_config();
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    EventLog log;
+    CHECK(sc_set_event_callback(s, event_cb, &log) == SC_OK);
+
+    // No duck has ever been requested on this fresh session.
+    CHECK(sc_notify_duck_executed(s, 60) == SC_OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(log.estimates.load() == 0);
+    CHECK(log.rejects.load() == 0);
+    CHECK(log.corrections.load() == 0);
+
+    // The session keeps working normally afterward -- the stray echo left
+    // no corrupted state behind.
+    sc_player_state_t ps{};
+    ps.position_ms = 10000;
+    ps.is_paused = false;
+    ps.received_mono_ns = mono_ns();
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+
+    sc_recognition_fix_t fix{};
+    fix.source = SC_FIX_SHAZAMKIT;
+    fix.match_offset_ms = 9950;
+    fix.capture_mono_ns = mono_ns();
+    fix.confidence = 0.9f;
+    CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+
+    for (int i = 0; i < 200 && log.estimates.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.estimates.load() == 1);
+
+    sc_destroy(s);
+}
+
+// Uniform-noise generator for the deferred-detector tests below --
+// independent of DspClickLcg above (a different stream/use: continuous
+// noise, not sparse click bursts). `dip_len_s <= 0` omits the dip entirely
+// (the no-dip control test's signal); otherwise samples in
+// [dip_start_s, dip_start_s + dip_len_s) are scaled by dip_scale on top of
+// `amplitude` -- 0.5 there is a -6.02 dB POWER dip (10*log10(0.5^2)), since
+// the detector's envelope reads mean(x^2), not the raw amplitude.
+struct DuckNoiseLcg {
+    uint32_t s;
+    explicit DuckNoiseLcg(uint32_t seed) : s(seed) {}
+    float next() {
+        s = s * 1664525u + 1013904223u;
+        return (static_cast<float>(s >> 8) / 8388608.0f) - 1.0f;  // [-1, 1)
+    }
+};
+
+// Sample counts (not seconds->float->size_t conversions) throughout, so
+// every segment boundary is an EXACT multiple of the 480-frame push block
+// dsp_push_click_range uses -- a double-seconds computation here previously
+// truncated 5.35 s * 48000 Hz down by a whole block (floating-point
+// representation error in the accumulated 5.0 + 0.10 + 0.15 + 0.10), which
+// silently dropped the last ~10 ms of the first push and desynchronized the
+// dip's placement relative to the echo it was supposed to precede.
+std::vector<float> duck_noise_track(size_t total_samples, double amplitude,
+                                    size_t dip_start_sample,
+                                    size_t dip_len_samples, double dip_scale,
+                                    uint32_t seed) {
+    std::vector<float> sig(total_samples, 0.0f);
+    DuckNoiseLcg rng(seed);
+    const size_t dip_end = dip_start_sample + dip_len_samples;
+    for (size_t i = 0; i < total_samples; ++i) {
+        const double scale = (dip_len_samples > 0 && i >= dip_start_sample &&
+                              i < dip_end)
+                                  ? amplitude * dip_scale
+                                  : amplitude;
+        sig[i] = static_cast<float>(scale * rng.next());
+    }
+    return sig;
+}
+
+// Shared layout for the two deferred-detector tests below (relative to
+// session start): 5.0 s clean baseline, a 100 ms clean buffer (the tail of
+// the 3 s-preceding-the-search-window baseline the detector actually
+// reads), then [in the dip test only] a 150 ms dip landing right at the
+// start of the search window [echo_ns-250ms, ...), then 100 ms more clean
+// audio up to the echo point at 5.35 s. duck_ms defaults to 150 (default
+// config), so the search window reaches to echo+150ms+750ms = 6.25 s;
+// pushing on to 7.0 s total clears tick()'s own +250 ms analysis margin
+// (ready at 6.5 s) with real headroom, comfortably under the 12 s history
+// ring (no wraparound to reason about).
+constexpr size_t kDuckTestBaselineSamples = 5 * 48000;   // 5.0 s
+constexpr size_t kDuckTestBufferSamples = 4800;          // 0.10 s
+constexpr size_t kDuckTestDipSamples = 7200;             // 0.15 s
+constexpr size_t kDuckTestEchoSamples =                  // 5.35 s
+    kDuckTestBaselineSamples + kDuckTestBufferSamples + kDuckTestDipSamples +
+    kDuckTestBufferSamples;
+constexpr size_t kDuckTestTotalSamples = 7 * 48000;  // 7.0 s
+constexpr double kDuckTestAmplitude = 0.3;
+
+// Deferred detector math (DSP-03a AC): a real -6 dB power dip placed a
+// couple hundred ms before a known echo point, run through the actual
+// capture path and sc_notify_duck_executed, must land close to the true
+// depth with a significant z once tick()'s deferred analysis runs.
+void test_duck_deferred_detector_finds_dip() {
+    sc_config_t cfg = valid_config();
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+
+    const auto sig = duck_noise_track(
+        kDuckTestTotalSamples, kDuckTestAmplitude,
+        /*dip_start_sample=*/kDuckTestBaselineSamples + kDuckTestBufferSamples,
+        /*dip_len_samples=*/kDuckTestDipSamples, /*dip_scale=*/0.5,
+        /*seed=*/7331);
+
+    uint64_t ts = 1'000'000'000ull;
+    dsp_push_click_range(s, sig, 0, kDuckTestEchoSamples, &ts);
+
+    CHECK(sc_notify_duck_executed(s, 60) == SC_OK);
+    // The worker drains whatever's sitting in the RT ring BEFORE processing
+    // its pending command queue each loop iteration (worker_loop's own
+    // ordering) -- without this pause, the second push below can flood the
+    // ring well before the worker ever dequeues kDuckExecuted, so that same
+    // iteration's drain (which runs first) would sweep in ALL of the
+    // post-echo audio too and let it advance wk.now_ns past the intended
+    // echo point BEFORE the echo is stamped. A short wait here (well over
+    // the 2 ms worker poll interval, with nothing new to drain in the
+    // meantime) lets the echo land against exactly what was pushed above,
+    // matching how the real shell's echo always happens strictly after the
+    // duck it's reporting on, with no audio racing ahead of it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    const size_t remaining = sig.size() - kDuckTestEchoSamples;
+    dsp_push_click_range(s, sig, kDuckTestEchoSamples, remaining, &ts);
+    // dsp_push_click_range's own trailing 120 ms drain margin already
+    // covers "the audio actually drained"; this extra margin covers "tick()
+    // actually ran the deferred analysis once ready" (a worker-poll-cycle
+    // concern, not a capture-drain one).
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    double dip_db = -999.0, z = -999.0;
+    sc_test_get_duck_metrics(s, &dip_db, &z);
+    std::printf("  [duck] dip_db=%.2f z=%.2f (expect ~6.0 dB, z well above 3)\n",
+               dip_db, z);
+    CHECK(std::abs(dip_db - 6.0) <= 1.5);
+    CHECK(z >= 3.0);
+
+    sc_destroy(s);
+}
+
+// No-dip control: the identical layout/timing with no quiet segment at all
+// must read a near-zero dip -- proves the detector isn't reading a
+// spurious dip out of pure noise (a max-over-positions matched filter has
+// some natural upward bias even on flat noise; this bounds it).
+void test_duck_deferred_detector_no_dip_reads_near_zero() {
+    sc_config_t cfg = valid_config();
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+
+    // dip_len_samples = 0 disables the dip entirely -- uniform amplitude
+    // throughout.
+    const auto sig = duck_noise_track(kDuckTestTotalSamples, kDuckTestAmplitude,
+                                      0, 0, 1.0, /*seed=*/4242);
+
+    uint64_t ts = 1'000'000'000ull;
+    dsp_push_click_range(s, sig, 0, kDuckTestEchoSamples, &ts);
+
+    CHECK(sc_notify_duck_executed(s, 60) == SC_OK);
+    // The worker drains whatever's sitting in the RT ring BEFORE processing
+    // its pending command queue each loop iteration (worker_loop's own
+    // ordering) -- without this pause, the second push below can flood the
+    // ring well before the worker ever dequeues kDuckExecuted, so that same
+    // iteration's drain (which runs first) would sweep in ALL of the
+    // post-echo audio too and let it advance wk.now_ns past the intended
+    // echo point BEFORE the echo is stamped. A short wait here (well over
+    // the 2 ms worker poll interval, with nothing new to drain in the
+    // meantime) lets the echo land against exactly what was pushed above,
+    // matching how the real shell's echo always happens strictly after the
+    // duck it's reporting on, with no audio racing ahead of it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    const size_t remaining = sig.size() - kDuckTestEchoSamples;
+    dsp_push_click_range(s, sig, kDuckTestEchoSamples, remaining, &ts);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    double dip_db = -999.0, z = -999.0;
+    sc_test_get_duck_metrics(s, &dip_db, &z);
+    std::printf("  [duck-control] dip_db=%.2f z=%.2f (expect near 0)\n", dip_db,
+               z);
+    CHECK(std::abs(dip_db) <= 1.5);
+
+    sc_destroy(s);
+}
+
 }  // namespace
 
 // FIELD TEST 8 regression: the capture history must not survive a session
@@ -979,6 +1187,9 @@ int main() {
     test_oss_ring_wiring_and_cadence();
     test_beat_comb_cross_check_wiring();
     test_track_lost_clears_beat_state();
+    test_duck_executed_echo_contract();
+    test_duck_deferred_detector_finds_dip();
+    test_duck_deferred_detector_no_dip_reads_near_zero();
 
     if (g_failures == 0) {
         std::printf("synccore_tests: all tests passed\n");
