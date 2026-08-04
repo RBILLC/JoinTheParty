@@ -60,7 +60,7 @@
 | DSP-01b | ✅ Done — worker wiring (drain tap + residual-cadence estimate + kTrackLost epoch reset), `beat_comb_corroborated` (k=1..4) + `sc_test_get_beat_state` hook, `lag_analyzer --tempo`; orchestrator rewrote the flaky comb-wiring test onto coherent beat-aligned copies; 9/9 ctest ×3 | `2f63485` |
 | DSP-02a | ✅ Done — `whiten_beta = 0.5` trailing param (legacy branch verbatim, byte-identity + anti-unification pins), `lag_analyzer --beta` in both modes with `(0,1]` guard, combined column order `...,beta,beat_period_ms`; on-device behavior unchanged; 9/9 ctest | `0306c0d` |
 | DSP-02b | ⬜ Not started | — |
-| DSP-03a | ⬜ Not started | — |
+| DSP-03a | ✅ Done — `SC_EVT_ACTIVE_DUCK`/`sc_notify_duck_executed` ABI + deferred worker matched-filter dip detector + duck tier behind `duck_tier_first` (default false = shipped pause-first, zero existing-test edits; promotion is a future post-field-pass flip per §2.12); orchestrator fixed a false-clear on the insufficient-history path + added the duck-expiry pin; 16 new tests, 9/9 ctest, sims byte-identical | `1ec8b56` |
 | DSP-03b | ⬜ Not started | — |
 | Everything else | ⬜ Not started | — |
 
