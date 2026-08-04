@@ -1,5 +1,6 @@
 package com.jointheparty.app.ui.session
 
+import com.jointheparty.app.audio.StreamVolumeController
 import com.jointheparty.app.audio.TonePlayer
 import com.jointheparty.app.backend.BackendClient
 import com.jointheparty.app.backend.ShazamTokenResult
@@ -10,8 +11,11 @@ import com.jointheparty.app.data.CalibrationProfile
 import com.jointheparty.app.data.NudgeStore
 import com.jointheparty.app.data.sortedByUpdatedAtDescending
 import com.jointheparty.app.recognition.RecognitionProvider
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -1375,6 +1379,190 @@ class SessionViewModelTest {
         assertEquals(0, engine.notifyProbeExecutedCount)
     }
 
+    // ---- DSP-03b: Event.ActiveDuck (technical-requirements.md §2.12) ------
+
+    /** Reachable at -6 dB via a non-exact index (target lands at -7.5 dB). */
+    private fun duckDbTable() = mapOf(
+        0 to -10.0f,
+        1 to -7.5f,
+        2 to -5.0f,
+        3 to -2.5f,
+        4 to 0.0f,
+    )
+
+    @Test
+    fun activeDuckExecutesSetDelayRestoreThenEchoesActualAchievedDepth() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        val callLog = mutableListOf<String>()
+        engine.duckCallLog = callLog
+        spotify.lastKnownPlayerState = livePlayerState()
+        val volume = FakeStreamVolumeController(dbTable = duckDbTable(), initialVolume = 4)
+        volume.callLog = callLog
+        val vm = SessionViewModel(
+            engine, FakeNudgeStore(), testDispatcher,
+            spotify = spotify, volumeController = volume,
+        )
+
+        engine.emit(SyncCore.Event.ActiveDuck(duckMs = 150))
+
+        // No virtual-time hang (ticket AC), same as the ActiveProbe tests
+        // above — a bounded 150 ms virtual delay completes instantly.
+        advanceUntilIdle()
+
+        // -6 dB exactly isn't reachable in duckDbTable(): the deepest index
+        // whose dB is <= -6 is index 1 at -7.5 dB, so the actually-achieved
+        // depth is 7.5 dB (75 deci-dB), never a hardcoded 60.
+        assertEquals(listOf("setVolume(1)", "setVolume(4)", "notifyDuckExecuted"), callLog)
+        assertEquals(1, engine.notifyDuckExecutedCount)
+        assertEquals(listOf(75), engine.duckAchievedDeciDbLog)
+        assertEquals(150L, testDispatcher.scheduler.currentTime)
+    }
+
+    @Test
+    fun activeDuckDoesNothingWhenAlreadyPaused() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        val callLog = mutableListOf<String>()
+        engine.duckCallLog = callLog
+        spotify.lastKnownPlayerState = livePlayerState(isPaused = true)
+        val volume = FakeStreamVolumeController(dbTable = duckDbTable(), initialVolume = 4)
+        volume.callLog = callLog
+        val vm = SessionViewModel(
+            engine, FakeNudgeStore(), testDispatcher,
+            spotify = spotify, volumeController = volume,
+        )
+
+        engine.emit(SyncCore.Event.ActiveDuck(duckMs = 150))
+        advanceUntilIdle()
+
+        assertEquals(emptyList<String>(), callLog)
+        assertEquals(0, engine.notifyDuckExecutedCount)
+    }
+
+    @Test
+    fun activeDuckDoesNothingDuringCalibration() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        val callLog = mutableListOf<String>()
+        engine.duckCallLog = callLog
+        spotify.lastKnownPlayerState = livePlayerState()
+        val volume = FakeStreamVolumeController(dbTable = duckDbTable(), initialVolume = 4)
+        volume.callLog = callLog
+        val vm = SessionViewModel(
+            engine, FakeNudgeStore(), testDispatcher,
+            spotify = spotify, volumeController = volume,
+        )
+
+        vm.startCalibration()
+        assertEquals(CalibrationState.Running, vm.syncState.value.calibration)
+
+        engine.emit(SyncCore.Event.ActiveDuck(duckMs = 150))
+        advanceUntilIdle()
+
+        assertEquals(emptyList<String>(), callLog)
+        assertEquals(0, engine.notifyDuckExecutedCount)
+    }
+
+    @Test
+    fun activeDuckDoesNothingWhenMuted() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        val callLog = mutableListOf<String>()
+        engine.duckCallLog = callLog
+        spotify.lastKnownPlayerState = livePlayerState()
+        // Original volume is already 0 (muted) — you cannot duck silence,
+        // and per DSP-03a's echo contract a shell that cannot execute the
+        // duck must stay silent, no echo.
+        val volume = FakeStreamVolumeController(dbTable = duckDbTable(), initialVolume = 0)
+        volume.callLog = callLog
+        val vm = SessionViewModel(
+            engine, FakeNudgeStore(), testDispatcher,
+            spotify = spotify, volumeController = volume,
+        )
+
+        engine.emit(SyncCore.Event.ActiveDuck(duckMs = 150))
+        advanceUntilIdle()
+
+        assertEquals(emptyList<String>(), callLog)
+        assertEquals(0, engine.notifyDuckExecutedCount)
+    }
+
+    @Test
+    fun activeDuckDoesNothingWhenNoVolumeController() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        spotify.lastKnownPlayerState = livePlayerState()
+        // volumeController defaults to null — mirrors every other
+        // nullable-dependency default in this ViewModel.
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, spotify = spotify)
+
+        engine.emit(SyncCore.Event.ActiveDuck(duckMs = 150))
+        advanceUntilIdle() // must not crash
+
+        assertEquals(0, engine.notifyDuckExecutedCount)
+    }
+
+    @Test
+    fun activeDuckRestoresVolumeOnCancellationWithoutEchoing() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        val callLog = mutableListOf<String>()
+        engine.duckCallLog = callLog
+        spotify.lastKnownPlayerState = livePlayerState()
+        val volume = FakeStreamVolumeController(dbTable = duckDbTable(), initialVolume = 4)
+        volume.callLog = callLog
+        // A dedicated scope (not runTest's implicit one) so the test can
+        // cancel it mid-episode, simulating session teardown — the one
+        // cancellation-safety path onActiveDuck's doc comment calls out as
+        // structurally different from onActiveProbe.
+        val vmScope = CoroutineScope(SupervisorJob() + testDispatcher)
+        val vm = SessionViewModel(
+            engine, FakeNudgeStore(), testDispatcher,
+            spotify = spotify, volumeController = volume, scope = vmScope,
+        )
+
+        engine.emit(SyncCore.Event.ActiveDuck(duckMs = 150))
+        testDispatcher.scheduler.runCurrent()
+        testDispatcher.scheduler.advanceTimeBy(50L) // partway through the 150 ms duck
+        testDispatcher.scheduler.runCurrent()
+        vmScope.cancel()
+        testDispatcher.scheduler.runCurrent()
+
+        // Restored to original despite the scope dying mid-delay — the
+        // user's volume must never stay ducked.
+        assertEquals(4, volume.volume)
+        assertEquals(listOf("setVolume(1)", "setVolume(4)"), callLog)
+        assertEquals(0, engine.notifyDuckExecutedCount)
+    }
+
+    @Test
+    fun activeDuckFallsBackToDeepestIndexWhenMinus6IsUnreachable() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        val callLog = mutableListOf<String>()
+        engine.duckCallLog = callLog
+        spotify.lastKnownPlayerState = livePlayerState()
+        // A shallow volume range: no index reaches -6 dB below the
+        // original (0 dB). firstOrNull finds nothing, so the fallback is
+        // index 0 — the deepest duck this device can produce.
+        val volume = FakeStreamVolumeController(
+            dbTable = mapOf(0 to -4.0f, 1 to -2.0f, 2 to 0.0f),
+            initialVolume = 2,
+        )
+        volume.callLog = callLog
+        val vm = SessionViewModel(
+            engine, FakeNudgeStore(), testDispatcher,
+            spotify = spotify, volumeController = volume,
+        )
+
+        engine.emit(SyncCore.Event.ActiveDuck(duckMs = 150))
+        advanceUntilIdle()
+
+        assertEquals(listOf("setVolume(0)", "setVolume(2)", "notifyDuckExecuted"), callLog)
+        assertEquals(listOf(40), engine.duckAchievedDeciDbLog)
+    }
+
     private fun livePlayerState(isPaused: Boolean = false) = SpotifyController.RemotePlayerState(
         trackUri = "spotify:track:abc",
         positionMs = 1_000L,
@@ -1483,6 +1671,22 @@ private class FakeSyncEngine : SyncEngine {
     override fun notifyProbeExecuted(): Boolean {
         notifyProbeExecutedCount += 1
         probeCallLog?.add("notifyProbeExecuted")
+        return true
+    }
+
+    // DSP-03b: shared call log, set by tests exercising Event.ActiveDuck so
+    // setVolume/delay/restore/notifyDuckExecuted order can be asserted
+    // across this fake and FakeStreamVolumeController together — same
+    // pattern as probeCallLog above.
+    var duckCallLog: MutableList<String>? = null
+    var notifyDuckExecutedCount = 0
+        private set
+    val duckAchievedDeciDbLog = mutableListOf<Int>()
+
+    override fun notifyDuckExecuted(achievedDeciDb: Int): Boolean {
+        notifyDuckExecutedCount += 1
+        duckAchievedDeciDbLog += achievedDeciDb
+        duckCallLog?.add("notifyDuckExecuted")
         return true
     }
 
@@ -1693,4 +1897,30 @@ private class FakeSpotifyController : SpotifyController {
     }
 
     override fun seekTo(positionMs: Long): Boolean = true
+}
+
+/**
+ * DSP-03b: scripted [StreamVolumeController] double — a fixed index->dB
+ * table (no android.media.AudioManager involved) plus an optional shared
+ * call log so setVolume ordering can be asserted alongside
+ * FakeSyncEngine.duckCallLog, same pattern as probeCallLog above.
+ */
+private class FakeStreamVolumeController(
+    private val dbTable: Map<Int, Float>,
+    initialVolume: Int,
+) : StreamVolumeController {
+    var volume: Int = initialVolume
+        private set
+
+    var callLog: MutableList<String>? = null
+
+    override fun getStreamVolume(): Int = volume
+
+    override fun setStreamVolume(index: Int) {
+        volume = index
+        callLog?.add("setVolume($index)")
+    }
+
+    override fun getStreamVolumeDb(index: Int): Float =
+        dbTable[index] ?: error("FakeStreamVolumeController: no dB entry for index $index")
 }

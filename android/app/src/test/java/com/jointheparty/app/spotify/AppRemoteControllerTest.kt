@@ -115,6 +115,10 @@ private class FakeSyncEngine : SyncEngine {
     // CTL-01b: inert stand-in, unused by anything under test in this file.
     override fun notifyProbeExecuted(): Boolean = true
 
+    // DSP-03b: inert stand-in, unused by anything under test in this file —
+    // mirrors notifyProbeExecuted above.
+    override fun notifyDuckExecuted(achievedDeciDb: Int): Boolean = true
+
     override fun submitPlayerState(positionMs: Long, isPaused: Boolean, receivedMonoNs: Long): Boolean {
         submitPlayerStateCalls += Triple(positionMs, isPaused, receivedMonoNs)
         return true

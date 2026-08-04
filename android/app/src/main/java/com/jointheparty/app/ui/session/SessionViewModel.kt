@@ -5,6 +5,7 @@ import com.jointheparty.app.backend.TrackResolution
 import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.core.SyncEngine
 import com.jointheparty.app.audio.ChirpPlayer
+import com.jointheparty.app.audio.StreamVolumeController
 import com.jointheparty.app.audio.TonePlayer
 import com.jointheparty.app.data.CalibrationProfile
 import com.jointheparty.app.data.NudgeStore
@@ -23,6 +24,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,6 +33,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * UI-02: shared low-frequency session model (technical-requirements.md
@@ -132,6 +135,13 @@ private const val REFEREE_AGREEMENT_COUNT = 3
  * which the estimator itself no longer distinguishes error.
  */
 private const val REFEREE_AGREEMENT_TOLERANCE_MS = 25
+
+/**
+ * DSP-03b (technical-requirements.md §2.12): nominal duck depth. Target
+ * index selection looks for the largest volume index whose dB is at most
+ * this far below the original — see [SessionViewModel.onActiveDuck].
+ */
+private const val DUCK_TARGET_DB = 6f
 
 /** Seed confidence for a fresh chirp-measured profile (CAL-04): a GCC-PHAT
  * round-trip is a direct correlator measurement, the strongest evidence
@@ -383,6 +393,13 @@ class SessionViewModel(
     private val tonePlayer: TonePlayer? = null,
     // INT-02: the playback half of the loop. Null in unit tests.
     private val spotify: SpotifyController? = null,
+    // DSP-03b (technical-requirements.md §2.12): the volume-duck actuator's
+    // AudioManager seam. Null in unit tests (StreamVolumeController isn't
+    // JVM-testable against a real AudioManager) and on pre-API-28 devices
+    // (see AudioManagerStreamVolumeController's doc comment) — same
+    // defaults-to-null convention as [spotify]/[chirp]/[tonePlayer]; onActiveDuck
+    // no-ops whenever this is null.
+    private val volumeController: StreamVolumeController? = null,
     // INT-06a (technical-requirements.md §2.5): the session's lifetime
     // anchor, owned by SessionGraph — replaces the former `viewModelScope`.
     // Defaults from `dispatcher` (not a bare Dispatchers.Default) so the JVM
@@ -1615,6 +1632,79 @@ class SessionViewModel(
         }
     }
 
+    // ---- Active duck (DSP-03b, technical-requirements.md §2.12) -----------
+
+    /**
+     * Executes [SyncCore.Event.ActiveDuck]: duck `STREAM_MUSIC` by ~6 dB for
+     * [SyncCore.Event.ActiveDuck.duckMs], restore it, then
+     * [SyncEngine.notifyDuckExecuted] with the depth ACTUALLY achieved
+     * (deci-dB) — never a hardcoded 60, since volume-index quantization
+     * means -6.0 dB exactly is rarely reachable (§2.12's own caveat).
+     *
+     * Gates mirror [onActiveProbe] exactly — playback must already be live
+     * ([SpotifyController.lastKnownPlayerState]`.isPaused == false`), no
+     * calibration may be running ([CalibrationState.Running]/
+     * [CalibrationState.ByEarRunning]) — plus two duck-specific ones:
+     *  - [volumeController] must be non-null (unavailable on pre-API-28
+     *    devices; see [AudioManagerStreamVolumeController]'s doc comment —
+     *    `SessionGraph` never constructs one there, so this is the only
+     *    gate that needs to fire for that case);
+     *  - the current volume must not already be 0 — you cannot duck
+     *    silence, and per DSP-03a's echo contract (docs/dsp03a-review.md) a
+     *    shell that cannot execute the duck must stay silent: no echo, the
+     *    core's own 20 s duck-request expiry and 60 s cooldown handle it.
+     *
+     * Target selection per §2.12: the largest index whose dB is
+     * <= original dB − [DUCK_TARGET_DB]. [firstOrNull] on
+     * `(original downTo 0)` because a small volume range may not reach a
+     * full 6 dB dip at ANY index — falling back to index 0 (the deepest
+     * duck this device can produce) rather than no duck at all.
+     *
+     * Cancellation safety — the one place this handler differs
+     * structurally from [onActiveProbe]: if the session [scope] dies
+     * mid-`delay` (e.g. teardown), the user's volume must not stay ducked.
+     * The `try`/`finally` below restores the original volume on EVERY
+     * path — normal completion or cancellation — exactly once, wrapped in
+     * `withContext(NonCancellable)` because a plain suspend call inside a
+     * `finally` of an already-cancelled coroutine would itself be
+     * cancelled immediately otherwise. The echo is deliberately NOT sent
+     * on the cancelled path: after `finally` runs, the original
+     * `CancellationException` continues propagating and the statement
+     * below the `try` block never executes — the episode never completed,
+     * so DSP-03a's `on_duck_result` must never see a verdict for it; the
+     * core's own duck-request expiry already covers a duck that never
+     * echoes.
+     */
+    private fun onActiveDuck(event: SyncCore.Event.ActiveDuck) {
+        val playbackLive = spotify?.lastKnownPlayerState?.isPaused == false
+        val calibrating = _syncState.value.calibration == CalibrationState.Running ||
+            _syncState.value.calibration == CalibrationState.ByEarRunning
+        val controller = volumeController
+        if (!playbackLive || calibrating || controller == null) return
+
+        val original = controller.getStreamVolume()
+        if (original == 0) return // can't duck silence; stay silent per §2.12
+
+        val originalDb = controller.getStreamVolumeDb(original)
+        val targetIdx = (original downTo 0).firstOrNull { idx ->
+            controller.getStreamVolumeDb(idx) <= originalDb - DUCK_TARGET_DB
+        } ?: 0
+        val achievedDb = originalDb - controller.getStreamVolumeDb(targetIdx)
+        val achievedDeciDb = (achievedDb * 10).roundToInt()
+
+        scope.launch(dispatcher) {
+            controller.setStreamVolume(targetIdx)
+            try {
+                delay(event.duckMs.toLong())
+            } finally {
+                withContext(NonCancellable) {
+                    controller.setStreamVolume(original)
+                }
+            }
+            engine.notifyDuckExecuted(achievedDeciDb)
+        }
+    }
+
     // ---- Engine-driven transitions -----------------------------------------
 
     private fun onEngineEvent(event: SyncCore.Event) {
@@ -1633,6 +1723,7 @@ class SessionViewModel(
             is SyncCore.Event.CalibrationResult -> onCalibrationResult(event)
             is SyncCore.Event.LatencyResidual -> onLatencyResidual(event)
             is SyncCore.Event.ActiveProbe -> onActiveProbe(event)
+            is SyncCore.Event.ActiveDuck -> onActiveDuck(event)
             // INT-02: execute the engine's micro-seek; the controller echoes
             // notifySeekIssued (settle window + latency learning).
             is SyncCore.Event.Correction -> {

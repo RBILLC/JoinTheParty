@@ -1,6 +1,8 @@
 package com.jointheparty.app.session
 
 import android.content.Context
+import android.os.Build
+import com.jointheparty.app.audio.AudioManagerStreamVolumeController
 import com.jointheparty.app.audio.AudioRouteObserver
 import com.jointheparty.app.audio.AudioTrackChirpPlayer
 import com.jointheparty.app.audio.AudioTrackTonePlayer
@@ -80,6 +82,17 @@ class SessionGraph(context: Context) {
         engine = engine,
     )
 
+    // DSP-03b (technical-requirements.md §2.12): AudioManager.
+    // getStreamVolumeDb is API 28+ (Android P); minSdk is 24. Below P this
+    // stays null — SessionViewModel's existing "no controller" duck gate
+    // covers those devices for free (no-op, no echo), same pattern as
+    // every other nullable dependency here.
+    private val volumeController = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        AudioManagerStreamVolumeController(context.applicationContext)
+    } else {
+        null
+    }
+
     val viewModel: SessionViewModel = SessionViewModel(
         engine = engine,
         nudgeStore = nudgeStore,
@@ -88,6 +101,7 @@ class SessionGraph(context: Context) {
         chirp = chirp,
         tonePlayer = tonePlayer,
         spotify = spotify,
+        volumeController = volumeController,
         scope = scope,
     )
 

@@ -59,6 +59,7 @@ JNIEnv* attached_env() {
 // CALIBRATION_RESULT: i0=measured_latency_ms i1=valid
 // LATENCY_RESIDUAL:   i0=residual_ms d0=peak_ratio i1=valid
 // ACTIVE_PROBE:       i0=pause_ms (CTL-01b)
+// ACTIVE_DUCK:        i0=duck_ms (DSP-03b)
 // REQUEST_FIX / TRACK_LOST: no payload
 void event_trampoline(sc_event_type_t type, const void* payload, void* user) {
     auto* h = static_cast<BridgeHandle*>(user);
@@ -99,6 +100,12 @@ void event_trampoline(sc_event_type_t type, const void* payload, void* user) {
         }
         case SC_EVT_ACTIVE_PROBE:
             i0 = static_cast<const sc_evt_active_probe_t*>(payload)->pause_ms;
+            break;
+        // DSP-03b: mirrors the SC_EVT_ACTIVE_PROBE case above exactly — same
+        // int payload slot, same packing shape (technical-requirements.md
+        // §2.12).
+        case SC_EVT_ACTIVE_DUCK:
+            i0 = static_cast<const sc_evt_active_duck_t*>(payload)->duck_ms;
             break;
         case SC_EVT_REQUEST_FIX:
         case SC_EVT_TRACK_LOST:
@@ -279,6 +286,21 @@ Java_com_jointheparty_app_core_SyncCore_nativeNotifyProbeExecuted(
     JNIEnv*, jobject, jlong handle) {
     auto* h = handle_of(handle);
     return h ? sc_notify_probe_executed(h->session) : SC_ERR_INVALID_ARG;
+}
+
+// DSP-03b: the shell's echo after actually executing an SC_EVT_ACTIVE_DUCK
+// (duck STREAM_MUSIC -> delay(duck_ms) -> restore), mirroring
+// nativeNotifyProbeExecuted's echo shape (technical-requirements.md §2.12).
+// achieved_deci_db is the depth ACTUALLY commanded, never a hardcoded
+// nominal 60 — volume-index quantization means -6.0 dB exactly is rarely
+// reachable, so the worker's dip detector must judge against what really
+// happened.
+JNIEXPORT jint JNICALL
+Java_com_jointheparty_app_core_SyncCore_nativeNotifyDuckExecuted(
+    JNIEnv*, jobject, jlong handle, jint achieved_deci_db) {
+    auto* h = handle_of(handle);
+    return h ? sc_notify_duck_executed(h->session, achieved_deci_db)
+             : SC_ERR_INVALID_ARG;
 }
 
 JNIEXPORT jint JNICALL

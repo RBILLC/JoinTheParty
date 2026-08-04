@@ -76,6 +76,17 @@ class SyncCore(
          * resume, then call [notifyProbeExecuted].
          */
         data class ActiveProbe(val pauseMs: Int) : Event
+
+        /**
+         * DSP-03b (technical-requirements.md §2.12): the SAME referee
+         * sentinel / Wittenmark turn-off triggers as [ActiveProbe], but
+         * requesting the gentler volume-duck tier first. The shell must
+         * duck `STREAM_MUSIC` by ~6 dB for [duckMs], restore it, then call
+         * [notifyDuckExecuted] with the depth ACTUALLY achieved — never a
+         * hardcoded nominal value, since volume-index quantization means
+         * -6.0 dB exactly is rarely reachable.
+         */
+        data class ActiveDuck(val duckMs: Int) : Event
     }
 
     private val eventFlow = MutableSharedFlow<Event>(
@@ -171,6 +182,16 @@ class SyncCore(
      */
     override fun notifyProbeExecuted(): Boolean = nativeNotifyProbeExecuted(handle) == 0
 
+    /**
+     * DSP-03b: echoes an executed [Event.ActiveDuck] (duck -> delay ->
+     * restore already performed by the caller), mirroring
+     * [notifyProbeExecuted]'s echo pattern over the new
+     * `sc_notify_duck_executed` ABI call. [achievedDeciDb] is the depth
+     * ACTUALLY commanded, in tenths of a dB.
+     */
+    override fun notifyDuckExecuted(achievedDeciDb: Int): Boolean =
+        nativeNotifyDuckExecuted(handle, achievedDeciDb) == 0
+
     fun pushReference(samples: FloatArray, frames: Int, trackPositionMs: Long): Boolean =
         nativePushReference(handle, samples, frames, trackPositionMs) == 0
 
@@ -220,6 +241,11 @@ class SyncCore(
             5 -> Event.CalibrationResult(i0, i1 != 0)
             6 -> Event.LatencyResidual(i0, d0.toFloat(), i1 != 0)
             7 -> Event.ActiveProbe(i0)
+            // 8 = SC_EVT_ACTIVE_DUCK, the ordinal directly after
+            // SC_EVT_ACTIVE_PROBE (=7 above) in sc_event_type_t — appended
+            // at the end of the C enum per DSP-03a's ABI-stability rule
+            // (technical-requirements.md §2.12).
+            8 -> Event.ActiveDuck(i0)
             else -> return
         }
         eventFlow.tryEmit(event)
@@ -253,6 +279,7 @@ class SyncCore(
     private external fun nativeNotifySeekIssued(handle: Long, targetMs: Long, issuedMonoNs: Long): Int
     private external fun nativeNotifyLocalPlayback(handle: Long, commandedPositionMs: Long): Int
     private external fun nativeNotifyProbeExecuted(handle: Long): Int
+    private external fun nativeNotifyDuckExecuted(handle: Long, achievedDeciDb: Int): Int
     private external fun nativePushReference(
         handle: Long, samples: FloatArray, frames: Int, trackPositionMs: Long,
     ): Int

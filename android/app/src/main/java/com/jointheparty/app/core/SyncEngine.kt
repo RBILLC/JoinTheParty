@@ -98,6 +98,17 @@ interface SyncEngine {
      */
     fun notifyProbeExecuted(): Boolean
 
+    /**
+     * DSP-03b (technical-requirements.md §2.12): echoes an executed
+     * [SyncCore.Event.ActiveDuck] — the shell must call this only after
+     * actually ducking `STREAM_MUSIC`, waiting `duckMs`, and restoring the
+     * original volume; mirrors [notifyProbeExecuted]'s echo shape over the
+     * new `sc_notify_duck_executed` ABI call. [achievedDeciDb] is the depth
+     * ACTUALLY commanded (tenths of a dB) — never the nominal 60, since
+     * volume-index quantization means -6.0 dB exactly is rarely reachable.
+     */
+    fun notifyDuckExecuted(achievedDeciDb: Int): Boolean
+
     fun submitPlayerState(positionMs: Long, isPaused: Boolean, receivedMonoNs: Long): Boolean
 
     fun submitRecognitionFix(
