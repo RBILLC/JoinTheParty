@@ -1563,6 +1563,254 @@ void test_stray_duck_result_ignored() {
     CHECK(!pol.probe_request_due(10 * kSec));
 }
 
+// ---- CTL-04: convergence settling hysteresis ----------------------------
+// tech-req §2.15. FT9's Test 2 (Billie Jean) recorded a 150 ms CTL-02
+// gate-firing followed, seconds later, by three SMALLER-than-large
+// instantaneous corrections (633/542/547 ms) landing while the audible
+// impression was already close. Once a correction lands at floor and the
+// existing settle/verify window confirms it, further proposals below the
+// large/lost bypass — instantaneous or persistence-gate — must clear a
+// stronger N-of-M bar before firing.
+
+// AC1: a correction landing at <= settle_enter_threshold_ms (150) and
+// clearing the standard settle/verify window enters settled — proven via
+// the very next behavioral contrast: an out-of-deadband proposal that would
+// have fired instantly pre-settled (as the FIRST 200 ms correction below
+// did) is instead held.
+void test_settled_entry_on_floor_landing_and_verify() {
+    synccore::CorrectionPolicy pol;
+    uint64_t t = 10 * kSec;
+    CHECK(pol.on_estimate(make_est(200.0, 0.0, true), 100000.0, t).kind ==
+          synccore::ActionKind::kSeek);
+    pol.on_seek_issued(t);
+
+    // Post-settle verify fix lands at floor (80 <= 150): enters settled.
+    t += 4 * kSec;
+    CHECK(!pol.is_settling(t));
+    CHECK(pol.on_estimate(make_est(80.0, 0.0, true), 100000.0, t).kind ==
+          synccore::ActionKind::kNone);
+
+    // Proof of entry: a fresh, single, out-of-deadband proposal — which
+    // pre-settled fires off one estimate (see the 200 ms correction above)
+    // — is instead held.
+    t += 5 * kSec;
+    const auto held =
+        pol.on_estimate(make_est(200.0, 0.0, true), 100000.0, t);
+    CHECK(held.kind == synccore::ActionKind::kNone);
+}
+
+// AC2: while settled, a fresh instantaneous-path proposal below
+// large_correction_threshold_ms is held, not fired, until
+// settled_confirm_min_fixes (5) agree within settled_confirm_agree_ms (40)
+// — fires on the 5th agreeing sample, from the cluster mean, mirroring
+// §2.7's own "cluster mean, not the instantaneous value."
+void test_settled_raises_bar_for_instantaneous_path_until_corroborated() {
+    synccore::CorrectionPolicy pol;
+    uint64_t t = 10 * kSec;
+    CHECK(pol.on_estimate(make_est(200.0, 0.0, true), 100000.0, t).kind ==
+          synccore::ActionKind::kSeek);
+    pol.on_seek_issued(t);
+
+    t += 4 * kSec;
+    CHECK(pol.on_estimate(make_est(120.0, 0.0, true), 100000.0, t).kind ==
+          synccore::ActionKind::kNone);  // enters settled; itself held (1/5)
+    t += 5 * kSec;
+    CHECK(pol.on_estimate(make_est(130.0, 0.0, true), 100000.0, t).kind ==
+          synccore::ActionKind::kNone);  // 2/5
+    t += 5 * kSec;
+    CHECK(pol.on_estimate(make_est(125.0, 0.0, true), 100000.0, t).kind ==
+          synccore::ActionKind::kNone);  // 3/5
+    t += 5 * kSec;
+    CHECK(pol.on_estimate(make_est(135.0, 0.0, true), 100000.0, t).kind ==
+          synccore::ActionKind::kNone);  // 4/5
+    t += 5 * kSec;
+    const auto fired =
+        pol.on_estimate(make_est(128.0, 0.0, true), 100000.0, t);  // 5/5
+    CHECK(fired.kind == synccore::ActionKind::kSeek);
+    // Cluster mean of [120,130,125,135,128] = 127.6; local + the policy's
+    // OWN (by now latency-adapted, per the 120 ms verify fix above —
+    // test_command_latency_adaptation exercises that mechanism directly) −
+    // mean, no drift term.
+    CHECK(fired.seek_to_ms ==
+          static_cast<int64_t>(
+              std::llround(100000.0 + pol.command_latency_ms() - 127.6)));
+}
+
+// AC3: a fresh estimate >= large_correction_threshold_ms (or
+// lost_threshold_ms) exits settled immediately and unconditionally,
+// regardless of any pending settled-bar hold — routing instead to §2.8's
+// OWN, unaffected 2-sample corroboration (not the stronger 5), and leaving
+// the policy genuinely un-settled afterward (proven by a subsequent single
+// small proposal firing off one estimate again).
+void test_settled_large_or_lost_error_bypasses_immediately() {
+    synccore::CorrectionPolicy pol;
+    uint64_t t = 10 * kSec;
+    CHECK(pol.on_estimate(make_est(200.0, 0.0, true), 100000.0, t).kind ==
+          synccore::ActionKind::kSeek);
+    pol.on_seek_issued(t);
+
+    t += 4 * kSec;
+    // Enters settled; itself held (1/5).
+    CHECK(pol.on_estimate(make_est(50.0, 0.0, true), 100000.0, t).kind ==
+          synccore::ActionKind::kNone);
+
+    // A large error bypasses settled immediately and routes to §2.8's own
+    // hold — first sample held, per that mechanism's own rule.
+    t += 5 * kSec;
+    CHECK(pol.on_estimate(make_est(1200.0, 0.0, true), 100000.0, t).kind ==
+          synccore::ActionKind::kNone);
+    // A SECOND agreeing large sample fires via §2.8's own pair-corroboration
+    // (large_corroborate_agree_ms=150) — NOT settled_confirm_min_fixes (5).
+    // If settled_ still gated this branch, two samples could never suffice.
+    t += 5 * kSec;
+    const auto largeFire =
+        pol.on_estimate(make_est(1210.0, 0.0, true), 100000.0, t);
+    CHECK(largeFire.kind == synccore::ActionKind::kSeek);
+    pol.on_seek_issued(t);
+
+    // Past settle: a single fresh, small, out-of-deadband (non-large)
+    // proposal must fire IMMEDIATELY off one estimate — proving settled_
+    // was genuinely cleared by the bypass (pre-bypass, the 50 ms sample
+    // above needed 5 agreeing samples; this one must not).
+    t += 4 * kSec;
+    CHECK(!pol.is_settling(t));
+    const auto after = pol.on_estimate(make_est(300.0, 0.0, true), 100000.0, t);
+    CHECK(after.kind == synccore::ActionKind::kSeek);
+}
+
+// AC4: settled clears on any emitted seek (instantaneous, persistence-gate,
+// or settled-gate) and on reset().
+void test_settled_clears_on_emitted_seek_and_on_reset() {
+    // Part A: the settled-gate's OWN fire clears settled_.
+    {
+        synccore::CorrectionPolicy pol;
+        uint64_t t = 10 * kSec;
+        CHECK(pol.on_estimate(make_est(200.0, 0.0, true), 100000.0, t).kind ==
+              synccore::ActionKind::kSeek);
+        pol.on_seek_issued(t);
+
+        t += 4 * kSec;
+        CHECK(pol.on_estimate(make_est(120.0, 0.0, true), 100000.0, t).kind ==
+              synccore::ActionKind::kNone);
+        t += 5 * kSec;
+        CHECK(pol.on_estimate(make_est(130.0, 0.0, true), 100000.0, t).kind ==
+              synccore::ActionKind::kNone);
+        t += 5 * kSec;
+        CHECK(pol.on_estimate(make_est(125.0, 0.0, true), 100000.0, t).kind ==
+              synccore::ActionKind::kNone);
+        t += 5 * kSec;
+        CHECK(pol.on_estimate(make_est(135.0, 0.0, true), 100000.0, t).kind ==
+              synccore::ActionKind::kNone);
+        t += 5 * kSec;
+        const auto fired =
+            pol.on_estimate(make_est(128.0, 0.0, true), 100000.0, t);
+        CHECK(fired.kind == synccore::ActionKind::kSeek);  // settled-gate fires
+        pol.on_seek_issued(t);
+
+        t += 4 * kSec;
+        CHECK(!pol.is_settling(t));
+        const auto after =
+            pol.on_estimate(make_est(300.0, 0.0, true), 100000.0, t);
+        CHECK(after.kind == synccore::ActionKind::kSeek);  // settled_ cleared
+    }
+    // Part B: reset() clears settled_.
+    {
+        synccore::CorrectionPolicy pol;
+        uint64_t t = 10 * kSec;
+        CHECK(pol.on_estimate(make_est(200.0, 0.0, true), 100000.0, t).kind ==
+              synccore::ActionKind::kSeek);
+        pol.on_seek_issued(t);
+
+        t += 4 * kSec;
+        CHECK(pol.on_estimate(make_est(120.0, 0.0, true), 100000.0, t).kind ==
+              synccore::ActionKind::kNone);  // settled, held
+
+        pol.reset();
+
+        t += 5 * kSec;
+        const auto after =
+            pol.on_estimate(make_est(300.0, 0.0, true), 100000.0, t);
+        CHECK(after.kind == synccore::ActionKind::kSeek);  // reset() cleared it
+    }
+}
+
+// Orchestrator-added pin: the settled-hold branch (settled_ &&
+// |e| >= deadband_ms) is not the only instantaneous seek reachable while
+// settled — a purely PREEMPTIVE proposal (|e| itself still inside the
+// deadband, only the drift-projected |predicted| crosses it — deviation 2's
+// own carve-out) falls through to the plain-instantaneous fire branch
+// instead, and that branch must ALSO clear settled_ on any emitted seek
+// (tech-req §2.15's epoch rule says "any emitted seek," not "any emitted
+// seek except a preemptive one"). A badly-landed preemptive seek left
+// settled_ = true against the fresh residual pre-fix, keeping the raised
+// 5-fix bar in place exactly when a genuine perturbation must not be slowed.
+// Proven by the same behavioral-contrast convention as the other tests in
+// this section: after the preemptive seek fires and its own verify lands
+// ABOVE settle_enter_threshold_ms (so it does NOT itself re-enter settled),
+// a fresh out-of-deadband, sub-large proposal must fire IMMEDIATELY off one
+// estimate — held would mean settled_ survived the preemptive seek.
+void test_settled_clears_on_preemptive_instantaneous_seek() {
+    synccore::CorrectionPolicy pol;
+    uint64_t t = 10 * kSec;
+
+    // Land a correction and enter settled via the post-verify fix, exactly
+    // like the other tests in this section.
+    CHECK(pol.on_estimate(make_est(200.0, 0.0, true), 100000.0, t).kind ==
+          synccore::ActionKind::kSeek);
+    pol.on_seek_issued(t);
+
+    t += 4 * kSec;
+    CHECK(pol.on_estimate(make_est(80.0, 0.0, true), 100000.0, t).kind ==
+          synccore::ActionKind::kNone);  // enters settled; itself held (1/5)
+
+    // A purely preemptive proposal: |e|=10 stays INSIDE deadband_ms (25), so
+    // the settled-hold branch's own |e| >= deadband_ms gate never engages —
+    // only the drift-projected |predicted| (well past 25 at this drift/
+    // horizon) crosses it, reaching the plain-instantaneous fire branch
+    // while settled_ is still true.
+    t += 5 * kSec;
+    const auto preemptive =
+        pol.on_estimate(make_est(10.0, 1000.0, true), 100000.0, t);
+    CHECK(preemptive.kind == synccore::ActionKind::kSeek);
+    pol.on_seek_issued(t);
+
+    // The preemptive seek's own verify lands ABOVE settle_enter_threshold_ms
+    // (300 > 150), so it does NOT itself re-enter settled — isolating
+    // whether the PREVIOUS (preemptive) fire cleared settled_, rather than
+    // this call happening to re-enter it. Fires immediately off this one
+    // estimate only if settled_ was genuinely cleared; held would mean it
+    // survived the preemptive seek.
+    t += 4 * kSec;
+    CHECK(!pol.is_settling(t));
+    const auto after = pol.on_estimate(make_est(300.0, 0.0, true), 100000.0, t);
+    CHECK(after.kind == synccore::ActionKind::kSeek);
+}
+
+// AC5: a reconstruction of Test 1's (Vienna) trim=0 alternating segment —
+// "43-52 ms interleaved with 1257-1639 ms harmonic-multiple readings...
+// never stabilized" — must never spuriously enter settled. Because entry
+// only ever happens inside the single post-seek verify check, and this
+// churn never lets two low-mode readings land back-to-back (each low
+// reading's own fire is always immediately followed by a large,
+// bypass-triggering harmonic reading), the mechanism structurally can't
+// latch settled_ true here — proven by a final clean small proposal firing
+// off one estimate, exactly the pre-settled instantaneous rule.
+void test_settled_never_spuriously_enters_during_harmonic_ambiguous_churn() {
+    synccore::CorrectionPolicy pol;
+    const double readings[] = {
+        43.0, 1257.0, 52.0, 1639.0, 48.0, 1257.0, 45.0, 1639.0, 50.0, 1257.0,
+    };
+    uint64_t t = 10 * kSec;
+    for (double e : readings) {
+        pol.on_estimate(make_est(e, 0.0, true), 100000.0, t);
+        t += 6 * kSec;
+    }
+
+    CHECK(!pol.is_settling(t));
+    const auto after = pol.on_estimate(make_est(300.0, 0.0, true), 100000.0, t);
+    CHECK(after.kind == synccore::ActionKind::kSeek);
+}
+
 }  // namespace
 
 int main() {
@@ -1621,6 +1869,13 @@ int main() {
     test_duck_expires_when_never_echoed();
     test_duck_state_cleared_on_reset();
     test_stray_duck_result_ignored();
+
+    test_settled_entry_on_floor_landing_and_verify();
+    test_settled_raises_bar_for_instantaneous_path_until_corroborated();
+    test_settled_large_or_lost_error_bypasses_immediately();
+    test_settled_clears_on_emitted_seek_and_on_reset();
+    test_settled_clears_on_preemptive_instantaneous_seek();
+    test_settled_never_spuriously_enters_during_harmonic_ambiguous_churn();
 
     if (g_failures == 0) {
         std::printf("policy_tests: all tests passed\n");

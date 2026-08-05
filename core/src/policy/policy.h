@@ -240,6 +240,32 @@ struct PolicyConfig {
     double duck_self_dominant_db = 4.0;
     double duck_room_dominant_db = 1.5;
     double duck_min_z = 3.0;
+
+    // tech-req §2.15 (CTL-04): convergence settling hysteresis. Once a
+    // correction lands at floor and the EXISTING settle_ns/
+    // post_settle_verify_ns window confirms it (no new dwell timer), the
+    // policy enters a "settled" state that raises the bar for every FURTHER
+    // correction proposal — the instantaneous deadband-crossing path as well
+    // as §2.7's own persistence gate — to this stronger corroboration test,
+    // reusing the exact same ring/cluster machinery (ring_append/
+    // ring_all_agree/ring_mean) at stricter thresholds. large_correction_
+    // threshold_ms/lost_threshold_ms are reused VERBATIM as the unconditional
+    // bypass triggers that exit settled immediately — no new knobs needed for
+    // that half.
+
+    // Filtered |error_ms|, confirmed through the existing settle/verify
+    // window, at or below which the policy is considered "at floor" and
+    // enters settled. Deliberately wider than confirm_floor_ms (125): a
+    // correction whose entire purpose was to close error to ~150 ms (FT9's
+    // own 11:58:14.260 gate-firing) should be recognized as reaching floor
+    // without demanding confirm_floor_ms's stricter bar be cleared again
+    // immediately after.
+    double settle_enter_threshold_ms = 150.0;
+    // Stronger than confirm_min_fixes (3) — the whole point of this state is
+    // to raise the bar once settled.
+    int settled_confirm_min_fixes = 5;
+    // Stronger (tighter) than confirm_agree_ms (60 ms), for the same reason.
+    double settled_confirm_agree_ms = 40.0;
 };
 
 enum class ActionKind { kNone, kSeek, kTrackLost };
@@ -360,6 +386,15 @@ private:
     uint64_t next_request_ns_ = 0;  // 0 = not scheduled
     bool awaiting_verify_ = false;  // seek issued; next estimate calibrates
     double last_centering_ms_ = 0.0;
+
+    // tech-req §2.15 (CTL-04): true once a correction has been confirmed at
+    // floor by the post-settle verify fix (set inside the awaiting_verify_
+    // block in on_estimate). While true, on_estimate checks every further
+    // proposal — instantaneous and persistence-gate — against
+    // settled_confirm_min_fixes/settled_confirm_agree_ms instead of
+    // confirm_min_fixes/confirm_agree_ms. Cleared by the large/lost bypass,
+    // by any emitted seek, and in reset().
+    bool settled_ = false;
 
     RingSample ring_[kRingCapacity];
     std::size_t ring_count_ = 0;

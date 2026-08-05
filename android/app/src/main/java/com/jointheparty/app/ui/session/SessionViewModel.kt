@@ -100,6 +100,46 @@ private const val AIM_VERIFY_DELAY_MS = 900L
 private const val AIM_TOLERANCE_MS = 3_000L
 
 /**
+ * GRD-01 (technical-requirements.md §2.13): expected-URI self-play latch.
+ * Every `controller.play(uri)` call latches that uri for this long — a
+ * bounded set-membership test, not a blanket "ignore auto-advance for N ms"
+ * timer (see [SessionViewModel.consumeSelfPlayLatch]) — so a late
+ * player-state confirmation of a URI we ourselves just commanded is never
+ * mistaken for a genuine Spotify auto-advance, even once a newer
+ * re-resolution has already moved [SyncState.track] on. FT9's own churn
+ * measured three self-issued restarts inside 2.8 s; 5 s covers that with
+ * margin. Named per policy.h's convention, materialized as a Kotlin
+ * SCREAMING_SNAKE_CASE constant — mirrors the existing `ENGINE_DEADBAND_MS`
+ * precedent (SessionGraph.kt).
+ */
+private const val SELF_PLAY_LATCH_WINDOW_MS = 5000L
+
+/**
+ * GRD-01: bounded ring capacity for the self-play latch, oldest evicted
+ * first — sized off FT9's observed churn rate (bursts of 3 restarts in
+ * under 3 s), generous enough for a burst, still finite.
+ */
+private const val SELF_PLAY_LATCH_MAX_ENTRIES = 4
+
+/**
+ * IDC-01 (technical-requirements.md §2.14): identity corroboration gate.
+ * Mirrors §2.7's `confirm_min_fixes` (3) exactly.
+ */
+private const val IDENT_CONFIRM_MIN_FIXES = 3
+
+/**
+ * IDC-01: reuses `kRoomContinuityGateMs` (synccore.cpp's CORE-06 tolerance)
+ * rather than inventing a new figure for "advancing ~wall-clock."
+ */
+private const val IDENT_CONFIRM_OFFSET_AGREE_MS = 500L
+
+/**
+ * IDC-01: matches §2.8's `large_pending_max_age_ns` (30 s) precedent for
+ * "how long unconfirmed evidence may sit before it expires."
+ */
+private const val IDENT_CORROB_MAX_AGE_MS = 30_000L
+
+/**
  * CAL-04: cadence for [SessionViewModel.maybeSampleReferee]. The referee
  * (`sc_sample_latency_residual`) autocorrelates a 12 s post-AEC capture
  * history (technical-requirements.md §2.6) — sampling much faster than that
@@ -586,6 +626,10 @@ class SessionViewModel(
                         if (loaded.isPaused) controller.resume()
                     } else {
                         com.jointheparty.app.debug.DebugLog.log("Spotify connected → play $uri")
+                        // GRD-01 (tech-req §2.13): latch BEFORE issuing the
+                        // call — the confirming player-state event can arrive
+                        // before this coroutine's next line does.
+                        latchSelfPlay(uri)
                         controller.play(uri)
                     }
                     // FIELD TEST 2 FIX (round 1): play(uri) starts from 0:00
@@ -662,6 +706,15 @@ class SessionViewModel(
         com.jointheparty.app.debug.DebugLog.log(
             "aim gave up after $MAX_AIM_ATTEMPTS attempts — estimator will report the error",
         )
+        // IDC-01 (tech-req §2.14): signed-off behavior change. An unresolved
+        // aim used to silently let playerStateWatcher() below proceed to
+        // CONVERGING against a garbage/stale estimate (FT9's Test 3: an aim
+        // gave up, the estimator reported a 763715 ms reading two seconds
+        // later, and the recognizer went on to mis-lock). Force the SAME
+        // LOST→LISTENING→MATCHING re-bootstrap onTrackLost() already
+        // performs — which also arms this section's corroboration gate —
+        // rather than trusting an aim nobody ever confirmed landed.
+        onTrackLost()
     }
 
     private fun playerStateWatcher() {
@@ -692,7 +745,13 @@ class SessionViewModel(
             onPlaybackStarted()
         }
         val commanded = _syncState.value.track?.spotifyUri
-        if (commanded != null && state.trackUri != null &&
+        // GRD-01 (tech-req §2.13): checked BEFORE the state.trackUri !=
+        // commanded test below — a hit means this confirmation is a URI WE
+        // issued, regardless of what _syncState.track currently holds (a
+        // newer re-resolution may have already moved it on). A miss falls
+        // through to the ordinary check, unchanged.
+        val selfIssued = state.trackUri != null && consumeSelfPlayLatch(state.trackUri)
+        if (!selfIssued && commanded != null && state.trackUri != null &&
             state.trackUri != commanded && !state.isPaused
         ) {
             onSpotifyAutoAdvanced(controller, state.trackUri)
@@ -702,43 +761,176 @@ class SessionViewModel(
     }
 
     /**
+     * GRD-01 (tech-req §2.13): bounded, time-boxed set of self-issued
+     * `play(uri)` calls not yet confirmed by a player-state event. Each
+     * entry expires via its OWN scheduled job — virtual-time-friendly,
+     * matching this file's delay()-based scheduling convention, rather than
+     * a raw System.nanoTime() comparison a JVM test could never advance past
+     * without a real wall-clock sleep.
+     */
+    private val selfPlayLatch = mutableListOf<Pair<String, kotlinx.coroutines.Job>>()
+
+    private fun latchSelfPlay(uri: String) {
+        if (selfPlayLatch.size >= SELF_PLAY_LATCH_MAX_ENTRIES) {
+            selfPlayLatch.removeAt(0).second.cancel()  // oldest evicted first
+        }
+        lateinit var job: kotlinx.coroutines.Job
+        job = scope.launch(dispatcher) {
+            delay(SELF_PLAY_LATCH_WINDOW_MS)
+            selfPlayLatch.removeAll { it.second === job }
+        }
+        selfPlayLatch += uri to job
+    }
+
+    /**
+     * Set-membership test, not a blanket "ignore auto-advance for N ms"
+     * timer (tech-req §2.13's own load-bearing distinction) — the latch
+     * only ever contains URIs we issued, so a real auto-advance to any URI
+     * we did not just command is never in the set and still trips the
+     * guardian exactly as today. A hit consumes the matching entry.
+     */
+    private fun consumeSelfPlayLatch(uri: String): Boolean {
+        val idx = selfPlayLatch.indexOfFirst { it.first == uri }
+        if (idx < 0) return false
+        selfPlayLatch.removeAt(idx).second.cancel()
+        return true
+    }
+
+    /**
      * Prefers the provider-supplied Spotify URI (ACRCloud external_metadata
      * — real, playable) over the backend ISRC resolver (which is MOCKED
      * until AUTH-03's server deploys and would hand playback a fake URI).
+     *
+     * IDC-01 (tech-req §2.14): while the identity corroboration gate is
+     * armed (see [armIdentCorroboration]), a resolved identity is recorded
+     * into the streak instead of being acted on immediately — only once
+     * [IDENT_CONFIRM_MIN_FIXES] agreeing entries accumulate does the shell
+     * proceed to [resolvedWithAim], using THIS (the newest) fix's data. When
+     * NOT armed (ordinary cold-start MATCHING), behavior is unchanged: the
+     * first resolved identity resolves immediately.
      */
     private suspend fun resolveTrack(fix: RecognitionProvider.RecognitionFixResult) {
+        val track = resolveTrackInfo(fix) ?: return
+        if (identCorrobArmed && !identCorroborate(track.spotifyUri, fix)) {
+            return  // not yet corroborated; stay quietly in MATCHING
+        }
+        resolvedWithAim(track, fix)
+    }
+
+    private suspend fun resolveTrackInfo(
+        fix: RecognitionProvider.RecognitionFixResult,
+    ): TrackInfo? {
         val direct = fix.spotifyUri
         if (direct != null) {
-            resolvedWithAim(
+            return TrackInfo(
+                spotifyUri = direct,
+                isrc = fix.isrc,
+                title = fix.title ?: "Unknown",
+                artist = fix.artist ?: "",
+                durationMs = 0L,
+            )
+        }
+        val backendClient = backend ?: return null
+        val isrc = fix.isrc ?: return null
+        return when (val resolution = backendClient.resolveIsrcToSpotifyUri(isrc)) {
+            is TrackResolution.Resolved ->
                 TrackInfo(
-                    spotifyUri = direct,
-                    isrc = fix.isrc,
+                    spotifyUri = resolution.spotifyUri,
+                    isrc = isrc,
                     title = fix.title ?: "Unknown",
                     artist = fix.artist ?: "",
                     durationMs = 0L,
-                ),
-                fix,
-            )
-            return
-        }
-        val backendClient = backend ?: return
-        val isrc = fix.isrc ?: return
-        when (val resolution = backendClient.resolveIsrcToSpotifyUri(isrc)) {
-            is TrackResolution.Resolved ->
-                resolvedWithAim(
-                    TrackInfo(
-                        spotifyUri = resolution.spotifyUri,
-                        isrc = isrc,
-                        title = fix.title ?: "Unknown",
-                        artist = fix.artist ?: "",
-                        durationMs = 0L,
-                    ),
-                    fix,
                 )
             TrackResolution.NotFound,
             is TrackResolution.Failure,
-            -> Unit // stay in MATCHING; the next pass may resolve
+            -> null // stay in MATCHING; the next pass may resolve
         }
+    }
+
+    /**
+     * IDC-01 (tech-req §2.14): true once `MATCHING` is (re-)armed via
+     * [onTrackLost]'s re-bootstrap or an aim-failure (see [aimUntilLanded]).
+     * While armed, every resolved identity — including one CORE-06
+     * independently rejected as SELF_HEARING/LOW_CONFIDENCE downstream —
+     * still passes through [resolveTrack]'s existing unconditional call (it
+     * never gated on that verdict to begin with), so a rejected fix is
+     * recorded here exactly like any other.
+     */
+    private var identCorrobArmed = false
+    private var identStreakCount = 0
+    private var identStreakUri: String? = null
+    private var identStreakLastOffsetMs: Long = 0L
+    private var identStreakLastCaptureMonoNs: Long = 0L
+
+    /**
+     * Capture-mono timestamp of the current streak's OWN first entry —
+     * [IDENT_CORROB_MAX_AGE_MS] is measured from here, not from a separate
+     * coroutine timer. A scheduled `delay()`-based expiry job would be
+     * drained early by ANY subsequent `advanceUntilIdle()` call in a JVM
+     * test (`maybeSampleReferee`'s own doc comment records exactly this
+     * "free-running timer" pitfall for a `while(true) { delay() }` loop);
+     * `captureMonoNs` is already the real per-fix clock this mechanism
+     * reasons about (the offset-vs-wall-clock agreement check below reads
+     * it too), so reusing it here needs no timer at all — expiry is simply
+     * checked reactively against whatever fix arrives next.
+     */
+    private var identStreakStartCaptureMonoNs: Long = 0L
+
+    /** Arms (or re-arms) the gate: epoch rule — the ring/streak never
+     * carries across a prior arming or a resolved track. */
+    private fun armIdentCorroboration() {
+        identCorrobArmed = true
+        identStreakCount = 0
+        identStreakUri = null
+    }
+
+    private fun clearIdentCorroboration() {
+        identCorrobArmed = false
+        identStreakCount = 0
+        identStreakUri = null
+    }
+
+    /**
+     * Extends the streak (same uri as the streak's most recent entry, and
+     * its offset delta agrees with the elapsed wall-clock delta within
+     * [IDENT_CONFIRM_OFFSET_AGREE_MS]) or restarts it at just this entry —
+     * the same "restart, not accumulate" rule §2.8's pending-large-
+     * correction record already established. Returns true once
+     * [IDENT_CONFIRM_MIN_FIXES] agreeing entries are reached (corroborated:
+     * the caller proceeds using THIS — the newest — entry's data).
+     *
+     * A streak whose OWN first entry is more than [IDENT_CORROB_MAX_AGE_MS]
+     * older than this fix expires silently first — cleared, no escalation —
+     * and this fix becomes entry 1 of a fresh streak instead.
+     */
+    private fun identCorroborate(
+        uri: String,
+        fix: RecognitionProvider.RecognitionFixResult,
+    ): Boolean {
+        if (identStreakCount > 0 &&
+            fix.captureMonoNs - identStreakStartCaptureMonoNs >
+            IDENT_CORROB_MAX_AGE_MS * 1_000_000L
+        ) {
+            // tech-req §2.14: no escalation to error — the streak simply
+            // clears and the session keeps quietly sampling in MATCHING.
+            identStreakCount = 0
+            identStreakUri = null
+        }
+        val extends = identStreakUri == uri &&
+            kotlin.math.abs(
+                (fix.matchOffsetMs - identStreakLastOffsetMs) -
+                    (fix.captureMonoNs - identStreakLastCaptureMonoNs) / 1_000_000,
+            ) <= IDENT_CONFIRM_OFFSET_AGREE_MS
+        if (!extends) identStreakStartCaptureMonoNs = fix.captureMonoNs
+        identStreakCount = if (extends) identStreakCount + 1 else 1
+        identStreakUri = uri
+        identStreakLastOffsetMs = fix.matchOffsetMs
+        identStreakLastCaptureMonoNs = fix.captureMonoNs
+        if (identStreakCount >= IDENT_CONFIRM_MIN_FIXES) {
+            clearIdentCorroboration()
+            return true
+        }
+        return false
     }
 
     /** Like [onTrackResolved], but carries the fix so playback can aim. */
@@ -806,6 +998,13 @@ class SessionViewModel(
             capturedCalibrationRoute = null // CFX-01
             refereePendingRouteId = null
             refereePendingResidualsMs.clear()
+            // GRD-01 (tech-req §2.13): epoch rule — a fresh session must
+            // never carry a self-issued latch forward from before.
+            selfPlayLatch.forEach { it.second.cancel() }
+            selfPlayLatch.clear()
+            // IDC-01 (tech-req §2.14): epoch rule — the corroboration
+            // ring/streak never carries across sessions.
+            clearIdentCorroboration()
             _syncState.update {
                 SyncState(routeId = it.routeId, routeName = it.routeName, nudgeMs = it.nudgeMs)
             }
@@ -2085,6 +2284,10 @@ class SessionViewModel(
             if (recognition != null) {
                 firstEstimateSeen = false
                 samplingAttempts = 0
+                // IDC-01 (tech-req §2.14): arm the identity corroboration
+                // gate for this re-bootstrap — shared with the aim-failure
+                // path in aimUntilLanded, one set of thresholds for both.
+                armIdentCorroboration()
                 onMatchInFlight()
                 scope.launch(dispatcher) {
                     // Field Test 5: this was RECOGNITION_RETRY_MS / 2 (3 s) of

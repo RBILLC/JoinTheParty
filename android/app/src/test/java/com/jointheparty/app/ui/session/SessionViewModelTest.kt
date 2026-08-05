@@ -1315,6 +1315,398 @@ class SessionViewModelTest {
         assertEquals(listOf("spotify:track:abc"), spotify.played)
     }
 
+    // ---- GRD-01: self-play expected-URI latch (technical-requirements.md
+    // §2.13) ------------------------------------------------------------
+    //
+    // These tests never emit into FakeSpotifyController.playerStates — every
+    // existing test in this file already models a player-state confirmation
+    // via playerStateWatcher()'s own SEED step (controller.lastKnownPlayer
+    // State?.let { handlePlayerState(...) }, run once when a fresh watcher
+    // subscribes). Setting lastKnownPlayerState immediately before driving a
+    // NEW resolution reproduces "a late confirmation lands once _syncState
+    // .track has already moved on" deterministically, without the
+    // multi-collector fan-out ambiguity a live flow emission would risk.
+    //
+    // Driven with runCurrent(), not advanceUntilIdle(): the latch's own
+    // per-entry expiry job is scheduled 5s out, and advanceUntilIdle() drains
+    // ANY pending work regardless of how far in the future it's scheduled —
+    // exactly the "free-running timer" pitfall maybeSampleReferee's doc
+    // comment already records, here tripped by a one-shot job rather than a
+    // looping one. Nothing in these tests has a real delay() of its own
+    // (recognition is null throughout), so runCurrent() alone fully drains
+    // the connect()/play()/watcher/seed chain without also reaching 5s out.
+
+    @Test
+    fun selfPlayLatchSuppressesLateConfirmationAfterNewerResolutionSupersedesIt() =
+        runTest(testDispatcher) {
+            val engine = FakeSyncEngine()
+            val spotify = FakeSpotifyController()
+            val callLog = mutableListOf<String>()
+            spotify.probeCallLog = callLog // guardian's pause() lands here
+            val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, spotify = spotify)
+            val scheduler = testDispatcher.scheduler
+
+            vm.startListening()
+            vm.onMatchInFlight()
+            vm.onTrackResolved(track("spotify:track:A"))
+            scheduler.runCurrent() // play(A) latched; watcher-A spawns (seed no-op, null)
+
+            // A's own confirmation "arrives" (recorded by the SDK) just as a
+            // newer resolution supersedes it -- FT9's own timing: _syncState
+            // .track flips synchronously inside onTrackResolved, well before
+            // the newer resolution's own play()/watcher have run.
+            spotify.lastKnownPlayerState = playerState("spotify:track:A", isPaused = false)
+
+            engine.emit(SyncCore.Event.TrackLost)
+            scheduler.runCurrent()
+            vm.onMatchInFlight()
+            vm.onTrackResolved(track("spotify:track:C"))
+            scheduler.runCurrent() // play(C); C's own watcher seed delivers the late "A" confirmation
+
+            assertEquals(listOf("spotify:track:A", "spotify:track:C"), spotify.played)
+            assertEquals(
+                "must not fire the guardian for a self-issued URI",
+                emptyList<String>(), callLog,
+            )
+        }
+
+    @Test
+    fun selfPlayLatchMissStillFiresGenuineAutoAdvance() = runTest(testDispatcher) {
+        val spotify = FakeSpotifyController()
+        val callLog = mutableListOf<String>()
+        spotify.probeCallLog = callLog
+        // Seeded before the watcher spawns: a genuine external auto-advance
+        // to a URI the latch never touched.
+        spotify.lastKnownPlayerState = playerState("spotify:track:ZZZ", isPaused = false)
+        val vm = SessionViewModel(FakeSyncEngine(), FakeNudgeStore(), testDispatcher, spotify = spotify)
+
+        vm.startListening()
+        vm.onMatchInFlight()
+        vm.onTrackResolved(track("spotify:track:A"))
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(listOf("pause"), callLog)
+    }
+
+    @Test
+    fun selfPlayLatchExpiredEntryFallsThroughToOrdinaryGuardianCheck() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        val callLog = mutableListOf<String>()
+        spotify.probeCallLog = callLog
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, spotify = spotify)
+        val scheduler = testDispatcher.scheduler
+
+        vm.startListening()
+        vm.onMatchInFlight()
+        vm.onTrackResolved(track("spotify:track:A"))
+        scheduler.runCurrent() // play(A) latched at t=0
+
+        // Let the latch window (self_play_latch_window_ms = 5000) fully
+        // elapse in VIRTUAL time before the confirmation is ever observed --
+        // this is the ONE test in this section that WANTS the expiry job to
+        // run, so it deliberately advances time forward into it.
+        scheduler.advanceTimeBy(5_001L)
+        scheduler.runCurrent()
+
+        spotify.lastKnownPlayerState = playerState("spotify:track:A", isPaused = false)
+        engine.emit(SyncCore.Event.TrackLost)
+        scheduler.runCurrent()
+        vm.onMatchInFlight()
+        vm.onTrackResolved(track("spotify:track:C"))
+        scheduler.runCurrent() // seed delivers the now-EXPIRED "A" confirmation
+
+        assertEquals(listOf("pause"), callLog)
+    }
+
+    @Test
+    fun selfPlayLatchBoundedAtMaxEntriesOldestEvicted() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        val callLog = mutableListOf<String>()
+        spotify.probeCallLog = callLog
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, spotify = spotify)
+        val scheduler = testDispatcher.scheduler
+
+        // Reaching LOCKED after each resolution resets consecutiveLosses
+        // (§2.4) -- this test's repeated TrackLost cycling would otherwise
+        // trip the UNRELATED "3 consecutive losses -> error" rule, which has
+        // nothing to do with GRD-01's own latch.
+        suspend fun lockThenReset() {
+            vm.onPlaybackStarted()
+            engine.emit(estimate(converged = true))
+            scheduler.runCurrent()
+        }
+
+        val uris = listOf(
+            "spotify:track:1", "spotify:track:2", "spotify:track:3",
+            "spotify:track:4", "spotify:track:5",
+        )
+        uris.forEachIndexed { i, uri ->
+            if (i == 0) {
+                vm.startListening()
+                vm.onMatchInFlight()
+            } else {
+                engine.emit(SyncCore.Event.TrackLost)
+                scheduler.runCurrent()
+                vm.onMatchInFlight()
+            }
+            vm.onTrackResolved(track(uri))
+            scheduler.runCurrent()
+            lockThenReset()
+        }
+        assertEquals(uris, spotify.played)
+        // Ring (max 4) after latching 1..5: [2,3,4,5] -- "1" evicted.
+
+        // uri "1" (oldest, evicted) is a latch MISS: falls through, fires.
+        spotify.lastKnownPlayerState = playerState("spotify:track:1", isPaused = false)
+        engine.emit(SyncCore.Event.TrackLost)
+        scheduler.runCurrent()
+        vm.onMatchInFlight()
+        vm.onTrackResolved(track("spotify:track:6")) // ring: evicts "2" -> [3,4,5,6]
+        scheduler.runCurrent()
+        assertEquals(listOf("pause"), callLog)
+        lockThenReset()
+
+        callLog.clear()
+        // Ring is now [3,4,5,6] ("2" evicted by latching "6" above). uri "5"
+        // is still one of the last 4 latched entries (and no longer
+        // commanded), and isn't the CURRENT oldest ("3") -- so this check's
+        // own latch("7") call evicts "3", not "5": suppressed.
+        spotify.lastKnownPlayerState = playerState("spotify:track:5", isPaused = false)
+        engine.emit(SyncCore.Event.TrackLost)
+        scheduler.runCurrent()
+        vm.onMatchInFlight()
+        vm.onTrackResolved(track("spotify:track:7"))
+        scheduler.runCurrent()
+        assertEquals(emptyList<String>(), callLog)
+    }
+
+    @Test
+    fun ft9ThreeRestartReproductionProducesZeroGuardianFirings() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val spotify = FakeSpotifyController()
+        val callLog = mutableListOf<String>()
+        spotify.probeCallLog = callLog
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, spotify = spotify)
+        val scheduler = testDispatcher.scheduler
+
+        val a = "spotify:track:0fHbLv7QZDpD2tHqzxOg1e"
+        val b = "spotify:track:6vR5u5b8JeRESx5nZaIWx6"
+
+        // FT9's own trace: A -> B -> A, three restarts inside 2.8s.
+        vm.startListening()
+        vm.onMatchInFlight()
+        vm.onTrackResolved(track(a))
+        scheduler.runCurrent() // play(a)
+
+        spotify.lastKnownPlayerState = playerState(a, isPaused = false)
+        engine.emit(SyncCore.Event.TrackLost)
+        scheduler.runCurrent()
+        vm.onMatchInFlight()
+        vm.onTrackResolved(track(b))
+        scheduler.runCurrent() // play(b); b's watcher seed delivers the late "a" confirmation
+
+        spotify.lastKnownPlayerState = playerState(b, isPaused = false)
+        engine.emit(SyncCore.Event.TrackLost)
+        scheduler.runCurrent()
+        vm.onMatchInFlight()
+        vm.onTrackResolved(track(a)) // the third restart, back to A
+        scheduler.runCurrent() // play(a); this watcher's seed delivers the late "b" confirmation
+
+        assertEquals(listOf(a, b, a), spotify.played)
+        assertEquals(
+            "FT9's three-restart churn must produce zero guardian firings",
+            emptyList<String>(), callLog,
+        )
+    }
+
+    // ---- IDC-01: identity corroboration gate (technical-requirements.md
+    // §2.14) --------------------------------------------------------------
+    //
+    // Driven via engine.emit(SyncCore.Event.RequestFix) rather than the
+    // shell's own delay()-based retry timer (NAT-06's "no free-running
+    // recognition loops" is the shell's OWN cadence discipline, not a limit
+    // on this file's ability to request a pass on demand — RequestFix is
+    // the same public trigger onEngineEvent already routes to
+    // runRecognitionPass()). Every fix here reaches resolveTrack while
+    // MATCHING exactly like production; FakeQueuedRecognitionProvider
+    // scripts a distinct fix per call.
+
+    @Test
+    fun identityCorroborationResolvesOnThirdAgreeingFixNotTheFirst() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val fixX = fixResult("spotify:track:X", 10_000L, 0L)
+        val fixY1 = fixResult("spotify:track:Y", 50_000L, 1_000_000_000L)
+        // Δoffset tracks Δwall-clock within 500 ms at each step.
+        val fixY2 = fixResult("spotify:track:Y", 52_000L, 3_000_000_000L)
+        val fixY3 = fixResult("spotify:track:Y", 55_000L, 6_000_000_000L)
+        val recognition = FakeQueuedRecognitionProvider(listOf(fixX, fixY1, fixY2, fixY3))
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, recognition)
+
+        vm.startListening()
+        advanceUntilIdle() // cold-start, UNARMED: resolves fixX on the 1st fix, unchanged
+        assertEquals(SessionPhase.AIMING, vm.syncState.value.phase)
+        assertEquals("spotify:track:X", vm.syncState.value.track?.spotifyUri)
+
+        engine.emit(SyncCore.Event.TrackLost)
+        advanceUntilIdle() // arms the gate; re-bootstrap consumes fixY1 (streak 1/3)
+        assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
+
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY2 agrees (streak 2/3)
+        assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
+
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY3 agrees (streak 3/3) -> corroborated -> resolves
+        assertEquals(SessionPhase.AIMING, vm.syncState.value.phase)
+        assertEquals("spotify:track:Y", vm.syncState.value.track?.spotifyUri)
+    }
+
+    @Test
+    fun identityCorroborationDisagreeingFixMidStreakRestartsInsteadOfAccumulating() =
+        runTest(testDispatcher) {
+            val engine = FakeSyncEngine()
+            val fixX = fixResult("spotify:track:X", 10_000L, 0L)
+            val fixY1 = fixResult("spotify:track:Y", 50_000L, 1_000_000_000L)
+            val fixY2agree = fixResult("spotify:track:Y", 52_000L, 3_000_000_000L)
+            // Offset breaks from the streak's own progression (Δoffset 38000
+            // vs Δwall 2000): must restart the streak at just this entry.
+            val fixY3disagree = fixResult("spotify:track:Y", 90_000L, 5_000_000_000L)
+            val fixY4agree = fixResult("spotify:track:Y", 92_000L, 7_000_000_000L)
+            val fixY5agree = fixResult("spotify:track:Y", 94_000L, 9_000_000_000L)
+            val recognition = FakeQueuedRecognitionProvider(
+                listOf(fixX, fixY1, fixY2agree, fixY3disagree, fixY4agree, fixY5agree),
+            )
+            val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, recognition)
+
+            vm.startListening()
+            advanceUntilIdle() // resolves fixX (unarmed cold start)
+
+            engine.emit(SyncCore.Event.TrackLost)
+            advanceUntilIdle() // arm + fixY1 (streak 1)
+            engine.emit(SyncCore.Event.RequestFix)
+            advanceUntilIdle() // fixY2agree (streak 2)
+            engine.emit(SyncCore.Event.RequestFix)
+            advanceUntilIdle() // fixY3disagree: restarts the streak at 1, not 3
+            assertEquals(
+                "a disagreeing fix must restart, not accumulate toward, the streak",
+                SessionPhase.MATCHING, vm.syncState.value.phase,
+            )
+
+            engine.emit(SyncCore.Event.RequestFix)
+            advanceUntilIdle() // fixY4agree (streak 2 of the NEW episode)
+            assertEquals(
+                "one agreeing fix after the restart must not itself corroborate " +
+                    "(that would mean the old count survived)",
+                SessionPhase.MATCHING, vm.syncState.value.phase,
+            )
+
+            engine.emit(SyncCore.Event.RequestFix)
+            advanceUntilIdle() // fixY5agree (streak 3 of the NEW episode) -> corroborated
+            assertEquals(SessionPhase.AIMING, vm.syncState.value.phase)
+        }
+
+    @Test
+    fun aimFailureForcesLostListeningMatchingRebootstrapAndArmsCorroboration() =
+        runTest(testDispatcher) {
+            val engine = FakeSyncEngine()
+            // lastKnownPlayerState stays null throughout: every aim attempt
+            // reads "missed", so aimUntilLanded exhausts MAX_AIM_ATTEMPTS.
+            val spotify = FakeSpotifyController()
+            val fixX = fixResult("spotify:track:X", 10_000L, 0L)
+            val recognition = FakeQueuedRecognitionProvider(listOf(fixX))
+            val vm = SessionViewModel(
+                engine, FakeNudgeStore(), testDispatcher, recognition, spotify = spotify,
+            )
+
+            vm.startListening()
+            // Resolves fixX -> AIMING -> startPlayback -> connect -> play ->
+            // aimUntilLanded's 4 attempts (900ms each) all miss -> gives up
+            // -> (IDC-01) forces the SAME LOST->LISTENING->MATCHING
+            // re-bootstrap onTrackLost() performs, where today it silently
+            // continued to CONVERGING.
+            advanceUntilIdle()
+
+            assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
+        }
+
+    @Test
+    fun selfHearingRejectedFixStillRecordedAndCountsTowardStreak() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val fixX = fixResult("spotify:track:X", 10_000L, 0L)
+        val fixY1 = fixResult("spotify:track:Y", 50_000L, 1_000_000_000L)
+        val fixY2 = fixResult("spotify:track:Y", 52_000L, 3_000_000_000L)
+        val fixY3 = fixResult("spotify:track:Y", 55_000L, 6_000_000_000L)
+        val recognition = FakeQueuedRecognitionProvider(listOf(fixX, fixY1, fixY2, fixY3))
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, recognition)
+
+        vm.startListening()
+        advanceUntilIdle()
+
+        engine.emit(SyncCore.Event.TrackLost)
+        advanceUntilIdle() // fixY1 (streak 1)
+        // §7.3's CORE-06 verdict on this same fix arrives asynchronously and
+        // independently -- resolveTrack never gated on it (unchanged), so
+        // the streak already counted fixY1 above regardless of this.
+        engine.emit(SyncCore.Event.FixRejected(SyncCore.RejectReason.SELF_HEARING))
+        advanceUntilIdle()
+        assertEquals(SyncCore.RejectReason.SELF_HEARING, vm.syncState.value.lastRejectReason)
+        assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
+
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY2 (streak 2)
+        engine.emit(SyncCore.Event.FixRejected(SyncCore.RejectReason.SELF_HEARING))
+        advanceUntilIdle()
+        assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
+
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY3 (streak 3) -> corroborated despite every
+        // fix in the streak having been independently rejected downstream
+        assertEquals(SessionPhase.AIMING, vm.syncState.value.phase)
+        assertEquals("spotify:track:Y", vm.syncState.value.track?.spotifyUri)
+    }
+
+    @Test
+    fun corroborationStreakExpiresWithoutEscalatingToError() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val fixX = fixResult("spotify:track:X", 10_000L, 0L)
+        val fixY1 = fixResult("spotify:track:Y", 50_000L, 1_000_000_000L) // t=1s
+        // > ident_corrob_max_age_ms (30s) after fixY1's own captureMonoNs --
+        // the streak's clock is the fix's OWN captureMonoNs (see
+        // identCorroborate's doc comment for why this isn't a coroutine
+        // timer: a delay()-based one would be drained early by this test's
+        // own advanceUntilIdle() calls, exactly the "free-running timer"
+        // pitfall maybeSampleReferee's doc comment already records).
+        val fixY2 = fixResult("spotify:track:Y", 52_000L, 32_000_000_000L) // t=32s
+        val fixY3 = fixResult("spotify:track:Y", 54_000L, 34_000_000_000L) // t=34s
+        val recognition = FakeQueuedRecognitionProvider(listOf(fixX, fixY1, fixY2, fixY3))
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, recognition)
+
+        vm.startListening()
+        advanceUntilIdle()
+
+        engine.emit(SyncCore.Event.TrackLost)
+        advanceUntilIdle() // arm + fixY1 (streak 1)
+        assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
+
+        // fixY2 arrives > 30s (by its own captureMonoNs) after fixY1: the
+        // streak expires silently first -- must stay in MATCHING, never
+        // escalate to ERROR -- and fixY2 becomes entry 1 of a FRESH streak,
+        // not entry 2 of the old one.
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY2 (fresh streak 1, after silent expiry)
+        assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
+
+        // Proof the streak really cleared (not silently still at 1 toward
+        // the old episode): fixY3 only reaches a fresh streak of 2, not 3 --
+        // if the old count had survived, fixY1+fixY2+fixY3 (1+1+1=3, or
+        // worse 2+1=3) would already have corroborated here.
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY3 (fresh streak 2)
+        assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
+    }
+
     // ---- CTL-01b: Event.ActiveProbe (technical-requirements.md §2.9) ------
 
     @Test
@@ -1570,13 +1962,39 @@ class SessionViewModelTest {
         receivedMonoNs = 0L,
     )
 
-    private fun track() = TrackInfo(
-        spotifyUri = "spotify:track:abc",
+    /** GRD-01/IDC-01 test helper: a player state carrying an arbitrary URI,
+     * no duration (so scheduleEndOfTrackPause's own timer never arms and
+     * complicates advanceUntilIdle()). */
+    private fun playerState(uri: String?, isPaused: Boolean = false) =
+        SpotifyController.RemotePlayerState(
+            trackUri = uri,
+            positionMs = 1_000L,
+            isPaused = isPaused,
+            receivedMonoNs = 0L,
+        )
+
+    private fun track(uri: String = "spotify:track:abc") = TrackInfo(
+        spotifyUri = uri,
         isrc = "USABC1234567",
         title = "Song",
         artist = "Artist",
         durationMs = 200_000L,
     )
+
+    /** IDC-01 test helper: a scripted recognition fix carrying its own uri/
+     * offset/captureMonoNs so the corroboration streak's agreement math can
+     * be driven precisely. */
+    private fun fixResult(uri: String?, offsetMs: Long, captureNs: Long) =
+        RecognitionProvider.RecognitionFixResult(
+            matchOffsetMs = offsetMs,
+            captureMonoNs = captureNs,
+            frequencySkew = 0.0,
+            confidence = 0.9f,
+            title = "Song",
+            artist = "Artist",
+            isrc = "USABC1234567",
+            spotifyUri = uri,
+        )
 
     /** CAL-04 test helper: a minimal, well-formed profile to seed [FakeNudgeStore] with. */
     private fun calibrationProfile(
@@ -1850,6 +2268,24 @@ private class FakeRecognitionProvider(
     override suspend fun recognizeOnce(): RecognitionProvider.RecognitionFixResult? {
         callCount++
         return result
+    }
+
+    override fun close() = Unit
+}
+
+/** IDC-01 test seam: yields a scripted SEQUENCE of fixes, one per call —
+ * holding the last one once the queue is exhausted (a driven-out-of-band
+ * SC_EVT_REQUEST_FIX-style extra call never returns null mid-streak). */
+private class FakeQueuedRecognitionProvider(
+    private val results: List<RecognitionProvider.RecognitionFixResult?>,
+) : RecognitionProvider {
+    var callCount = 0
+        private set
+
+    override suspend fun recognizeOnce(): RecognitionProvider.RecognitionFixResult? {
+        val r = results.getOrNull(callCount) ?: results.lastOrNull()
+        callCount++
+        return r
     }
 
     override fun close() = Unit

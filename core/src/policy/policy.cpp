@@ -22,6 +22,11 @@ void CorrectionPolicy::reset() {
     large_pending_error_ms_ = 0.0;
     large_pending_ns_ = 0;
 
+    // tech-req §2.15 (CTL-04): epoch rule — a fresh join or track-lost
+    // re-listen must never be born "settled," exactly like the ring, the
+    // pending record, and the sentinel state above.
+    settled_ = false;
+
     // tech-req §2.9 (CTL-01a): all referee/probe state is epoch-scoped
     // exactly like the persistence ring and the large-correction hold — a
     // fresh session must never judge starvation or a verdict against
@@ -392,6 +397,14 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
                            cfg_.command_latency_min_ms,
                            cfg_.command_latency_max_ms);
         }
+
+        // tech-req §2.15 (CTL-04): this IS the post-settle verify fix — the
+        // one place a landed correction gets confirmed. |e| at or below
+        // settle_enter_threshold_ms here means the correction actually
+        // reached floor: enter settled. No separate dwell timer.
+        if (std::abs(e) <= cfg_.settle_enter_threshold_ms) {
+            settled_ = true;
+        }
     }
 
     // tech-req §2.9 (CTL-01a) verdict: the first probe_verdict_min_fixes
@@ -425,15 +438,37 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
 
     if (std::abs(e) >= cfg_.lost_threshold_ms) {
         action.kind = ActionKind::kTrackLost;
-        reset();
+        reset();  // reset() already clears settled_ (tech-req §2.15)
         return action;
+    }
+
+    // tech-req §2.15 (CTL-04): explicit large-error bypass — a genuine
+    // perturbation (routed to §2.8's own hold below) must never be slowed by
+    // the stronger settled bar. Checked unconditionally, before any of the
+    // ring/gating logic below, so it can never be shadowed by a stale
+    // pending record or a suppressed probe.
+    if (std::abs(e) >= cfg_.large_correction_threshold_ms) {
+        settled_ = false;
     }
 
     // CTL-02 (tech-req §2.7) persistence ring: only genuinely converged,
     // fresh fix evidence accumulates into the cluster. Losing convergence —
     // even briefly — invalidates the cluster's premise, so a non-converged
     // estimate clears it outright rather than pausing it.
-    if (est.converged) {
+    //
+    // tech-req §2.15 (CTL-04) EXCEPTION: while settled, every fresh estimate
+    // accumulates regardless of est.converged. The settled bar exists
+    // specifically to corroborate OUT-OF-DEADBAND proposals (Billie Jean's
+    // 542/547 ms readings), and the estimator's own converged flag requires
+    // |e| <= its deadband_ms — the SAME deadband_ms the shell always also
+    // hands the policy (synccore.cpp's sc_create). An out-of-deadband
+    // residual can therefore never itself be "converged": gating settled's
+    // own evidence on convergence would make the bar unsatisfiable by
+    // construction (discovered via test_closed_loop_genuine_large_jump_
+    // corrects regressing to a stuck −54 ms residual during implementation).
+    // Coherence here comes from the samples' own mutual agreement
+    // (ring_all_agree below), not from the estimator's separate flag.
+    if (est.converged || settled_) {
         ring_append(e, now_ns);
     } else {
         ring_clear();
@@ -501,6 +536,16 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
     // gate) treats a duck and a pause probe identically.
     const bool probe_suppresses_seeks = probe_outstanding_ || duck_outstanding_;
 
+    // tech-req §2.15 (CTL-04): while settled, every further proposal below
+    // the large/lost bypass thresholds — instantaneous AND persistence-gate
+    // — must clear this STRONGER bar instead of §2.7's own defaults. Entering
+    // settled does not clear the ring; it changes which of these two
+    // threshold pairs on_estimate checks it against.
+    const int effective_min_fixes =
+        settled_ ? cfg_.settled_confirm_min_fixes : cfg_.confirm_min_fixes;
+    const double effective_agree_ms =
+        settled_ ? cfg_.settled_confirm_agree_ms : cfg_.confirm_agree_ms;
+
     if (std::abs(e) >= cfg_.deadband_ms ||
         std::abs(predicted) >= cfg_.deadband_ms) {
         if (std::abs(e) >= cfg_.large_correction_threshold_ms) {
@@ -529,6 +574,11 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
                     last_centering_ms_ = drift_centering;
                     ring_clear();
                     large_pending_ = false;
+                    // tech-req §2.15: settled_ is already false here (the
+                    // large-error bypass above cleared it unconditionally
+                    // for this call) — restated for the epoch rule's own
+                    // sake ("clears on any emitted seek").
+                    settled_ = false;
                 }
                 // else: corroborated but suppressed — leave the pending
                 // record exactly as-is; it fires once the probe clears.
@@ -541,6 +591,53 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
                 large_pending_error_ms_ = e;
                 large_pending_ns_ = now_ns;
             }
+        } else if (settled_ && std::abs(e) >= cfg_.deadband_ms) {
+            // tech-req §2.15 (CTL-04): raise the bar — a small (below the
+            // large threshold), out-of-deadband proposal is held pending
+            // settled-grade corroboration instead of firing off one
+            // estimate, the same shape as §2.8's large-correction hold but
+            // at floor-class magnitude. Only genuinely converged samples
+            // accumulate in the ring (above), so a non-converged proposal
+            // here simply never gathers evidence and stays held.
+            //
+            // Gated on the ACTUAL error crossing deadband_ms, not merely the
+            // predicted one (§6.3 skew pre-emption): a purely preemptive
+            // proposal — |e| still inside the deadband, only the drift-
+            // projected |predicted| crosses it — is continuous drift-
+            // tracking evidence, not a discrete residual bump like Billie
+            // Jean's 542/547 ms readings. Holding those hostage to N-sample
+            // agreement would defeat pre-emption's entire purpose (by the
+            // time samples agree, the drift it exists to catch has already
+            // grown past it) and is what broke CORE-03's own sawtooth sim
+            // (worst |error| ballooned to 251 ms) during implementation —
+            // pre-emption keeps firing immediately even while settled.
+            //
+            // NOT gated on est.converged (unlike the persistence-gate branch
+            // below): an out-of-deadband residual can never itself be
+            // "converged" once the estimator's own deadband_ms matches the
+            // policy's, which the shell always arranges — coherence here
+            // comes from ring_all_agree's own mutual-agreement test.
+            if (ring_count_ >= static_cast<std::size_t>(effective_min_fixes) &&
+                ring_all_agree(ring_mean(), effective_agree_ms)) {
+                if (!probe_suppresses_seeks) {
+                    const double mean = ring_mean();
+                    action.kind = ActionKind::kSeek;
+                    action.seek_to_ms = static_cast<int64_t>(std::llround(
+                        projected_local_ms + cfg_.command_latency_ms - mean -
+                        drift_centering));
+                    seek_pending_ack_ = true;
+                    seek_emitted_ns_ = now_ns;
+                    awaiting_verify_ = true;
+                    last_centering_ms_ = drift_centering;
+                    ring_clear();
+                    settled_ = false;  // epoch rule: any emitted seek clears
+                }
+                // else: corroborated but suppressed — the ring stays open,
+                // exactly like the persistence gate's own suppressed case.
+            }
+            // else: not yet enough agreeing evidence — held; the ring keeps
+            // accumulating underneath exactly like the large-correction
+            // hold above.
         } else if (!probe_suppresses_seeks) {
             action.kind = ActionKind::kSeek;
             action.seek_to_ms = static_cast<int64_t>(
@@ -551,20 +648,32 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
             awaiting_verify_ = true;
             last_centering_ms_ = drift_centering;
             ring_clear();  // a correction changes the operating point
+            // tech-req §2.15 epoch rule: any emitted seek clears settled —
+            // including the pre-emptive fire, the one instantaneous seek
+            // still reachable while settled (the settled-hold branch above
+            // owns |e| >= deadband). The verify fix re-enters settled
+            // whenever the seek lands at floor, so this only matters when
+            // it lands badly — exactly when the raised bar must not slow
+            // recovery.
+            settled_ = false;
         }
         // else: instantaneous correction suppressed while a probe is
         // outstanding; the ring keeps accumulating underneath.
     } else if (est.converged &&
-               ring_count_ >= static_cast<std::size_t>(cfg_.confirm_min_fixes) &&
+               ring_count_ >= static_cast<std::size_t>(effective_min_fixes) &&
                (ring_newest_ns() - ring_oldest_ns()) >= cfg_.confirm_window_ns &&
-               ring_all_agree(ring_mean(), cfg_.confirm_agree_ms) &&
+               ring_all_agree(ring_mean(), effective_agree_ms) &&
                std::abs(ring_mean()) > cfg_.confirm_floor_ms &&
                std::abs(ring_mean()) < cfg_.lost_threshold_ms) {
         // CTL-02 persistence trigger: the instantaneous path above keeps
         // precedence (checked first, unfired here) — this is the second,
         // slower gate for a stable, corroborated residual a widened
         // deadband_ms would otherwise hold forever. Corrects from the
-        // cluster mean, not the instantaneous error.
+        // cluster mean, not the instantaneous error. tech-req §2.15: while
+        // settled, effective_min_fixes/effective_agree_ms are the STRONGER
+        // settled_confirm_* pair rather than confirm_min_fixes/
+        // confirm_agree_ms — "every further correction proposal," not only
+        // the instantaneous path.
         if (!probe_suppresses_seeks) {
             const double mean = ring_mean();
             action.kind = ActionKind::kSeek;
@@ -576,6 +685,7 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
             awaiting_verify_ = true;
             last_centering_ms_ = drift_centering;
             ring_clear();
+            settled_ = false;  // epoch rule: any emitted seek clears settled
         }
         // else: persistence trigger suppressed while a probe is
         // outstanding; the cluster stays open and keeps accumulating.
