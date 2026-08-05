@@ -15,6 +15,7 @@ option(SYNCCORE_SANITIZE "Enable Address/Undefined sanitizers (clang/gcc) or ASa
 add_library(synccore STATIC
     src/synccore.cpp
     src/estimator/estimator.cpp
+    src/estimator/hypothesis_bank.cpp
     src/policy/policy.cpp
     src/correlate/correlate.cpp
     src/dsp/fft.cpp
@@ -79,6 +80,12 @@ if(SYNCCORE_BUILD_TESTS)
 
     synccore_add_test(synccore_tests tests/test_synccore.cpp)
     synccore_add_test(estimator_tests tests/test_estimator.cpp)
+    synccore_add_test(hypothesis_bank_tests tests/test_hypothesis_bank.cpp)
+    # hypothesis_bank.h pulls in dsp/oss_ring.h for BeatEstimate, which
+    # (per test_oss_ring's own precedent above) holds a RealFft member
+    # directly and so needs kissfft's private include dir too.
+    target_include_directories(hypothesis_bank_tests
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft)
     synccore_add_test(policy_tests tests/test_policy.cpp)
     synccore_add_test(correlate_tests tests/test_correlate.cpp)
     synccore_add_test(input_level_tests tests/test_input_level.cpp)

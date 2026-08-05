@@ -304,6 +304,26 @@ public:
     double command_latency_ms() const { return cfg_.command_latency_ms; }
     void set_deadband_ms(double ms) { cfg_.deadband_ms = ms; }
 
+    // MHT-01 (tech-req §2.16): actuate only off the single dominant
+    // hypothesis once its existence probability clears
+    // mht_existence_actuate_threshold — never off the plain estimator's
+    // estimate while the bank is actively disambiguating (a seek off an
+    // unresolved ambiguity is exactly the FT9 Billie Jean failure this bank
+    // exists to prevent), and never off a soft blend of several hypotheses
+    // (§2.16's own explicit rejection of PDA's Eq. 3.6 soft-blend update).
+    //
+    // Deliberate layering split: PolicyConfig gets NO new fields for this —
+    // mht_existence_actuate_threshold and every other MHT knob live entirely
+    // in MhtConfig/HypothesisBank (owned by synccore.cpp's worker state).
+    // The worker computes dominance (HypothesisBank::dominant_at) and hands
+    // this ONE boolean across the module boundary; policy.cpp holds no MHT
+    // knowledge beyond "am I held right now." While held, no seek-emitting
+    // branch of on_estimate may fire (instantaneous, persistence-gate,
+    // settled-hold, large-correction-corroborated) — kTrackLost detection is
+    // untouched (§2.4) and remains fully live. Cleared by reset() (epoch
+    // rule, matching every other §2.7/§2.8/§2.9/§2.15 state).
+    void set_mht_hold(bool hold) { mht_hold_ = hold; }
+
     // tech-req §2.9 (CTL-01a): the worker reads this to fill
     // sc_evt_active_probe_t.pause_ms when dispatching SC_EVT_ACTIVE_PROBE.
     int32_t probe_pause_ms() const { return cfg_.probe_pause_ms; }
@@ -487,6 +507,13 @@ private:
                                           // anchor
     bool duck_escalated_ = false;        // R3: at most one pause-probe
                                           // escalation per duck episode
+
+    // MHT-01 (tech-req §2.16): true while the worker's MHT bank is actively
+    // disambiguating (>= 1 live hypothesis, none yet cleared the actuate
+    // threshold) — see set_mht_hold's doc comment. Consulted only inside
+    // on_estimate's seek-suppression flag; kTrackLost stays unaffected by
+    // construction (checked earlier in on_estimate, unconditionally).
+    bool mht_hold_ = false;
 };
 
 }  // namespace synccore

@@ -1811,6 +1811,98 @@ void test_settled_never_spuriously_enters_during_harmonic_ambiguous_churn() {
     CHECK(after.kind == synccore::ActionKind::kSeek);
 }
 
+// ---- MHT-01: actuation hold (tech-req §2.16) -----------------------------
+// The worker (synccore.cpp) computes dominance from the MHT bank and hands
+// the policy exactly one boolean via set_mht_hold — PolicyConfig gets no new
+// fields, and policy.cpp holds no MHT-specific knowledge beyond "am I held
+// right now." set_mht_hold is itself the policy's public seam for this, so
+// these tests drive it directly (no HypothesisBank construction needed),
+// exactly as test_seek_suppressed_while_probe_outstanding above drives
+// probe_outstanding_ indirectly through on_tick to pin the sibling
+// probe/duck suppression behavior.
+
+// Instantaneous path: a proposal that fires a kSeek when unheld (the exact
+// case test_correction_outside_deadband pins) must return kNone once held.
+void test_mht_hold_suppresses_instantaneous_path() {
+    synccore::CorrectionPolicy pol;
+    // Unheld baseline, same call test_correction_outside_deadband makes.
+    CHECK(pol.on_estimate(make_est(60.0), 100000.0, 10 * kSec).kind ==
+          synccore::ActionKind::kSeek);
+
+    synccore::CorrectionPolicy pol2;
+    pol2.set_mht_hold(true);
+    const auto held = pol2.on_estimate(make_est(60.0), 100000.0, 10 * kSec);
+    CHECK(held.kind == synccore::ActionKind::kNone);
+}
+
+// Persistence-gate path: the exact Vienna-class drive from
+// test_persistence_gate_vienna_class above (3 converged 285 ms fixes,
+// confirm_min_fixes/confirm_window_ns both satisfied on the 3rd) fires a
+// kSeek unheld; held, the 3rd sample must return kNone instead — the ring
+// keeps accumulating underneath regardless (ring_append runs ahead of the
+// suppression check), it just never gets to fire.
+void test_mht_hold_suppresses_persistence_gate() {
+    synccore::PolicyConfig cfg;
+    cfg.deadband_ms = 350.0;
+    synccore::CorrectionPolicy pol(cfg);
+    pol.set_mht_hold(true);
+
+    CHECK(pol.on_estimate(make_est(285.0, 0.0, true), 100000.0, 10 * kSec)
+              .kind == synccore::ActionKind::kNone);
+    CHECK(pol.on_estimate(make_est(285.0, 0.0, true), 100000.0, 20 * kSec)
+              .kind == synccore::ActionKind::kNone);
+    const auto held =
+        pol.on_estimate(make_est(285.0, 0.0, true), 100000.0, 30 * kSec);
+    CHECK(held.kind == synccore::ActionKind::kNone);
+}
+
+// kTrackLost detection (§2.4, unchanged) must stay fully live while held —
+// a held policy must still detect a genuinely lost track.
+void test_mht_hold_does_not_suppress_track_lost() {
+    synccore::CorrectionPolicy pol;
+    pol.set_mht_hold(true);
+    const auto lost = pol.on_estimate(make_est(2500.0), 100000.0, 10 * kSec);
+    CHECK(lost.kind == synccore::ActionKind::kTrackLost);
+}
+
+// No residue: a suppressed cycle must look like a no-proposal cycle, not a
+// seek that silently failed to land. If the held branch had wrongly set
+// awaiting_verify_ ("as if" a seek had fired), the very next — otherwise
+// unrelated, in-deadband — on_estimate call would run the command-latency-
+// learning branch and mutate command_latency_ms away from its 250 ms
+// default. Releasing the hold afterward must let the IDENTICAL suppressed
+// proposal fire normally, proving the ring/pending state below the
+// suppression point was left untouched by the held cycle.
+void test_mht_hold_release_restores_firing_without_residue() {
+    synccore::CorrectionPolicy pol;
+    pol.set_mht_hold(true);
+    CHECK(pol.on_estimate(make_est(60.0), 100000.0, 10 * kSec).kind ==
+          synccore::ActionKind::kNone);
+    CHECK(!pol.is_settling(10 * kSec + 1));  // no seek_pending_ack_ residue
+
+    // Unrelated in-deadband call: would mutate command_latency_ms if the
+    // held cycle above had left a phantom awaiting_verify_ behind.
+    pol.on_estimate(make_est(5.0), 100000.0, 11 * kSec);
+    CHECK(pol.command_latency_ms() == 250.0);
+
+    pol.set_mht_hold(false);
+    const auto fired = pol.on_estimate(make_est(60.0), 100000.0, 20 * kSec);
+    CHECK(fired.kind == synccore::ActionKind::kSeek);
+}
+
+// Epoch: reset() clears the hold — a fresh session must never inherit one
+// from before the reset.
+void test_mht_hold_cleared_on_reset() {
+    synccore::CorrectionPolicy pol;
+    pol.set_mht_hold(true);
+    CHECK(pol.on_estimate(make_est(60.0), 100000.0, 10 * kSec).kind ==
+          synccore::ActionKind::kNone);
+
+    pol.reset();
+    const auto fired = pol.on_estimate(make_est(60.0), 100000.0, 10 * kSec);
+    CHECK(fired.kind == synccore::ActionKind::kSeek);
+}
+
 }  // namespace
 
 int main() {
@@ -1876,6 +1968,12 @@ int main() {
     test_settled_clears_on_emitted_seek_and_on_reset();
     test_settled_clears_on_preemptive_instantaneous_seek();
     test_settled_never_spuriously_enters_during_harmonic_ambiguous_churn();
+
+    test_mht_hold_suppresses_instantaneous_path();
+    test_mht_hold_suppresses_persistence_gate();
+    test_mht_hold_does_not_suppress_track_lost();
+    test_mht_hold_release_restores_firing_without_residue();
+    test_mht_hold_cleared_on_reset();
 
     if (g_failures == 0) {
         std::printf("policy_tests: all tests passed\n");

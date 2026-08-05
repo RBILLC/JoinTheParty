@@ -58,6 +58,13 @@ void CorrectionPolicy::reset() {
     last_duck_request_ns_ = 0;
     duck_request_ns_ = 0;
     duck_escalated_ = false;
+
+    // MHT-01 (tech-req §2.16): epoch rule, matching every other §2.7/§2.8/
+    // §2.9/§2.15 state above — a fresh session must never inherit a hold
+    // from before this reset (the bank itself resets independently in
+    // synccore.cpp's kTrackLost handler; this only clears the policy's own
+    // one-bit mirror of it).
+    mht_hold_ = false;
 }
 
 void CorrectionPolicy::ring_append(double error_ms, uint64_t mono_ns) {
@@ -534,7 +541,22 @@ Action CorrectionPolicy::on_estimate(const Estimate& est,
     // exact same way — extended here rather than duplicated below, so every
     // downstream use of this flag (instantaneous path and the persistence
     // gate) treats a duck and a pause probe identically.
-    const bool probe_suppresses_seeks = probe_outstanding_ || duck_outstanding_;
+    //
+    // MHT-01 (tech-req §2.16): the worker's MHT bank hold joins the same
+    // flag, for the same reason — every seek-emitting branch below
+    // (instantaneous, persistence-gate, settled-hold, large-correction-
+    // corroborated) already routes through this ONE suppression point, so a
+    // held cycle looks exactly like the no-proposal cycles probe/duck
+    // suppression already produces: no seek_pending_ack_/awaiting_verify_,
+    // no ring/large-pending clear, no cooldown stamp — the ring and the
+    // large-pending hold keep accumulating underneath exactly as they would
+    // otherwise (see each branch's own "else: ... suppressed" comment),
+    // which is what lets a released hold fire on the SAME evidence it would
+    // have without ever having held. kTrackLost is unaffected: both
+    // kTrackLost checks above (lost_threshold_ms and the probe self-match
+    // verdict) run unconditionally, before this flag is even computed.
+    const bool probe_suppresses_seeks =
+        probe_outstanding_ || duck_outstanding_ || mht_hold_;
 
     // tech-req §2.15 (CTL-04): while settled, every further proposal below
     // the large/lost bypass thresholds — instantaneous AND persistence-gate

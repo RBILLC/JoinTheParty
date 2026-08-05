@@ -26,6 +26,7 @@
 #include "dsp/lag_window.h"
 #include "dsp/oss_ring.h"
 #include "estimator/estimator.h"
+#include "estimator/hypothesis_bank.h"
 #include "policy/policy.h"
 #include "spsc_ring.h"
 #include "synccore_testing.h"
@@ -218,6 +219,20 @@ struct sc_session {
     struct {
         synccore::SyncEstimator estimator;
         synccore::CorrectionPolicy policy;
+        // MHT-01 (tech-req §2.16): parallel hypothesis bank. Default-
+        // constructed exactly like `estimator` above (MhtConfig{} — default
+        // mht_enabled=false — and EstimatorConfig{}, the SAME default
+        // EstimatorConfig `estimator` gets: sc_create's setters below apply
+        // identically to both, see set_output_latency_ms/set_deadband_ms
+        // call sites), so every entry point is a true no-op and this pass
+        // changes zero on-device behavior while mht_enabled stays false.
+        synccore::HypothesisBank mht;
+        // Referee-analysis-moment values (tech-req §2.10's own "one shared
+        // analysis moment," kSampleLatencyResidual), forwarded to
+        // wk.mht.on_fix at the next accepted fix — see that handler for why
+        // this is stored unconditionally rather than only when warranted.
+        synccore::BeatEstimate last_beat;
+        double last_comb_ratio = 0.0;
         synccore::ChirpDetector detector{kSupportedRateHz};
         synccore::SyncCoreAec aec{kSupportedRateHz};
         uint64_t now_ns = 0;        // latest input timestamp seen
@@ -455,6 +470,13 @@ struct sc_session {
             case synccore::ActionKind::kTrackLost:
                 wk.estimator.reset();
                 wk.policy.reset();
+                // MHT-01 epoch rule (tech-req §2.16): a re-listen is a new
+                // epoch for the bank too — no hypothesis, existence, or
+                // sidecar state may survive into it, exactly like the
+                // estimator/policy resets immediately above (and the OSS
+                // ring's own reset just below, which the bank's own
+                // seeding inputs — BeatEstimate — depend on).
+                wk.mht.reset();
                 // DSP-01b epoch rule (tech-req §2.10): a re-listen is a new
                 // epoch — the tempogram's OSS ring and stability history
                 // must not survive into it, exactly like the estimator/
@@ -636,6 +658,18 @@ struct sc_session {
     // recognition-request scheduler. Runs on capture-time progress.
     void tick() {
         if (wk.now_ns == 0) return;
+        // MHT-01 (tech-req §2.16) DECISION: deliberately NOT substituting
+        // the dominant hypothesis here, unlike kRecognitionFix's decide_ns
+        // block. on_tick (below) never emits a seek — it is void, and its
+        // only jobs are tracking converged_seen_/confidence for the §2.9
+        // referee sentinel and Wittenmark turn-off dwell, neither of which
+        // §2.16 says anything about. §2.16's own actuate-on-dominant rule
+        // governs SEEK actuation only ("the policy actuates... only off the
+        // single dominant hypothesis"); coupling the bank into the
+        // unrelated probe-trigger/emitted-telemetry cadence here would be
+        // scope creep this ticket doesn't authorize. The periodic
+        // SC_EVT_SYNC_ESTIMATE emission just below is the same plain
+        // estimator estimate for the same reason.
         const synccore::Estimate est = wk.estimator.estimate_at(wk.now_ns);
         if (est.valid &&
             wk.now_ns - wk.last_emit_ns >= kEstimateEmitPeriodNs) {
@@ -757,6 +791,21 @@ struct sc_session {
                     return;
                 }
                 wk.policy.on_fix_accepted(t);
+                // MHT-01 (tech-req §2.16 hard limit, restated verbatim: "the
+                // bank never touches self-match"). This call sits STRICTLY
+                // downstream of every §7.3 self-match-guard early return
+                // above (settling/self-hearing/low-confidence all already
+                // returned) and after the fix has already been accepted
+                // into the estimator/policy — that placement IS the
+                // invariant; do not move this call earlier, and do not grow
+                // a second self-match path around it (hypothesis_bank.h's
+                // own header comment states the same limit). last_beat/
+                // last_comb_ratio are the most recent referee-window values
+                // (kSampleLatencyResidual), the "one shared analysis
+                // moment" §2.10 already established for the tempogram.
+                wk.mht.on_fix(cmd.fix.match_offset_ms, t, cmd.fix.frequency_skew,
+                              cmd.fix.confidence, wk.last_beat,
+                              wk.last_comb_ratio);
                 // Maintain the room timeline. Field Test 5 (song 2) showed
                 // why this must NOT simply re-seed on every accepted fix:
                 // with the recognizer alternating between the room and our
@@ -800,9 +849,32 @@ struct sc_session {
                 // Field Test 4: this is the systematic ~1 s lag that survived
                 // every other fix, because every correction re-established it.
                 const uint64_t decide_ns = wk.now_ns;
-                const synccore::Estimate est = wk.estimator.estimate_at(decide_ns);
+                // MHT-01 (tech-req §2.16): actuate off the single dominant
+                // hypothesis once its existence clears
+                // mht_existence_actuate_threshold — never off a blend of
+                // several (§2.16's explicit rejection of PDA's soft-blend,
+                // Eq. 3.6). While the bank is active (>=1 live hypothesis)
+                // but has no dominant clearing the threshold, the policy is
+                // HELD rather than left to actuate off the plain
+                // (pre-disambiguation) estimator estimate — that would be
+                // exactly the FT9 Billie Jean failure this bank exists to
+                // prevent (a seek off one unresolved, possibly-wrong tooth
+                // of the comb). While the bank is empty or mht_enabled is
+                // false (the shipped default), active() is false and
+                // dom.valid is false unconditionally (HypothesisBank's own
+                // no-op-while-disabled contract) — set_mht_hold(false) and
+                // est falls through to wk.estimator.estimate_at, byte-
+                // identical to pre-MHT-01 behavior.
+                const auto dom = wk.mht.dominant_at(decide_ns);
+                wk.policy.set_mht_hold(wk.mht.active() && !dom.valid);
+                const synccore::Estimate est =
+                    dom.valid ? dom.estimate : wk.estimator.estimate_at(decide_ns);
                 wk.last_emit_ns = decide_ns;
                 emit_estimate(est);
+                // projected_local_ms stays the SHARED estimator's own
+                // projection unconditionally (§2.16 doesn't touch the
+                // player-state projection, only which offset/drift
+                // ESTIMATE feeds the seek-target formula that consumes it).
                 apply(wk.policy.on_estimate(
                     est, wk.estimator.projected_local_ms(decide_ns), decide_ns));
                 command_latency_mirror_ms.store(
@@ -816,6 +888,11 @@ struct sc_session {
                 wk.estimator.on_player_state(cmd.player.position_ms,
                                              cmd.player.is_paused,
                                              cmd.player.received_mono_ns);
+                // MHT-01: forwarded identically to every live/future
+                // hypothesis — see hypothesis_bank.h's on_player_state.
+                wk.mht.on_player_state(cmd.player.position_ms,
+                                       cmd.player.is_paused,
+                                       cmd.player.received_mono_ns);
                 // CTL-01a: the estimator holds is_paused privately with no
                 // getter (estimator.h stays untouched) — mirror it here so
                 // tick() can feed playback_live to CorrectionPolicy::on_tick.
@@ -825,6 +902,13 @@ struct sc_session {
                 wk.now_ns = std::max(wk.now_ns, cmd.mono_ns);
                 wk.estimator.on_local_seek(cmd.value_ms, cmd.mono_ns,
                                            wk.policy.command_latency_ms());
+                // MHT-01: forwarded identically — each hypothesis's own
+                // SyncEstimator instance must absorb the same seek-
+                // execution-uncertainty widening the shared estimator gets,
+                // or a post-seek fix would read as a spurious innovation to
+                // every hypothesis.
+                wk.mht.on_local_seek(cmd.value_ms, cmd.mono_ns,
+                                     wk.policy.command_latency_ms());
                 wk.policy.on_seek_issued(cmd.mono_ns);
                 // A seek re-commands our own playback position — keep the
                 // self-hearing guard's reference fresh.
@@ -835,9 +919,12 @@ struct sc_session {
                 break;
             case Command::Kind::kSetNudge:
                 wk.estimator.set_nudge_ms(static_cast<double>(cmd.value_ms));
+                wk.mht.set_nudge_ms(static_cast<double>(cmd.value_ms));  // MHT-01
                 break;
             case Command::Kind::kSetOutputLatency:
                 wk.estimator.set_output_latency_ms(
+                    static_cast<double>(cmd.value_ms));
+                wk.mht.set_output_latency_ms(  // MHT-01
                     static_cast<double>(cmd.value_ms));
                 break;
             case Command::Kind::kSetAecMode:
@@ -963,6 +1050,18 @@ struct sc_session {
                 // here.
                 const synccore::BeatEstimate beat =
                     wk.oss_ring.estimate_beat_period(wk.now_ns);
+                // MHT-01 (tech-req §2.16): stash this analysis moment's
+                // referee values, unconditionally — even when n <= 0.
+                // WindowLag{}'s default comb_ratio=0 sentinel ("no
+                // competitor") can never pass HypothesisBank::warranted's
+                // mht_warrant_comb_ratio_max gate, so storing it plainly
+                // here is exactly right for that case too; no special-
+                // casing needed, matching append_history's/oss_ring.push's
+                // own treatment of the empty/n<=0 case elsewhere in this
+                // file. Consumed by kRecognitionFix's wk.mht.on_fix call at
+                // the next accepted fix.
+                wk.last_beat = beat;
+                wk.last_comb_ratio = lag.comb_ratio;
                 // §2.8 cross-check: corroborates (or not) the SAME window's
                 // second_lag_ms — read-only diagnostic, never gates
                 // anything above. When n <= 0, `lag` is still WindowLag{}'s
@@ -1048,9 +1147,13 @@ sc_status_t sc_create(const sc_config_t* cfg, sc_session_t** out) {
         s->cfg.command_latency_prior_ms = kDefaultCommandLatencyMs;
     s->route = cfg->initial_route;
     s->route_latency_prior_ms = cfg->output_latency_prior_ms;
-    if (cfg->output_latency_prior_ms > 0)
+    if (cfg->output_latency_prior_ms > 0) {
         s->wk.estimator.set_output_latency_ms(
             static_cast<double>(cfg->output_latency_prior_ms));
+        // MHT-01: the bank's own sidecar estimators get the SAME prior.
+        s->wk.mht.set_output_latency_ms(
+            static_cast<double>(cfg->output_latency_prior_ms));
+    }
     s->wk.policy.set_command_latency_ms(
         static_cast<double>(s->cfg.command_latency_prior_ms));
     s->command_latency_mirror_ms.store(s->cfg.command_latency_prior_ms,
@@ -1058,6 +1161,8 @@ sc_status_t sc_create(const sc_config_t* cfg, sc_session_t** out) {
     if (cfg->deadband_ms > 0) {
         s->wk.estimator.set_deadband_ms(static_cast<double>(cfg->deadband_ms));
         s->wk.policy.set_deadband_ms(static_cast<double>(cfg->deadband_ms));
+        // MHT-01: same shared deadband the estimator/policy both get.
+        s->wk.mht.set_deadband_ms(static_cast<double>(cfg->deadband_ms));
     }
     s->worker = std::thread([s] { s->worker_loop(); });
     *out = s;
