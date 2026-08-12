@@ -17,6 +17,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.SemanticsPropertyReceiver
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
@@ -158,52 +159,8 @@ fun CaliperScale(
                 // whether or not touch exploration is on.
                 .semantics {
                     when (mode) {
-                        is CaliperMode.ReadOut -> {
-                            // Deliberately just "what this control is" — the
-                            // device name and provenance word/qualifier are
-                            // the surrounding row's job (ProvenanceLine,
-                            // DeviceShelfRow/DeviceDetail); duplicating them
-                            // here would repeat the same words twice in one
-                            // TalkBack pass over a merged row.
-                            contentDescription = CALIPER_READOUT_CONTENT_DESCRIPTION
-                            stateDescription = caliperReadOutStateDescription(mode.settledValueMs)
-                        }
-                        is CaliperMode.Input -> {
-                            contentDescription = CALIPER_INPUT_CONTENT_DESCRIPTION
-                            stateDescription = caliperInputStateDescription(mode.cursorMs)
-                            // progressBarRangeInfo + setProgress (not a bare
-                            // contentDescription, per NudgeWheel's read-only
-                            // precedent) is the platform's actual
-                            // drag-free path: it's what makes this node
-                            // "Adjustable" to TalkBack, offering an
-                            // increment/decrement gesture that calls
-                            // [setProgress] instead of requiring a drag.
-                            // `steps` quantizes that gesture to
-                            // [CALIPER_ADJUST_STEPS] stops — one call, so the
-                            // system-computed default step can't silently
-                            // drift from [CALIPER_ADJUST_STEP_MS].
-                            progressBarRangeInfo = ProgressBarRangeInfo(
-                                current = mode.cursorMs,
-                                range = 0f..DT.Calibration.scaleRangeMs,
-                                steps = CALIPER_ADJUST_STEPS,
-                            )
-                            setProgress { targetValue ->
-                                // Snapped rather than passed through raw:
-                                // guarantees "exactly one defined step" per
-                                // adjust gesture (CFX-03 acceptance
-                                // criteria) regardless of what raw value the
-                                // accessibility framework computes.
-                                // mode.onCursorChange is the SAME callback
-                                // the drag path uses (below) — it's also
-                                // what CalibrationSheet.kt's ToneMatchCaliper
-                                // reads to flip `hasDragged` (which enables
-                                // "That's it"), so this path reaches the
-                                // exact same commit-enabled state a drag
-                                // would.
-                                mode.onCursorChange(caliperSnapToStep(targetValue))
-                                true
-                            }
-                        }
+                        is CaliperMode.ReadOut -> applyCaliperReadOutSemantics(mode.settledValueMs)
+                        is CaliperMode.Input -> applyCaliperInputSemantics(mode)
                     }
                 }
                 .let { base ->
@@ -324,17 +281,75 @@ private val DASH_OFF = 4.dp
 // a JVM test can exercise the announcement copy and the step arithmetic
 // directly — same convention as Provenance.kt's provenanceLabel/
 // provenanceQualifier ("string-diff audit... testable on the JVM without
-// Compose"). This project has no Robolectric/instrumentation suite (only
-// JVM unit tests), so the semantics attachment itself (does TalkBack
-// actually announce this / invoke this action?) is NOT covered by any
-// automated test here — see the ticket's outstanding "needs a device pass"
-// criterion.
+// Compose"). applyCaliperReadOutSemantics/applyCaliperInputSemantics (below)
+// extend that same testability to the semantics ATTACHMENT itself: this
+// project has no Robolectric/instrumentation suite (only JVM unit tests),
+// but `SemanticsConfiguration` has no Android framework dependency, so
+// CaliperScaleTest applies these two functions to a real one and reads back
+// contentDescription/stateDescription/progressBarRangeInfo/setProgress
+// exactly as CaliperScale's `.semantics { }` block does. What remains
+// uncovered — genuinely only observable on a device/emulator with TalkBack
+// running — is whether the platform accessibility service actually
+// discovers, announces, and drives this node; see the ticket's outstanding
+// "needs a device pass" criterion.
 
 /** ReadOut's contentDescription: names the control, nothing else (see the KDoc at its call site for why device name/provenance are deliberately excluded). */
 const val CALIPER_READOUT_CONTENT_DESCRIPTION = "Calibration scale"
 
 /** Input's contentDescription — distinct wording so a TalkBack user can tell, by ear, whether the node they've landed on is browsing a value or setting one. */
 const val CALIPER_INPUT_CONTENT_DESCRIPTION = "Tone-match calibration scale"
+
+/**
+ * ReadOut mode's semantics: value/state description only (CFX-03 acceptance
+ * criteria) — deliberately just "what this control is," never the device
+ * name or provenance word/qualifier, which are the surrounding row's job
+ * (ProvenanceLine, DeviceShelfRow/DeviceDetail); duplicating them here would
+ * repeat the same words twice in one TalkBack pass over a merged row.
+ *
+ * A [SemanticsPropertyReceiver] extension rather than inlined into the
+ * `.semantics { }` block at the call site, so a JVM unit test can apply it
+ * directly to a real `SemanticsConfiguration()` (which implements this same
+ * receiver interface) and read back what a screen reader would actually see
+ * — not just the pure announcement-copy functions it delegates to.
+ */
+internal fun SemanticsPropertyReceiver.applyCaliperReadOutSemantics(settledValueMs: Float?) {
+    contentDescription = CALIPER_READOUT_CONTENT_DESCRIPTION
+    stateDescription = caliperReadOutStateDescription(settledValueMs)
+}
+
+/**
+ * Input mode's semantics (CFX-03 acceptance criteria / tech-req §2.6
+ * "CaliperScale accessibility contract"): value/state description plus a
+ * drag-free commit path. See [applyCaliperReadOutSemantics] for why this is
+ * a standalone [SemanticsPropertyReceiver] extension rather than inlined.
+ */
+internal fun SemanticsPropertyReceiver.applyCaliperInputSemantics(mode: CaliperMode.Input) {
+    contentDescription = CALIPER_INPUT_CONTENT_DESCRIPTION
+    stateDescription = caliperInputStateDescription(mode.cursorMs)
+    // progressBarRangeInfo + setProgress (not a bare contentDescription, per
+    // NudgeWheel's read-only precedent) is the platform's actual drag-free
+    // path: it's what makes this node "Adjustable" to TalkBack, offering an
+    // increment/decrement gesture that calls [setProgress] instead of
+    // requiring a drag. `steps` quantizes that gesture to
+    // [CALIPER_ADJUST_STEPS] stops — one call, so the system-computed
+    // default step can't silently drift from [CALIPER_ADJUST_STEP_MS].
+    progressBarRangeInfo = ProgressBarRangeInfo(
+        current = mode.cursorMs,
+        range = 0f..DT.Calibration.scaleRangeMs,
+        steps = CALIPER_ADJUST_STEPS,
+    )
+    setProgress { targetValue ->
+        // Snapped rather than passed through raw: guarantees "exactly one
+        // defined step" per adjust gesture (CFX-03 acceptance criteria)
+        // regardless of what raw value the accessibility framework computes.
+        // mode.onCursorChange is the SAME callback the drag path uses
+        // (above) — it's also what CalibrationSheet.kt's ToneMatchCaliper
+        // reads to flip `hasDragged` (which enables "That's it"), so this
+        // path reaches the exact same commit-enabled state a drag would.
+        mode.onCursorChange(caliperSnapToStep(targetValue))
+        true
+    }
+}
 
 /**
  * ReadOut's stateDescription (tech-req §2.6): the settled value in ms, or
