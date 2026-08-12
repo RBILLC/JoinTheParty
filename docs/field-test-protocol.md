@@ -290,6 +290,18 @@ phones' media volume to a known, repeatable level (and write it down in the
 run notes) before the first join. `adb -t N shell media volume --show
 --stream 3 --set <idx>` does it without touching the screen.
 
+### Check the audio ROUTE, not just Bluetooth power (FT10)
+
+A connected Bluetooth audio device silently steals the media stream: the
+phone "plays" but the room speaker stays quiet, and every acoustic number is
+measured against nothing. Field Test 10's rig check found Phone B with an
+A2DP headset `STATE_CONNECTED` and `dumpsys audio` showing the music stream
+index live on `bt_a2dp` while `2 (speaker)` sat at 0 — Bluetooth *power*
+being on was expected; the active *route* was the problem. Pre-flight, per
+phone: `adb -s <serial> shell dumpsys audio | grep -A4 "STREAM_MUSIC"` and
+confirm the live index is on the speaker device, not `bt_a2dp`/`ble`;
+`adb shell svc bluetooth disable` clears it (re-enable after the run).
+
 ### Reset the custom trim before any standardized test
 
 A user-set trim carried over from casual listening silently shifts every
