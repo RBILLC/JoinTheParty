@@ -492,6 +492,48 @@ class SessionViewModel(
     private var consecutiveLosses = 0
 
     /**
+     * GRD-01 concurrency fix (GitHub #32, reopened by field-test-10: FT10
+     * hit a FATAL `IndexOutOfBoundsException` in [consumeSelfPlayLatch] plus
+     * a double guardian fire in [onSpotifyAutoAdvanced], both real-world-only
+     * races invisible to the JVM suite's single-threaded scheduler).
+     * [dispatcher] defaults to [Dispatchers.Default] — a genuinely
+     * multi-threaded pool — and this class launches many coroutines on it
+     * ([playerStateWatcher]'s collector, [latchSelfPlay]'s per-entry expiry
+     * job, [runRecognitionPass]'s fast-switch branch, the single
+     * `engine.events` collector, [aimUntilLanded]'s give-up→[onTrackLost]
+     * path). Any of them can land on a different worker thread, so a plain
+     * read-then-write of one of this class's shared mutable session fields
+     * — [selfPlayLatch], [autoAdvanceHandled], the IDC-01 corroboration
+     * fields ([identCorrobArmed]/[identStreakCount]/[identStreakUri]/etc.),
+     * [consecutiveLosses], [endOfTrackJob], and [transition]'s own
+     * from→to legality check — is a genuine TOCTOU race, not a style nit.
+     * Every function that touches one of those synchronizes on this
+     * monitor for its critical section.
+     *
+     * Plain JVM `synchronized`, not a coroutine [kotlinx.coroutines.sync
+     * .Mutex]: most guarded call sites ([transition], every shell-driven
+     * intent — [startListening], [onTrackResolved], [reset], ... —
+     * [onSpotifyAutoAdvanced]) are ordinary non-suspend functions called
+     * synchronously off the UI thread; a coroutine `Mutex` would force
+     * every one of them to become `suspend`, rippling into Compose's
+     * calling convention for no benefit, since none of these critical
+     * sections themselves suspend or block on I/O. `synchronized` is
+     * reentrant per thread, so the nesting this file already has
+     * ([onTrackLost] → [transition] / [armIdentCorroboration],
+     * [onSpotifyAutoAdvanced] → [stopFollowingAndRelisten] → [transition])
+     * is free. No guarded block ever suspends inside the monitor (a
+     * `scope.launch(...)` call is fine — launching is not suspending), so
+     * there is no suspend-while-holding-the-monitor deadlock risk either.
+     * Under the JVM unit suite's single-threaded
+     * [kotlinx.coroutines.test.StandardTestDispatcher] the monitor is never
+     * contended, so virtual-time scheduling (`advanceUntilIdle`/
+     * `runCurrent`) is completely unaffected — this is purely a
+     * real-multi-thread-only guard (verified by the concurrent stress
+     * tests in `SessionViewModelTest.kt`).
+     */
+    private val sessionLock = Any()
+
+    /**
      * NAT-06: guards [runRecognitionPass] against overlapping passes —
      * ShazamKit quota discipline (technical-requirements.md §3.2) requires
      * one session, one pass at a time. Two triggers can race to start a
@@ -771,15 +813,24 @@ class SessionViewModel(
     private val selfPlayLatch = mutableListOf<Pair<String, kotlinx.coroutines.Job>>()
 
     private fun latchSelfPlay(uri: String) {
-        if (selfPlayLatch.size >= SELF_PLAY_LATCH_MAX_ENTRIES) {
-            selfPlayLatch.removeAt(0).second.cancel()  // oldest evicted first
-        }
         lateinit var job: kotlinx.coroutines.Job
-        job = scope.launch(dispatcher) {
-            delay(SELF_PLAY_LATCH_WINDOW_MS)
-            selfPlayLatch.removeAll { it.second === job }
+        // GRD-01 concurrency fix (#32): the eviction + append below must be
+        // atomic with every other selfPlayLatch access — see [sessionLock].
+        synchronized(sessionLock) {
+            if (selfPlayLatch.size >= SELF_PLAY_LATCH_MAX_ENTRIES) {
+                selfPlayLatch.removeAt(0).second.cancel()  // oldest evicted first
+            }
+            job = scope.launch(dispatcher) {
+                delay(SELF_PLAY_LATCH_WINDOW_MS)
+                // This expiry job can run on a different Dispatchers.Default
+                // worker than whatever thread is concurrently consuming or
+                // latching — the exact race FT10 crashed on (a bare
+                // `removeAll` racing consumeSelfPlayLatch's indexOfFirst→
+                // removeAt window).
+                synchronized(sessionLock) { selfPlayLatch.removeAll { it.second === job } }
+            }
+            selfPlayLatch += uri to job
         }
-        selfPlayLatch += uri to job
     }
 
     /**
@@ -788,12 +839,19 @@ class SessionViewModel(
      * only ever contains URIs we issued, so a real auto-advance to any URI
      * we did not just command is never in the set and still trips the
      * guardian exactly as today. A hit consumes the matching entry.
+     *
+     * GRD-01 concurrency fix (#32): the indexOfFirst→removeAt window below
+     * is exactly what FT10 crashed on (`IndexOutOfBoundsException`,
+     * `SessionViewModel.kt:795` at the time) — a concurrent expiry
+     * `removeAll` or another consumer emptied the list between the two
+     * calls. Synchronized on [sessionLock] with every other selfPlayLatch
+     * access.
      */
-    private fun consumeSelfPlayLatch(uri: String): Boolean {
+    private fun consumeSelfPlayLatch(uri: String): Boolean = synchronized(sessionLock) {
         val idx = selfPlayLatch.indexOfFirst { it.first == uri }
-        if (idx < 0) return false
+        if (idx < 0) return@synchronized false
         selfPlayLatch.removeAt(idx).second.cancel()
-        return true
+        true
     }
 
     /**
@@ -811,9 +869,17 @@ class SessionViewModel(
      */
     private suspend fun resolveTrack(fix: RecognitionProvider.RecognitionFixResult) {
         val track = resolveTrackInfo(fix) ?: return
-        if (identCorrobArmed && !identCorroborate(track.spotifyUri, fix)) {
-            return  // not yet corroborated; stay quietly in MATCHING
+        // GRD-01 concurrency fix (#32): the armed-check and the streak
+        // mutation must land as one atomic unit — see [sessionLock] —
+        // otherwise two fixes racing this function on different
+        // Dispatchers.Default workers (e.g. the fast-switch branch and a
+        // track-lost re-bootstrap) could both read identCorrobArmed before
+        // either updates the streak. [resolveTrackInfo] above (network/
+        // backend I/O) deliberately stays outside the lock.
+        val corroborated = synchronized(sessionLock) {
+            !identCorrobArmed || identCorroborate(track.spotifyUri, fix)
         }
+        if (!corroborated) return  // not yet corroborated; stay quietly in MATCHING
         resolvedWithAim(track, fix)
     }
 
@@ -849,7 +915,10 @@ class SessionViewModel(
 
     /**
      * IDC-01 (tech-req §2.14): true once `MATCHING` is (re-)armed via
-     * [onTrackLost]'s re-bootstrap or an aim-failure (see [aimUntilLanded]).
+     * [onTrackLost]'s re-bootstrap. [aimUntilLanded]'s give-up path arms it
+     * only INDIRECTLY, by calling [onTrackLost] itself (the same
+     * re-bootstrap any other track-lost takes) — it has no arming call of
+     * its own (issue #37: this doc previously implied it did; corrected).
      * While armed, every resolved identity — including one CORE-06
      * independently rejected as SELF_HEARING/LOW_CONFIDENCE downstream —
      * still passes through [resolveTrack]'s existing unconditional call (it
@@ -877,14 +946,21 @@ class SessionViewModel(
     private var identStreakStartCaptureMonoNs: Long = 0L
 
     /** Arms (or re-arms) the gate: epoch rule — the ring/streak never
-     * carries across a prior arming or a resolved track. */
-    private fun armIdentCorroboration() {
+     * carries across a prior arming or a resolved track.
+     *
+     * GRD-01 concurrency fix (#32): synchronized on [sessionLock] with
+     * every other identCorrob* access — this can be called from
+     * [onTrackLost], which itself runs on either the engine-event collector
+     * or [aimUntilLanded]'s give-up path, two different coroutines that can
+     * land on different threads. */
+    private fun armIdentCorroboration() = synchronized(sessionLock) {
         identCorrobArmed = true
         identStreakCount = 0
         identStreakUri = null
     }
 
-    private fun clearIdentCorroboration() {
+    /** GRD-01 concurrency fix (#32): see [armIdentCorroboration]. */
+    private fun clearIdentCorroboration() = synchronized(sessionLock) {
         identCorrobArmed = false
         identStreakCount = 0
         identStreakUri = null
@@ -903,10 +979,14 @@ class SessionViewModel(
      * older than this fix expires silently first — cleared, no escalation —
      * and this fix becomes entry 1 of a fresh streak instead.
      */
+    // GRD-01 concurrency fix (#32): full body synchronized on [sessionLock]
+    // — see [resolveTrack]'s call site, which reads identCorrobArmed and
+    // calls this as one atomic unit; [sessionLock] is reentrant so this
+    // function's own lock acquisition nests safely inside that one.
     private fun identCorroborate(
         uri: String,
         fix: RecognitionProvider.RecognitionFixResult,
-    ): Boolean {
+    ): Boolean = synchronized(sessionLock) {
         if (identStreakCount > 0 &&
             fix.captureMonoNs - identStreakStartCaptureMonoNs >
             IDENT_CORROB_MAX_AGE_MS * 1_000_000L
@@ -926,11 +1006,18 @@ class SessionViewModel(
         identStreakUri = uri
         identStreakLastOffsetMs = fix.matchOffsetMs
         identStreakLastCaptureMonoNs = fix.captureMonoNs
+        // #37 instrumentation: streak progress was invisible in logcat —
+        // FT10's IDC-01 verdict was nearly inconclusive purely for want of
+        // this line (field-test-10-results.md's IDC-01 section had to
+        // reconstruct streak state from source reading instead).
+        com.jointheparty.app.debug.DebugLog.log(
+            "identCorrob: streak $identStreakCount/$IDENT_CONFIRM_MIN_FIXES ($uri)",
+        )
         if (identStreakCount >= IDENT_CONFIRM_MIN_FIXES) {
             clearIdentCorroboration()
-            return true
+            return@synchronized true
         }
-        return false
+        false
     }
 
     /** Like [onTrackResolved], but carries the fix so playback can aim. */
@@ -989,19 +1076,25 @@ class SessionViewModel(
             engine.stopCapture()
             captureRunning = false
             calibrationOwnsCapture = false
-            consecutiveLosses = 0
             gateDismissedThisSession = false
-            firstEstimateSeen = false
-            samplingAttempts = 0
-            autoAdvanceHandled = null
-            endOfTrackJob?.cancel()
             capturedCalibrationRoute = null // CFX-01
             refereePendingRouteId = null
             refereePendingResidualsMs.clear()
-            // GRD-01 (tech-req §2.13): epoch rule — a fresh session must
-            // never carry a self-issued latch forward from before.
-            selfPlayLatch.forEach { it.second.cancel() }
-            selfPlayLatch.clear()
+            // GRD-01 concurrency fix (#32): reset() runs on the caller's
+            // thread (a UI-driven action) concurrently with any in-flight
+            // session coroutine on `dispatcher` — guard the same shared
+            // fields those coroutines guard. See [sessionLock].
+            synchronized(sessionLock) {
+                consecutiveLosses = 0
+                firstEstimateSeen = false
+                samplingAttempts = 0
+                autoAdvanceHandled = null
+                endOfTrackJob?.cancel()
+                // GRD-01 (tech-req §2.13): epoch rule — a fresh session
+                // must never carry a self-issued latch forward from before.
+                selfPlayLatch.forEach { it.second.cancel() }
+                selfPlayLatch.clear()
+            }
             // IDC-01 (tech-req §2.14): epoch rule — the corroboration
             // ring/streak never carries across sessions.
             clearIdentCorroboration()
@@ -2016,8 +2109,14 @@ class SessionViewModel(
                         com.jointheparty.app.debug.DebugLog.log(
                             "sampling cap reached with no match → error state",
                         )
-                        transition(SessionPhase.LOST)
-                        transition(SessionPhase.ERROR)
+                        // GRD-01 concurrency fix (#32): the two-step
+                        // transition sequence is atomic w.r.t. any other
+                        // thread mutating phase/session state — see
+                        // [sessionLock].
+                        synchronized(sessionLock) {
+                            transition(SessionPhase.LOST)
+                            transition(SessionPhase.ERROR)
+                        }
                     }
                     return@launch
                 }
@@ -2076,9 +2175,18 @@ class SessionViewModel(
                     com.jointheparty.app.debug.DebugLog.log(
                         "room changed songs → re-aim '${fix.title}'",
                     )
-                    transition(SessionPhase.LOST)
-                    transition(SessionPhase.LISTENING)
-                    onMatchInFlight()
+                    // GRD-01 concurrency fix (#32): the three-step
+                    // transition sequence is atomic w.r.t. any other thread
+                    // mutating phase/session state (e.g. a concurrent
+                    // onTrackLost() re-bootstrap) — see [sessionLock].
+                    // resolveTrack(fix) deliberately stays OUTSIDE the lock:
+                    // it suspends (backend I/O), and a suspend call must
+                    // never happen while holding a plain JVM monitor.
+                    synchronized(sessionLock) {
+                        transition(SessionPhase.LOST)
+                        transition(SessionPhase.LISTENING)
+                        onMatchInFlight()
+                    }
                     resolveTrack(fix)
                 }
                 retry = shouldKeepSampling()
@@ -2199,17 +2307,24 @@ class SessionViewModel(
         controller: SpotifyController,
         state: SpotifyController.RemotePlayerState,
     ) {
-        endOfTrackJob?.cancel()
-        if (state.isPaused || state.durationMs <= 0) return
-        val remaining = state.durationMs - state.positionMs - END_OF_TRACK_LEAD_MS
-        endOfTrackJob = scope.launch(dispatcher) {
-            delay(remaining.coerceAtLeast(0L))
-            val uri = state.trackUri ?: return@launch
-            if (_syncState.value.track?.spotifyUri != uri) return@launch
-            com.jointheparty.app.debug.DebugLog.log(
-                "track ending — pausing before Spotify picks the next one",
-            )
-            stopFollowingAndRelisten(controller, uri)
+        // GRD-01 concurrency fix (#32): endOfTrackJob is read/cancelled/
+        // reassigned from every playerStateWatcher() collector — genuinely
+        // concurrent whenever more than one is alive at once (e.g. a fresh
+        // re-resolution's watcher racing a still-live older one, both on
+        // Dispatchers.Default). See [sessionLock].
+        synchronized(sessionLock) {
+            endOfTrackJob?.cancel()
+            if (state.isPaused || state.durationMs <= 0) return
+            val remaining = state.durationMs - state.positionMs - END_OF_TRACK_LEAD_MS
+            endOfTrackJob = scope.launch(dispatcher) {
+                delay(remaining.coerceAtLeast(0L))
+                val uri = state.trackUri ?: return@launch
+                if (_syncState.value.track?.spotifyUri != uri) return@launch
+                com.jointheparty.app.debug.DebugLog.log(
+                    "track ending — pausing before Spotify picks the next one",
+                )
+                stopFollowingAndRelisten(controller, uri)
+            }
         }
     }
 
@@ -2233,12 +2348,20 @@ class SessionViewModel(
      * missed — no duration reported, or the track changed for some other
      * reason (the user hit next in Spotify).
      */
+    // GRD-01 concurrency fix (#32): full body synchronized on [sessionLock].
+    // FT10 caught this exact check-then-act (`autoAdvanceHandled ==
+    // actualUri` here, `autoAdvanceHandled = uri` inside
+    // [stopFollowingAndRelisten]) double-firing from two threads — both
+    // passed the check before either wrote. Reentrant with
+    // [stopFollowingAndRelisten]'s own synchronized body below.
     private fun onSpotifyAutoAdvanced(controller: SpotifyController, actualUri: String) {
-        if (autoAdvanceHandled == actualUri) return  // one response per track
-        com.jointheparty.app.debug.DebugLog.log(
-            "Spotify auto-advanced to $actualUri — pausing to hear the room",
-        )
-        stopFollowingAndRelisten(controller, actualUri)
+        synchronized(sessionLock) {
+            if (autoAdvanceHandled == actualUri) return@synchronized  // one response per track
+            com.jointheparty.app.debug.DebugLog.log(
+                "Spotify auto-advanced to $actualUri — pausing to hear the room",
+            )
+            stopFollowingAndRelisten(controller, actualUri)
+        }
     }
 
     /**
@@ -2246,23 +2369,33 @@ class SessionViewModel(
      * the shared tail of both the end-of-track timer and the auto-advance
      * backstop. Our own speaker drowns out the room, so the pause has to land
      * before the microphone is worth sampling again.
+     *
+     * GRD-01 concurrency fix (#32): full body synchronized on [sessionLock]
+     * — this is the OTHER caller of [scheduleEndOfTrackPause]'s natural-end
+     * path in addition to [onSpotifyAutoAdvanced] above, so both routes to
+     * this shared tail serialize against each other and against every other
+     * guarded field ([autoAdvanceHandled], [endOfTrackJob], the phase
+     * transitions below).
      */
     private fun stopFollowingAndRelisten(controller: SpotifyController, uri: String) {
-        autoAdvanceHandled = uri
-        endOfTrackJob?.cancel()
-        controller.pause()
-        _syncState.update { it.copy(track = null) }
-        transition(SessionPhase.LOST)
-        if (!transition(SessionPhase.LISTENING)) return
-        if (recognition == null) return
-        firstEstimateSeen = false
-        samplingAttempts = 0
-        onMatchInFlight()
-        scope.launch(dispatcher) {
-            // The pause has to actually take effect before the mic is worth
-            // sampling, otherwise the first window still contains our audio.
-            delay(AUTO_ADVANCE_QUIET_MS)
-            runRecognitionPass()
+        synchronized(sessionLock) {
+            autoAdvanceHandled = uri
+            endOfTrackJob?.cancel()
+            controller.pause()
+            _syncState.update { it.copy(track = null) }
+            transition(SessionPhase.LOST)
+            if (!transition(SessionPhase.LISTENING)) return@synchronized
+            if (recognition == null) return@synchronized
+            firstEstimateSeen = false
+            samplingAttempts = 0
+            onMatchInFlight()
+            scope.launch(dispatcher) {
+                // The pause has to actually take effect before the mic is
+                // worth sampling, otherwise the first window still contains
+                // our audio.
+                delay(AUTO_ADVANCE_QUIET_MS)
+                runRecognitionPass()
+            }
         }
     }
 
@@ -2272,34 +2405,46 @@ class SessionViewModel(
      * (technical-requirements.md §2.4).
      */
     private fun onTrackLost() {
-        transition(SessionPhase.LOST)
-        consecutiveLosses += 1
-        if (consecutiveLosses < 3) {
-            transition(SessionPhase.LISTENING)
-            // FIELD FIX (2026-07-25, "does not handle the next song"): the
-            // auto-restart changed phase but never re-armed recognition —
-            // the bootstrap only ran from the Join tap, so after the room
-            // moved to the next track the app sat deaf in LISTENING
-            // forever. Re-bootstrap exactly like a fresh Join.
-            if (recognition != null) {
-                firstEstimateSeen = false
-                samplingAttempts = 0
-                // IDC-01 (tech-req §2.14): arm the identity corroboration
-                // gate for this re-bootstrap — shared with the aim-failure
-                // path in aimUntilLanded, one set of thresholds for both.
-                armIdentCorroboration()
-                onMatchInFlight()
-                scope.launch(dispatcher) {
-                    // Field Test 5: this was RECOGNITION_RETRY_MS / 2 (3 s) of
-                    // dead time added to an already slow re-acquire. The
-                    // capture window gates how soon a match is possible, so
-                    // there is nothing to gain by also waiting here.
-                    delay(REACQUIRE_FIRST_PASS_MS)
-                    runRecognitionPass()
+        // GRD-01 concurrency fix (#32): full body synchronized on
+        // [sessionLock] — [onTrackLost] itself is reachable from two
+        // different coroutines (the single engine-event collector, and
+        // [aimUntilLanded]'s give-up path on its own `startPlayback`
+        // coroutine), which can land on different Dispatchers.Default
+        // workers. Guards consecutiveLosses, the phase transitions below,
+        // and the IDC-01 arming as one atomic sequence.
+        synchronized(sessionLock) {
+            transition(SessionPhase.LOST)
+            consecutiveLosses += 1
+            if (consecutiveLosses < 3) {
+                transition(SessionPhase.LISTENING)
+                // FIELD FIX (2026-07-25, "does not handle the next song"): the
+                // auto-restart changed phase but never re-armed recognition —
+                // the bootstrap only ran from the Join tap, so after the room
+                // moved to the next track the app sat deaf in LISTENING
+                // forever. Re-bootstrap exactly like a fresh Join.
+                if (recognition != null) {
+                    firstEstimateSeen = false
+                    samplingAttempts = 0
+                    // IDC-01 (tech-req §2.14): arm the identity
+                    // corroboration gate for this re-bootstrap. This is the
+                    // gate's ONE direct arming call site — aimUntilLanded's
+                    // give-up path reaches it only indirectly, by calling
+                    // onTrackLost() itself (issue #37: this comment
+                    // previously implied aimUntilLanded armed it directly).
+                    armIdentCorroboration()
+                    onMatchInFlight()
+                    scope.launch(dispatcher) {
+                        // Field Test 5: this was RECOGNITION_RETRY_MS / 2 (3 s)
+                        // of dead time added to an already slow re-acquire. The
+                        // capture window gates how soon a match is possible, so
+                        // there is nothing to gain by also waiting here.
+                        delay(REACQUIRE_FIRST_PASS_MS)
+                        runRecognitionPass()
+                    }
                 }
+            } else {
+                transition(SessionPhase.ERROR)
             }
-        } else {
-            transition(SessionPhase.ERROR)
         }
     }
 
@@ -2309,10 +2454,18 @@ class SessionViewModel(
      * The single gate every phase change passes through. Illegal
      * transitions are ignored silently — no exception, no log — per UI-02.
      * Returns whether the transition was applied.
+     *
+     * GRD-01 concurrency fix (#32): the from-read + legality check + state
+     * write below is synchronized on [sessionLock] as one atomic unit. FT10
+     * caught this exact check-then-act letting two threads both pass
+     * `isLegalTransition` for the same duplicated LOST→LISTENING→MATCHING
+     * chain. Reentrant — every caller of [transition] that itself already
+     * holds [sessionLock] (e.g. [onTrackLost], [stopFollowingAndRelisten])
+     * nests into this same monitor for free.
      */
-    private fun transition(to: SessionPhase): Boolean {
+    private fun transition(to: SessionPhase): Boolean = synchronized(sessionLock) {
         val from = _syncState.value.phase
-        if (!isLegalTransition(from, to)) return false
+        if (!isLegalTransition(from, to)) return@synchronized false
         if (to == SessionPhase.LOCKED) {
             consecutiveLosses = 0
             // CAL-04: start the referee's interval from the moment we lock,
@@ -2322,7 +2475,7 @@ class SessionViewModel(
         }
         _syncState.update { it.copy(phase = to) }
         com.jointheparty.app.debug.DebugLog.log("phase: $from → $to")
-        return true
+        true
     }
 
     private fun isLegalTransition(from: SessionPhase, to: SessionPhase): Boolean {

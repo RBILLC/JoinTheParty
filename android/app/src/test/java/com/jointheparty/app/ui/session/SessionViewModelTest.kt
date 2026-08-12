@@ -11,17 +11,25 @@ import com.jointheparty.app.data.CalibrationProfile
 import com.jointheparty.app.data.NudgeStore
 import com.jointheparty.app.data.sortedByUpdatedAtDescending
 import com.jointheparty.app.recognition.RecognitionProvider
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.filterIsInstance
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -1519,6 +1527,184 @@ class SessionViewModelTest {
             "FT9's three-restart churn must produce zero guardian firings",
             emptyList<String>(), callLog,
         )
+    }
+
+    // ---- GRD-01 concurrency fix (GitHub #32, reopened by field-test-10)
+    // ------------------------------------------------------------------
+    //
+    // FT10 crashed the app with a FATAL IndexOutOfBoundsException inside
+    // consumeSelfPlayLatch, and separately caught the auto-advance guardian
+    // double-firing from two threads — both real-multi-thread-only races
+    // invisible to every test above, which all run on the single-threaded
+    // StandardTestDispatcher/runTest virtual scheduler (exactly what let
+    // the original unsynchronized fix ship and pass CI in the first
+    // place). These tests use a REAL multi-threaded dispatcher (a fixed
+    // thread pool, not virtual time) to reproduce the same shape of
+    // contention.
+    //
+    // consumeSelfPlayLatch/latchSelfPlay/onSpotifyAutoAdvanced are private
+    // — reached here via reflection so the tests can hammer the exact
+    // mutation sites FT10's crash trace named, on many real threads, at
+    // high volume, without also needing the full-blown phase-transition
+    // gate (transition() is itself now synchronized/idempotent and would
+    // otherwise serialize most concurrent onTrackResolved-style calls
+    // before they ever reached the racy primitives).
+    //
+    // Verified manually (not part of this suite): a standalone class
+    // mirroring the OLD unsynchronized selfPlayLatch/latchSelfPlay/
+    // consumeSelfPlayLatch shape byte-for-byte, stress-tested with this
+    // exact harness (20,000 concurrent latch+consume pairs on an 8-thread
+    // pool), produced 21,102 corruption errors out of 40,000 concurrent
+    // consume attempts (NullPointerException from java.util.ArrayList.
+    // remove racing itself — the same "unsynchronized ArrayList mutated
+    // from multiple Dispatchers.Default workers" failure family as FT10's
+    // IndexOutOfBoundsException). The tests below run the identical load
+    // against the real, now-synchronized SessionViewModel and must produce
+    // zero errors.
+
+    @Test
+    fun consumeSelfPlayLatchSurvivesConcurrentLatchAndConsumeChurn() {
+        val pool = Executors.newFixedThreadPool(8)
+        val realDispatcher = pool.asCoroutineDispatcher()
+        try {
+            val vm = SessionViewModel(FakeSyncEngine(), FakeNudgeStore(), realDispatcher)
+            val latchSelfPlay = SessionViewModel::class.java.getDeclaredMethod(
+                "latchSelfPlay", String::class.java,
+            ).apply { isAccessible = true }
+            val consumeSelfPlayLatch = SessionViewModel::class.java.getDeclaredMethod(
+                "consumeSelfPlayLatch", String::class.java,
+            ).apply { isAccessible = true }
+            val errors = CopyOnWriteArrayList<Throwable>()
+
+            runBlocking(realDispatcher) {
+                val jobs = (0 until 20_000).map { i ->
+                    launch {
+                        // A small uri keyspace (8) keeps SELF_PLAY_LATCH_MAX_
+                        // ENTRIES (4) eviction churning too — [latchSelfPlay]'s
+                        // OWN removeAt(0) eviction is a second concurrent
+                        // mutator racing every consumer, on top of the
+                        // per-entry expiry job.
+                        val uri = "spotify:track:${i % 8}"
+                        try {
+                            latchSelfPlay.invoke(vm, uri)
+                            // Race a consumer against the just-latched entry
+                            // from a DIFFERENT coroutine, likely a different
+                            // real thread on this 8-worker pool.
+                            launch {
+                                try {
+                                    consumeSelfPlayLatch.invoke(vm, uri)
+                                } catch (t: java.lang.reflect.InvocationTargetException) {
+                                    errors += t.targetException
+                                }
+                            }
+                            consumeSelfPlayLatch.invoke(vm, uri)
+                        } catch (t: java.lang.reflect.InvocationTargetException) {
+                            errors += t.targetException
+                        }
+                    }
+                }
+                jobs.forEach { it.join() }
+            }
+
+            assertTrue(
+                "consumeSelfPlayLatch must not throw under real concurrent " +
+                    "latch/consume/evict churn (GRD-01, #32): ${errors.firstOrNull()}",
+                errors.isEmpty(),
+            )
+        } finally {
+            pool.shutdown()
+        }
+    }
+
+    @Test
+    fun consumeSelfPlayLatchSurvivesConcurrentEntryExpiryRace() {
+        // Exercises the OTHER mutation site FT10's crash analysis named
+        // specifically: an entry's own scheduled expiry job (`delay(
+        // SELF_PLAY_LATCH_WINDOW_MS); selfPlayLatch.removeAll {...}`)
+        // racing concurrent consumers, on a real dispatcher. This is a
+        // genuine ~5s real-time wait — SELF_PLAY_LATCH_WINDOW_MS is a
+        // compile-time constant, not test-injectable.
+        val pool = Executors.newFixedThreadPool(8)
+        val realDispatcher = pool.asCoroutineDispatcher()
+        try {
+            val vm = SessionViewModel(FakeSyncEngine(), FakeNudgeStore(), realDispatcher)
+            val latchSelfPlay = SessionViewModel::class.java.getDeclaredMethod(
+                "latchSelfPlay", String::class.java,
+            ).apply { isAccessible = true }
+            val consumeSelfPlayLatch = SessionViewModel::class.java.getDeclaredMethod(
+                "consumeSelfPlayLatch", String::class.java,
+            ).apply { isAccessible = true }
+            val errors = CopyOnWriteArrayList<Throwable>()
+            val uris = (0 until 4).map { "spotify:track:exp$it" } // fills the ring exactly
+
+            runBlocking(realDispatcher) {
+                uris.forEach { uri -> latchSelfPlay.invoke(vm, uri) }
+                // Hammer consumeSelfPlayLatch across the whole ~5s window so
+                // calls land both well before AND right at/after each
+                // entry's own expiry removeAll fires — FT10's exact race.
+                val hammer = launch {
+                    while (isActive) {
+                        uris.forEach { uri ->
+                            try {
+                                consumeSelfPlayLatch.invoke(vm, uri)
+                            } catch (t: java.lang.reflect.InvocationTargetException) {
+                                errors += t.targetException
+                            }
+                        }
+                    }
+                }
+                delay(5_500L)
+                hammer.cancelAndJoin()
+            }
+
+            assertTrue(
+                "consumeSelfPlayLatch must not throw when raced against its " +
+                    "own entry's scheduled expiry (GRD-01, #32): ${errors.firstOrNull()}",
+                errors.isEmpty(),
+            )
+        } finally {
+            pool.shutdown()
+        }
+    }
+
+    @Test
+    fun autoAdvanceGuardianFiresExactlyOnceUnderConcurrentDuplicateReports() {
+        // FT10's second race: two threads (13606/13849) both passed
+        // onSpotifyAutoAdvanced's `autoAdvanceHandled == actualUri`
+        // check-then-act before either wrote, and both ran the full
+        // pause/LOST/re-listen sequence. Reproduced here with 200
+        // concurrent reports of the SAME auto-advance on a real 8-thread
+        // pool — exactly one must actually pause.
+        val pool = Executors.newFixedThreadPool(8)
+        val realDispatcher = pool.asCoroutineDispatcher()
+        try {
+            val spotify = FakeSpotifyController()
+            val callLog = CopyOnWriteArrayList<String>()
+            spotify.probeCallLog = callLog
+            val vm = SessionViewModel(
+                FakeSyncEngine(), FakeNudgeStore(), realDispatcher, spotify = spotify,
+            )
+            val onSpotifyAutoAdvanced = SessionViewModel::class.java.getDeclaredMethod(
+                "onSpotifyAutoAdvanced", SpotifyController::class.java, String::class.java,
+            ).apply { isAccessible = true }
+
+            val uri = "spotify:track:duplicate-auto-advance"
+            runBlocking(realDispatcher) {
+                val jobs = (0 until 200).map {
+                    launch { onSpotifyAutoAdvanced.invoke(vm, spotify, uri) }
+                }
+                jobs.forEach { it.join() }
+            }
+
+            assertEquals(
+                "the check-then-act dedup on autoAdvanceHandled must serialize so " +
+                    "only ONE of 200 concurrent reports of the same auto-advance " +
+                    "actually pauses (GRD-01, #32)",
+                1, callLog.count { it == "pause" },
+            )
+        } finally {
+            pool.shutdown()
+        }
     }
 
     // ---- IDC-01: identity corroboration gate (technical-requirements.md
