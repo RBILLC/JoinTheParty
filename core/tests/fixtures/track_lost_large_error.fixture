@@ -1,0 +1,27 @@
+# CORE-07 fixture. See docs/core07-review.md for the full grammar.
+#
+# A true offset well past lost_threshold_ms (2000 ms default) from the very
+# first fix — the "re-listen, don't chase it" path (architecture-spec
+# §6.2/§2.4). Keeps precedence over every other gate (large-correction hold,
+# persistence gate, settled hysteresis).
+
+name: track_lost_large_error
+desc: 3000 ms constant offset, past lost_threshold_ms; must declare track lost rather than chase it with seeks.
+tags: track-lost,negative-control
+snr_db: 15
+source: synthetic
+
+mode: world
+world.true_error0_ms: 3000
+world.drift_ms_per_s: 0
+world.local_start_ms: 60000
+
+fixes.schedule: auto
+fixes.noise_ms: 5
+fixes.confidence: 0.9
+fixes.apply_seeks: true
+
+horizon_s: 60
+
+expect.track_lost: true
+expect.min_fixes: 1

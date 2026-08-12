@@ -118,4 +118,13 @@ if(SYNCCORE_BUILD_TESTS)
     add_executable(synccore_abi_c_check tests/abi_c_check.c)
     target_link_libraries(synccore_abi_c_check PRIVATE synccore)
     add_test(NAME synccore_abi_c_check COMMAND synccore_abi_c_check)
+
+    # CORE-07: fixture regression suite. Every tests/fixtures/*.fixture file
+    # is discovered and replayed at runtime (see test_fixture_suite.cpp) —
+    # adding a new regression case is a new data file, never a CMake or C++
+    # change. The fixtures directory is baked in as an absolute path so the
+    # test runs correctly regardless of which build directory invokes it.
+    synccore_add_test(fixture_tests tests/test_fixture_suite.cpp)
+    target_compile_definitions(fixture_tests PRIVATE
+        SYNCCORE_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 endif()

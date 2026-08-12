@@ -1,0 +1,38 @@
+# CORE-07 fixture. See docs/core07-review.md for the full grammar.
+#
+# tech-req §2.8 Part B (CTL-03b). Field Test 8's headline defect: a single
+# conf-0.74 fix landed 1259 ms off mid-stream and stood uncorrected because
+# the estimator's own outlier gate is inactive at mid-uncertainty. The data-
+# driven twin of test_policy.cpp's test_closed_loop_phantom_large_fix_held:
+# one clean bootstrap fix, a long gap (regrows the posterior variance past
+# outlier_gate_max_p00), then the phantom — which the large-correction hold
+# must refuse to fire from alone — followed by ordinary policy-driven fixes
+# that pull the estimate back to the true (zero) error.
+
+name: phantom_large_fix_held
+desc: One clean fix, then (after a long gap) a single conf-0.74 fix reading 1259 ms off; the large-correction hold must never fire it alone.
+tags: ctl-03,large-correction,ft8
+snr_db: 18
+source: reconstructed from docs/field-test-8-results.md (mirrors test_policy.cpp's phantom-fix simulation)
+
+mode: world
+world.true_error0_ms: 0
+world.drift_ms_per_s: 0
+world.local_start_ms: 60000
+
+fixes.schedule: explicit
+fixes.continue_auto: true
+fixes.noise_ms: 3
+fixes.confidence: 0.9
+fixes.apply_seeks: true
+
+# t_s   confidence  noise_ms(perturbation added to the true-model offset)
+FIX 1.0     0.9    0
+FIX 1000.0  0.74   1259
+
+horizon_s: 1400
+
+expect.track_lost: false
+expect.max_large_seeks: 0
+expect.final_abs_error_ms_max: 25
+expect.min_fixes: 5

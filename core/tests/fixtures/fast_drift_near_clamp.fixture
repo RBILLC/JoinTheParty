@@ -1,0 +1,29 @@
+# CORE-07 fixture. See docs/core07-review.md for the full grammar.
+#
+# 800 ppm true drift — at the estimator's own drift_clamp_ms_per_s bound
+# (0.8 ms/s, EstimatorConfig's physical sanity clamp against runaway drift
+# states per Field Test 2). Stresses the pre-emptive skew-correction path
+# (architecture-spec §6.3) right at the edge the clamp exists to survive,
+# rather than well inside it like sawtooth_drift_500ppm.fixture.
+
+name: fast_drift_near_clamp
+desc: 800 ppm true drift, at the estimator's drift_clamp_ms_per_s bound; recurring pre-emptive corrections must keep tracking it.
+tags: drift,edge-case
+snr_db: 16
+source: synthetic
+
+mode: world
+world.true_error0_ms: 100
+world.drift_ms_per_s: 0.8
+world.local_start_ms: 60000
+
+fixes.schedule: auto
+fixes.noise_ms: 3
+fixes.confidence: 0.9
+fixes.apply_seeks: true
+
+horizon_s: 400
+
+expect.track_lost: false
+expect.min_seeks: 3
+expect.min_fixes: 10

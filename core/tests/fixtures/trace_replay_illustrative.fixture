@@ -1,0 +1,66 @@
+# CORE-07 fixture. See docs/core07-review.md for the full grammar.
+#
+# Demonstrates `mode: trace` end-to-end: FIX rows carry a literal absolute
+# offset_ms, exactly the shape a converter from real captured recognition
+# fixes (timestamp, offset, confidence — e.g. adb-logged CORRECTION/fix
+# lines, or raw ACRCloud match responses) would produce. IMPORTANT
+# PROVENANCE NOTE: the offset numbers below are HAND-AUTHORED to be
+# internally consistent (constant ~285 ms true offset + tiny alternating
+# noise, modeled on the shape of docs/field-test-9-results.md's Vienna
+# episode) — they are not a literal transcription of a raw field capture,
+# because the repo does not yet have one on disk with the necessary
+# per-fix (timestamp, offset_ms, confidence) triples. When a real capture
+# becomes available, replace the FIX table below with the transcribed
+# values and expect.true_error_ms with the independently measured (mic)
+# ground truth; nothing else about this fixture's shape needs to change.
+
+name: trace_replay_illustrative
+desc: Illustrative literal FIX-row replay (mode=trace) at a constant ~285 ms offset; demonstrates the mechanism real captures will use.
+tags: trace-mode,mechanism-demo
+snr_db: 22
+source: hand-authored, modeled on docs/field-test-9-results.md's Vienna episode shape — see provenance note above
+
+mode: trace
+world.local_start_ms: 60000
+# Both the policy's AND the estimator's own deadband must widen for the
+# persistence gate to have anything to act on — Estimate.converged (set off
+# EstimatorConfig.deadband_ms) gates entry into the ring in the first place.
+policy.deadband_ms: 350
+estimator.deadband_ms: 350
+fixes.apply_seeks: false
+
+# t_s     offset_ms  confidence  skew
+FIX 1.0     60718      0.90        0
+FIX 11.0    70712      0.90        0
+FIX 21.0    80718      0.90        0
+FIX 31.0    90712      0.90        0
+FIX 41.0    100718     0.90        0
+FIX 51.0    110712     0.90        0
+FIX 61.0    120718     0.90        0
+FIX 71.0    130712     0.90        0
+FIX 81.0    140718     0.90        0
+FIX 91.0    150712     0.90        0
+FIX 101.0   160718     0.90        0
+FIX 111.0   170712     0.90        0
+FIX 121.0   180718     0.90        0
+FIX 131.0   190712     0.90        0
+FIX 141.0   200718     0.90        0
+FIX 151.0   210712     0.90        0
+FIX 161.0   220718     0.90        0
+FIX 171.0   230712     0.90        0
+FIX 181.0   240718     0.90        0
+
+horizon_s: 200
+
+# No expect.max_seeks here: with fixes.apply_seeks=false the runner never
+# calls on_seek_issued, so nothing ever tells the policy a correction
+# landed and the persistence gate keeps re-qualifying the same literal
+# residual on its own settle cadence — repeated firing is the expected
+# shape for an un-actuated trace replay, not a regression signal. The
+# property this fixture actually pins is the mechanism: the trace-mode
+# path drives the real estimator/policy and converges near ground truth.
+expect.true_error_ms: 285
+expect.track_lost: false
+expect.min_seeks: 1
+expect.final_abs_error_ms_max: 125
+expect.min_fixes: 15

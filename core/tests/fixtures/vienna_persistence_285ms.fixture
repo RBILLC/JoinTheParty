@@ -1,0 +1,41 @@
+# CORE-07 fixture. See docs/core07-review.md for the full grammar.
+#
+# tech-req §2.7 (CTL-02), modeled on Field Test 8/9's "Vienna" episode:
+# Android's widened 350 ms deadband never sees a constant ~285 ms echo, so
+# only the persistence gate (a corroborated cluster above confirm_floor_ms)
+# can close it. docs/field-test-9-results.md's own log line
+# ("seek 164432ms (jump 277ms) e=-172 conf=0.83") confirms this path fires
+# for real; this fixture is a synthetic reconstruction of that shape, not a
+# literal replay of that session's raw fixes (see the "trace" mode fixture
+# for the literal-replay mechanism).
+
+name: vienna_persistence_285ms
+desc: Constant ~285 ms offset inside the widened 350 ms Android deadband; only the CTL-02 persistence gate can close it.
+tags: persistence,ctl-02,ft8,ft9
+snr_db: 22
+source: reconstructed from docs/field-test-8-results.md and docs/field-test-9-results.md (not a literal replay)
+
+mode: world
+world.true_error0_ms: 285
+world.drift_ms_per_s: 0
+world.local_start_ms: 60000
+
+# Both the policy's AND the estimator's own deadband must widen: Estimate.
+# converged (set inside SyncEstimator off its own EstimatorConfig.deadband_ms)
+# gates entry into the persistence ring in the first place — mirrors
+# test_policy.cpp's test_closed_loop_vienna_persistence, which sets both.
+policy.deadband_ms: 350
+estimator.deadband_ms: 350
+
+fixes.schedule: auto
+fixes.noise_ms: 3
+fixes.confidence: 0.9
+fixes.apply_seeks: true
+
+horizon_s: 300
+
+expect.track_lost: false
+expect.min_seeks: 1
+expect.max_seeks: 3
+expect.final_abs_error_ms_max: 125
+expect.min_fixes: 5

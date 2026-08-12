@@ -1,0 +1,31 @@
+# CORE-07 fixture. See docs/core07-review.md for the full grammar.
+#
+# 60 ms constant offset, clearly outside the 25 ms deadband but well below
+# any of the large-correction/track-lost machinery. The textbook
+# instantaneous-deadband path (tech-req architecture-spec §6.2): one seek,
+# then hold.
+
+name: moderate_offset_single_correction
+desc: 60 ms constant offset outside the default deadband; one correction, then holds.
+tags: baseline,healthy
+snr_db: 25
+source: synthetic
+
+mode: world
+world.true_error0_ms: 60
+world.drift_ms_per_s: 0
+world.local_start_ms: 60000
+
+fixes.schedule: auto
+fixes.noise_ms: 3
+fixes.confidence: 0.9
+fixes.apply_seeks: true
+
+horizon_s: 120
+
+expect.track_lost: false
+expect.converged: true
+expect.final_abs_error_ms_max: 25
+expect.min_seeks: 1
+expect.max_seeks: 2
+expect.min_fixes: 5

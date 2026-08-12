@@ -1,0 +1,32 @@
+# CORE-07 fixture. See docs/core07-review.md for the full grammar.
+#
+# The data-driven twin of test_policy.cpp's
+# test_closed_loop_sawtooth_within_deadband: an external speaker running
+# 0.05% (500 ppm) fast, initial mis-sync of 350 ms. The loop must issue
+# recurring pre-emptive corrections and keep the sawtooth's peaks inside a
+# loose bound (tighter, exact-window CORE-03 acceptance stays in
+# test_policy.cpp — this fixture is the coarser regression net over the same
+# scenario shape, run through the *.fixture path instead of hand-written C++).
+
+name: sawtooth_drift_500ppm
+desc: 500 ppm fast external clock, 350 ms initial offset; recurring pre-emptive corrections hold the sawtooth inside a loose bound.
+tags: drift,ctl-03,skew
+snr_db: 20
+source: synthetic (mirrors test_policy.cpp's sawtooth simulation)
+
+mode: world
+world.true_error0_ms: 350
+world.drift_ms_per_s: 0.5
+world.local_start_ms: 60000
+
+fixes.schedule: auto
+fixes.noise_ms: 3
+fixes.confidence: 0.9
+fixes.apply_seeks: true
+
+horizon_s: 600
+
+expect.track_lost: false
+expect.min_seeks: 2
+expect.final_abs_error_ms_max: 30
+expect.min_fixes: 15

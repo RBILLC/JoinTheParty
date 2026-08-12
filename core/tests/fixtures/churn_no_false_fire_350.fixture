@@ -1,0 +1,36 @@
+# CORE-07 fixture. See docs/core07-review.md for the full grammar.
+#
+# The deadband-150 lesson (Field Test 8 addendum), generalized to the
+# shipped 350 ms Android deadband: fixes scattered wide (the song's own
+# beat-comb scatter) around a TRUE error of zero must never persistence-
+# fire, no matter how long the session runs. The data-driven twin of
+# test_policy.cpp's test_closed_loop_stability_no_churn_at_350.
+
+name: churn_no_false_fire_350
+desc: Wide alternating scatter around zero true error at the 350 ms Android deadband; must never fire (the deadband-150 lesson).
+tags: persistence,negative-control,ft8
+snr_db: 12
+source: synthetic (mirrors test_policy.cpp's stability simulation)
+
+mode: world
+world.true_error0_ms: 0
+world.drift_ms_per_s: 0
+world.local_start_ms: 60000
+
+# Both the policy's AND the estimator's own deadband must widen — otherwise
+# Estimate.converged never sets and the persistence ring this fixture means
+# to stress never gets populated in the first place. Mirrors
+# test_policy.cpp's test_closed_loop_stability_no_churn_at_350.
+policy.deadband_ms: 350
+estimator.deadband_ms: 350
+
+fixes.schedule: auto
+fixes.noise_ms: 300
+fixes.confidence: 0.9
+fixes.apply_seeks: true
+
+horizon_s: 330
+
+expect.track_lost: false
+expect.max_seeks: 0
+expect.min_fixes: 10

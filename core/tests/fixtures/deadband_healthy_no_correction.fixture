@@ -1,0 +1,30 @@
+# CORE-07 fixture. See docs/core07-review.md for the full grammar.
+#
+# A cluster of fixes reading a constant offset already inside the default
+# 25 ms deadband. Nothing should ever fire — this is the negative-control
+# twin of calm_quick_lock.fixture, guarding against an over-eager policy
+# regression (the deadband-150/churn-at-350 lesson generalizes down here).
+
+name: deadband_healthy_no_correction
+desc: Constant 15 ms offset, inside the default deadband; must never correct.
+tags: baseline,healthy,negative-control
+snr_db: 30
+source: synthetic
+
+mode: world
+world.true_error0_ms: 15
+world.drift_ms_per_s: 0
+world.local_start_ms: 60000
+
+fixes.schedule: auto
+fixes.noise_ms: 4
+fixes.confidence: 0.9
+fixes.apply_seeks: true
+
+horizon_s: 90
+
+expect.track_lost: false
+expect.converged: true
+expect.final_abs_error_ms_max: 20
+expect.max_seeks: 0
+expect.min_fixes: 4

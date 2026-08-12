@@ -1,0 +1,31 @@
+# CORE-07 fixture. See docs/core07-review.md for the full grammar.
+#
+# The common case: a moderate initial offset just outside the default
+# deadband, clean fixes, no drift. Mostly a canary against any estimator/
+# policy regression that starts firing extra corrections — or stops firing
+# the one it should — where the field-tested behavior is "converge, correct
+# once, hold."
+
+name: calm_quick_lock
+desc: Small stable offset just outside the default 25 ms deadband; single clean correction, quick convergence, no drift.
+tags: baseline,healthy
+snr_db: 28
+source: synthetic (house convention, matches test_estimator.cpp's World model)
+
+mode: world
+world.true_error0_ms: 40
+world.drift_ms_per_s: 0
+world.local_start_ms: 60000
+
+fixes.schedule: auto
+fixes.noise_ms: 4
+fixes.confidence: 0.9
+fixes.apply_seeks: true
+
+horizon_s: 120
+
+expect.track_lost: false
+expect.converged: true
+expect.final_abs_error_ms_max: 15
+expect.max_seeks: 2
+expect.min_fixes: 5
