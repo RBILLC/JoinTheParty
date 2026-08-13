@@ -1893,6 +1893,223 @@ class SessionViewModelTest {
         assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
     }
 
+    // ---- IDC-02 (GitHub #37): fast-switch corroboration + reduced
+    // relisten gate -------------------------------------------------------
+    //
+    // Fast-switch tests run without a [FakeSpotifyController] wired to
+    // [SessionViewModel] (spotify stays the default null): [isOffsetWildlyOff]
+    // reads `spotify?.lastKnownPlayerState`, which is null either way, so it
+    // returns true (wildly off) unconditionally — exactly the condition the
+    // fast-switch branch needs, without having to fabricate agreeing player
+    // states. [startPlayback] itself no-ops when `spotify` is null (returns
+    // right after `val controller = spotify ?: return`), so the ViewModel
+    // settles in AIMING with `track` set and nothing further to await —
+    // the same shape [aimFailureForcesLostListeningMatchingRebootstrapAndArmsCorroboration]
+    // above already establishes is a safe, deterministic test seam for this
+    // phase.
+
+    @Test
+    fun fastSwitchSingleWildlyOffFixDoesNotSwitch() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val fixX = fixResult("spotify:track:X", 10_000L, 0L)
+        val fixY1 = fixResult("spotify:track:Y", 50_000L, 1_000_000_000L)
+        val recognition = FakeQueuedRecognitionProvider(listOf(fixX, fixY1))
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, recognition)
+
+        vm.startListening()
+        advanceUntilIdle() // resolves fixX (cold start) -> AIMING, track=X
+
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY1: different uri, wildly off -> candidate opened, no switch
+
+        assertEquals(
+            "a single different-URI fast-switch fix must not actuate on its own (#37 decision 1)",
+            SessionPhase.AIMING, vm.syncState.value.phase,
+        )
+        assertEquals("spotify:track:X", vm.syncState.value.track?.spotifyUri)
+        // The pending fix still fed the engine as a sync observation --
+        // that existing behavior is unchanged while a candidate is pending.
+        assertEquals(2, engine.submittedFixes.size)
+    }
+
+    @Test
+    fun fastSwitchSecondAgreeingFixSwitchesCleanly() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val fixX = fixResult("spotify:track:X", 10_000L, 0L)
+        val fixY1 = fixResult("spotify:track:Y", 50_000L, 1_000_000_000L)
+        // Δoffset tracks Δwall-clock within 500 ms -- agrees with fixY1.
+        val fixY2 = fixResult("spotify:track:Y", 52_000L, 3_000_000_000L)
+        val recognition = FakeQueuedRecognitionProvider(listOf(fixX, fixY1, fixY2))
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, recognition)
+
+        vm.startListening()
+        advanceUntilIdle() // resolves fixX -> AIMING, track=X
+
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY1: candidate opened, no switch
+        assertEquals(SessionPhase.AIMING, vm.syncState.value.phase)
+        assertEquals("spotify:track:X", vm.syncState.value.track?.spotifyUri)
+
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY2 agrees -> ONE clean LOST->LISTENING->re-aim switch
+
+        assertEquals(SessionPhase.AIMING, vm.syncState.value.phase)
+        assertEquals("spotify:track:Y", vm.syncState.value.track?.spotifyUri)
+        // identCorrobArmed is never touched by the fast-switch path -- the
+        // switch's own resolveTrack(fix) call resolves immediately because
+        // !identCorrobArmed (unarmed), not because of a 2-fix gate on THAT
+        // separate machinery.
+        val identCorrobArmedField = SessionViewModel::class.java.getDeclaredField("identCorrobArmed")
+            .apply { isAccessible = true }
+        assertFalse(
+            "the fast-switch candidate must not arm the unrelated IDC-01 gate",
+            identCorrobArmedField.get(vm) as Boolean,
+        )
+    }
+
+    @Test
+    fun fastSwitchNonAgreeingSecondFixRestartsTheCandidate() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val fixX = fixResult("spotify:track:X", 10_000L, 0L)
+        val fixY1 = fixResult("spotify:track:Y", 50_000L, 1_000_000_000L)
+        // A DIFFERENT uri than the pending candidate's -- must restart at Z,
+        // not accumulate toward a switch involving Y.
+        val fixZ1 = fixResult("spotify:track:Z", 90_000L, 5_000_000_000L)
+        // Agrees with fixZ1 (Δoffset 2000 vs Δwall 2000).
+        val fixZ2 = fixResult("spotify:track:Z", 92_000L, 7_000_000_000L)
+        val recognition = FakeQueuedRecognitionProvider(listOf(fixX, fixY1, fixZ1, fixZ2))
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, recognition)
+
+        vm.startListening()
+        advanceUntilIdle() // resolves fixX -> AIMING, track=X
+
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY1: candidate opened on Y
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixZ1: different uri than the Y candidate -> restarts at Z
+        assertEquals(
+            "a non-agreeing (here: different-URI) fix must restart, not accumulate, the candidate",
+            SessionPhase.AIMING, vm.syncState.value.phase,
+        )
+        assertEquals("spotify:track:X", vm.syncState.value.track?.spotifyUri)
+
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixZ2 agrees with the RESTARTED (Z) candidate -> switches to Z
+
+        assertEquals(SessionPhase.AIMING, vm.syncState.value.phase)
+        assertEquals("spotify:track:Z", vm.syncState.value.track?.spotifyUri)
+    }
+
+    @Test
+    fun fastSwitchCandidateExpiresViaMaxAgeRule() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val fixX = fixResult("spotify:track:X", 10_000L, 0L)
+        val fixY1 = fixResult("spotify:track:Y", 50_000L, 1_000_000_000L) // t=1s
+        // > IDENT_CORROB_MAX_AGE_MS (30s) after fixY1's own captureMonoNs --
+        // the pending candidate expires before the agreement check even
+        // runs, so fixY2 becomes a brand-new candidate instead of the
+        // confirming second fix (whether or not it would numerically have
+        // "agreed" with fixY1 is moot: expiry short-circuits that check).
+        val fixY2 = fixResult("spotify:track:Y", 52_000L, 32_000_000_000L) // t=32s
+        // Agrees with fixY2 (Δoffset 2000 vs Δwall 2000) -- only reachable
+        // if fixY2 became a FRESH candidate (i.e. the pre-expiry fixY1
+        // candidate was really cleared, not silently still counted).
+        val fixY3 = fixResult("spotify:track:Y", 54_000L, 34_000_000_000L) // t=34s
+        val recognition = FakeQueuedRecognitionProvider(listOf(fixX, fixY1, fixY2, fixY3))
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, recognition)
+
+        vm.startListening()
+        advanceUntilIdle() // resolves fixX -> AIMING, track=X
+
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY1: candidate opened at t=1s
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY2 (t=32s): candidate is >30s stale -> expires,
+        // fixY2 becomes a FRESH candidate instead of confirming
+        assertEquals(
+            "a fast-switch candidate older than IDENT_CORROB_MAX_AGE_MS must expire, not confirm",
+            SessionPhase.AIMING, vm.syncState.value.phase,
+        )
+        assertEquals("spotify:track:X", vm.syncState.value.track?.spotifyUri)
+
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY3 agrees with the FRESH (post-expiry) candidate -> switches
+        assertEquals(SessionPhase.AIMING, vm.syncState.value.phase)
+        assertEquals("spotify:track:Y", vm.syncState.value.track?.spotifyUri)
+    }
+
+    @Test
+    fun naturalEndRelistenRequiresTwoAgreeingFixesNotOne() = runTest(testDispatcher) {
+        // Decision 2 (#37): stopFollowingAndRelisten -- the shared tail of
+        // both the end-of-track timer and the auto-advance backstop -- arms
+        // a REDUCED 2-fix gate. Invoked via reflection on the private
+        // method directly (same seam as
+        // [autoAdvanceGuardianFiresExactlyOnceUnderConcurrentDuplicateReports]
+        // above), which exercises exactly the shared tail both real paths
+        // funnel through without needing to fabricate a full player-state
+        // event sequence.
+        //
+        // The ViewModel itself is built WITHOUT a `spotify` controller (the
+        // `controller` argument below is only used by stopFollowingAndRelisten
+        // for its own `.pause()` call) -- same "spotify stays null" seam the
+        // fast-switch tests above use, so a confirmed resolution settles in
+        // AIMING via startPlayback's null-controller no-op instead of
+        // cascading into a real (and here irrelevant) aim-verification loop.
+        val engine = FakeSyncEngine()
+        val looseController = FakeSpotifyController()
+        val fixY1 = fixResult("spotify:track:Y", 50_000L, 1_000_000_000L)
+        val fixY2 = fixResult("spotify:track:Y", 52_000L, 3_000_000_000L)
+        val recognition = FakeQueuedRecognitionProvider(listOf(fixY1, fixY2))
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, recognition)
+
+        val stopFollowingAndRelisten = SessionViewModel::class.java.getDeclaredMethod(
+            "stopFollowingAndRelisten", SpotifyController::class.java, String::class.java,
+        ).apply { isAccessible = true }
+        stopFollowingAndRelisten.invoke(vm, looseController, "spotify:track:OLD")
+        advanceUntilIdle() // quiet window elapses -> first pass consumes fixY1 (streak 1/2)
+
+        assertEquals(
+            "one fix after a natural-end/auto-advance relisten must not resolve alone",
+            SessionPhase.MATCHING, vm.syncState.value.phase,
+        )
+
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY2 agrees -> streak 2/2 -> corroborated
+
+        assertEquals(SessionPhase.AIMING, vm.syncState.value.phase)
+        assertEquals("spotify:track:Y", vm.syncState.value.track?.spotifyUri)
+    }
+
+    @Test
+    fun trackLostRelistenStillRequiresThreeFixesAfterIdc02() = runTest(testDispatcher) {
+        // Regression guard: IDC-02 must not have loosened onTrackLost's own
+        // gate -- it stays at the full IDENT_CONFIRM_MIN_FIXES (3), the same
+        // guarantee identityCorroborationResolvesOnThirdAgreeingFixNotTheFirst
+        // pins above, re-asserted here specifically alongside the new
+        // parametrization to catch a wrong default creeping into
+        // armIdentCorroboration().
+        val engine = FakeSyncEngine()
+        val fixX = fixResult("spotify:track:X", 10_000L, 0L)
+        val fixY1 = fixResult("spotify:track:Y", 50_000L, 1_000_000_000L)
+        val fixY2 = fixResult("spotify:track:Y", 52_000L, 3_000_000_000L)
+        val recognition = FakeQueuedRecognitionProvider(listOf(fixX, fixY1, fixY2))
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, recognition)
+
+        vm.startListening()
+        advanceUntilIdle() // resolves fixX (cold start)
+
+        engine.emit(SyncCore.Event.TrackLost)
+        advanceUntilIdle() // arms the full 3-fix gate; fixY1 (streak 1/3)
+
+        engine.emit(SyncCore.Event.RequestFix)
+        advanceUntilIdle() // fixY2 agrees (streak 2/3) -- must NOT yet corroborate
+
+        assertEquals(
+            "onTrackLost's gate must still require 3 fixes, not the relisten path's 2",
+            SessionPhase.MATCHING, vm.syncState.value.phase,
+        )
+    }
+
     // ---- CTL-01b: Event.ActiveProbe (technical-requirements.md §2.9) ------
 
     @Test

@@ -123,9 +123,22 @@ private const val SELF_PLAY_LATCH_MAX_ENTRIES = 4
 
 /**
  * IDC-01 (technical-requirements.md §2.14): identity corroboration gate.
- * Mirrors §2.7's `confirm_min_fixes` (3) exactly.
+ * Mirrors §2.7's `confirm_min_fixes` (3) exactly. Remains the threshold
+ * for the track-lost re-bootstrap ([SessionViewModel.onTrackLost]) —
+ * issue #37's PM decision reserved the full 3-fix gate for that path only.
  */
 private const val IDENT_CONFIRM_MIN_FIXES = 3
+
+/**
+ * IDC-02 (GitHub #37, PM decision recorded 2026-08-13): the natural-end and
+ * auto-advance re-listens ([SessionViewModel.stopFollowingAndRelisten])
+ * arm a REDUCED gate rather than the full [IDENT_CONFIRM_MIN_FIXES] —
+ * these re-listens follow an orderly, expected track boundary (not a
+ * confused/lost signal the way [SessionViewModel.onTrackLost] is), so PM
+ * judged one confirming fix beyond the first sufficient corroboration
+ * before actuating, not three.
+ */
+private const val IDENT_RELISTEN_MIN_FIXES = 2
 
 /**
  * IDC-01: reuses `kRoomContinuityGateMs` (synccore.cpp's CORE-06 tolerance)
@@ -504,7 +517,9 @@ class SessionViewModel(
      * path). Any of them can land on a different worker thread, so a plain
      * read-then-write of one of this class's shared mutable session fields
      * — [selfPlayLatch], [autoAdvanceHandled], the IDC-01 corroboration
-     * fields ([identCorrobArmed]/[identStreakCount]/[identStreakUri]/etc.),
+     * fields ([identCorrobArmed]/[identCorrobMinFixes]/[identStreakCount]/
+     * [identStreakUri]/etc.), the IDC-02 (#37) fast-switch candidate
+     * ([fastSwitchPendingUri]/etc., see [evaluateFastSwitchCandidate]),
      * [consecutiveLosses], [endOfTrackJob], and [transition]'s own
      * from→to legality check — is a genuine TOCTOU race, not a style nit.
      * Every function that touches one of those synchronizes on this
@@ -926,6 +941,17 @@ class SessionViewModel(
      * recorded here exactly like any other.
      */
     private var identCorrobArmed = false
+
+    /**
+     * IDC-02 (#37): the streak's ACTIVE threshold, set by whichever
+     * [armIdentCorroboration] call is currently in force — [IDENT_CONFIRM_MIN_FIXES]
+     * (3) from [onTrackLost], or [IDENT_RELISTEN_MIN_FIXES] (2) from
+     * [stopFollowingAndRelisten]. Read by [identCorroborate] instead of the
+     * old hardcoded [IDENT_CONFIRM_MIN_FIXES] literal, so both the escalation
+     * check and the `identCorrob: streak N/M` log line reflect whichever gate
+     * is actually armed.
+     */
+    private var identCorrobMinFixes = IDENT_CONFIRM_MIN_FIXES
     private var identStreakCount = 0
     private var identStreakUri: String? = null
     private var identStreakLastOffsetMs: Long = 0L
@@ -948,13 +974,20 @@ class SessionViewModel(
     /** Arms (or re-arms) the gate: epoch rule — the ring/streak never
      * carries across a prior arming or a resolved track.
      *
+     * IDC-02 (#37): [minFixes] parametrizes the threshold rather than
+     * duplicating the arm/streak/clear machinery per caller —
+     * [onTrackLost] arms at the default (full) [IDENT_CONFIRM_MIN_FIXES];
+     * [stopFollowingAndRelisten] arms explicitly at the reduced
+     * [IDENT_RELISTEN_MIN_FIXES].
+     *
      * GRD-01 concurrency fix (#32): synchronized on [sessionLock] with
      * every other identCorrob* access — this can be called from
      * [onTrackLost], which itself runs on either the engine-event collector
      * or [aimUntilLanded]'s give-up path, two different coroutines that can
      * land on different threads. */
-    private fun armIdentCorroboration() = synchronized(sessionLock) {
+    private fun armIdentCorroboration(minFixes: Int = IDENT_CONFIRM_MIN_FIXES) = synchronized(sessionLock) {
         identCorrobArmed = true
+        identCorrobMinFixes = minFixes
         identStreakCount = 0
         identStreakUri = null
     }
@@ -962,6 +995,7 @@ class SessionViewModel(
     /** GRD-01 concurrency fix (#32): see [armIdentCorroboration]. */
     private fun clearIdentCorroboration() = synchronized(sessionLock) {
         identCorrobArmed = false
+        identCorrobMinFixes = IDENT_CONFIRM_MIN_FIXES
         identStreakCount = 0
         identStreakUri = null
     }
@@ -1010,10 +1044,13 @@ class SessionViewModel(
         // FT10's IDC-01 verdict was nearly inconclusive purely for want of
         // this line (field-test-10-results.md's IDC-01 section had to
         // reconstruct streak state from source reading instead).
+        // IDC-02: prints the ACTIVE threshold (identCorrobMinFixes), not a
+        // hardcoded 3 — this line now also fires for the reduced 2-fix
+        // relisten gate armed by stopFollowingAndRelisten.
         com.jointheparty.app.debug.DebugLog.log(
-            "identCorrob: streak $identStreakCount/$IDENT_CONFIRM_MIN_FIXES ($uri)",
+            "identCorrob: streak $identStreakCount/$identCorrobMinFixes ($uri)",
         )
-        if (identStreakCount >= IDENT_CONFIRM_MIN_FIXES) {
+        if (identStreakCount >= identCorrobMinFixes) {
             clearIdentCorroboration()
             return@synchronized true
         }
@@ -1094,6 +1131,9 @@ class SessionViewModel(
                 // must never carry a self-issued latch forward from before.
                 selfPlayLatch.forEach { it.second.cancel() }
                 selfPlayLatch.clear()
+                // IDC-02 (#37): epoch rule — a fresh session must never
+                // carry a pending fast-switch candidate forward from before.
+                fastSwitchPendingUri = null
             }
             // IDC-01 (tech-req §2.14): epoch rule — the corroboration
             // ring/streak never carries across sessions.
@@ -2075,6 +2115,72 @@ class SessionViewModel(
         return kotlin.math.abs(projected - fix.matchOffsetMs) > 5_000
     }
 
+    /**
+     * IDC-02 (GitHub #37 decision 1): the pending fast-switch candidate — a
+     * SMALL, SEPARATE guarded slot, deliberately NOT a reuse of
+     * [identStreakUri]/[identStreakCount]/etc. Those fields are scoped to
+     * the ARMED corroboration gate ([identCorrobArmed],
+     * [armIdentCorroboration]/[clearIdentCorroboration]/[identCorroborate]),
+     * whose lifecycle is independent: armed only by [onTrackLost] or
+     * [stopFollowingAndRelisten], for a cold re-bootstrap in MATCHING.
+     * [evaluateFastSwitchCandidate] instead runs from an ACTIVE tracking
+     * session (AIMING/CONVERGING/LOCKED/DRIFTING) that is NOT armed and
+     * must stay undisturbed while a candidate is pending — sharing one set
+     * of fields would let a fast-switch candidate corrupt an in-progress
+     * armed streak (or vice versa) if both were somehow live at once, and
+     * would force [identCorroborate]'s 3-vs-2 threshold parametrization to
+     * also apply here, when decision 1 only ever needs exactly 2 (a single
+     * "does the NEXT fix agree" check, not an N-deep streak). A lone
+     * previous-fix slot is sufficient: with a 2-fix requirement, "the
+     * streak's first entry" and "the pending candidate" are the same fix.
+     *
+     * Guarded by [sessionLock] — read/written only from
+     * [evaluateFastSwitchCandidate], called from [runRecognitionPass]'s
+     * fast-switch branch.
+     */
+    private var fastSwitchPendingUri: String? = null
+    private var fastSwitchPendingOffsetMs: Long = 0L
+    private var fastSwitchPendingCaptureMonoNs: Long = 0L
+
+    /**
+     * IDC-02 decision 1: true once a SECOND fix agrees with the pending
+     * candidate (same URI, offset delta tracking the wall-clock delta
+     * within [IDENT_CONFIRM_OFFSET_AGREE_MS] — identical agreement math to
+     * [identCorroborate], reused rather than reinvented). A non-agreeing or
+     * different-URI fix RESTARTS the candidate at this fix instead of
+     * accumulating — the same "restart, not accumulate" rule
+     * [identCorroborate] already documents. No pending candidate at all is
+     * just the restart case with a null-vs-non-null URI mismatch.
+     *
+     * Expiry: a candidate older than [IDENT_CORROB_MAX_AGE_MS] (by this
+     * fix's own `captureMonoNs`, vs. the candidate's) is treated as already
+     * expired BEFORE the agreement check — reactive, no timer, same
+     * reasoning as [identStreakStartCaptureMonoNs]'s KDoc.
+     *
+     * Caller holds [sessionLock] (see [runRecognitionPass]'s fast-switch
+     * branch).
+     */
+    private fun evaluateFastSwitchCandidate(fix: RecognitionProvider.RecognitionFixResult): Boolean {
+        if (fastSwitchPendingUri != null &&
+            fix.captureMonoNs - fastSwitchPendingCaptureMonoNs > IDENT_CORROB_MAX_AGE_MS * 1_000_000L
+        ) {
+            fastSwitchPendingUri = null // expired: falls through to the restart branch below
+        }
+        val agrees = fastSwitchPendingUri == fix.spotifyUri &&
+            kotlin.math.abs(
+                (fix.matchOffsetMs - fastSwitchPendingOffsetMs) -
+                    (fix.captureMonoNs - fastSwitchPendingCaptureMonoNs) / 1_000_000,
+            ) <= IDENT_CONFIRM_OFFSET_AGREE_MS
+        if (agrees) {
+            fastSwitchPendingUri = null // consumed: the caller acts on this fix now
+            return true
+        }
+        fastSwitchPendingUri = fix.spotifyUri
+        fastSwitchPendingOffsetMs = fix.matchOffsetMs
+        fastSwitchPendingCaptureMonoNs = fix.captureMonoNs
+        return false
+    }
+
     private fun shouldKeepSampling(): Boolean {
         if (firstEstimateSeen) return false
         // Bounded: every pass is a paid recognition request, so a session
@@ -2180,22 +2286,43 @@ class SessionViewModel(
                     // evening). Only switch when the offset ALSO disagrees
                     // — a real new song has an arbitrary position; an
                     // alternate release of the current song matches ours.
-                    com.jointheparty.app.debug.DebugLog.log(
-                        "room changed songs → re-aim '${fix.title}'",
-                    )
-                    // GRD-01 concurrency fix (#32): the three-step
-                    // transition sequence is atomic w.r.t. any other thread
-                    // mutating phase/session state (e.g. a concurrent
-                    // onTrackLost() re-bootstrap) — see [sessionLock].
-                    // resolveTrack(fix) deliberately stays OUTSIDE the lock:
-                    // it suspends (backend I/O), and a suspend call must
-                    // never happen while holding a plain JVM monitor.
-                    synchronized(sessionLock) {
-                        transition(SessionPhase.LOST)
-                        transition(SessionPhase.LISTENING)
-                        onMatchInFlight()
+                    //
+                    // IDC-02 (#37 decision 1, PM 2026-08-13): a SINGLE such
+                    // fix used to yank an in-progress session immediately —
+                    // FT10 showed a lone Tubo-Tubo-class misrecognition (or
+                    // edition ping-pong) could do this. Now requires a
+                    // SECOND fix agreeing with this one (see
+                    // [evaluateFastSwitchCandidate]) before actuating; the
+                    // session continues undisturbed while a candidate is
+                    // pending — this fix was already submitted to the
+                    // engine as a sync observation above, unconditionally,
+                    // unchanged.
+                    val confirmed = synchronized(sessionLock) {
+                        evaluateFastSwitchCandidate(fix)
                     }
-                    resolveTrack(fix)
+                    if (confirmed) {
+                        com.jointheparty.app.debug.DebugLog.log(
+                            "room changed songs → re-aim '${fix.title}'",
+                        )
+                        // GRD-01 concurrency fix (#32): the three-step
+                        // transition sequence is atomic w.r.t. any other thread
+                        // mutating phase/session state (e.g. a concurrent
+                        // onTrackLost() re-bootstrap) — see [sessionLock].
+                        // resolveTrack(fix) deliberately stays OUTSIDE the lock:
+                        // it suspends (backend I/O), and a suspend call must
+                        // never happen while holding a plain JVM monitor.
+                        synchronized(sessionLock) {
+                            transition(SessionPhase.LOST)
+                            transition(SessionPhase.LISTENING)
+                            onMatchInFlight()
+                        }
+                        resolveTrack(fix)
+                    } else {
+                        com.jointheparty.app.debug.DebugLog.log(
+                            "room changed songs → candidate pending '${fix.title}' " +
+                                "(awaiting a second agreeing fix)",
+                        )
+                    }
                 }
                 retry = shouldKeepSampling()
             } finally {
@@ -2396,6 +2523,11 @@ class SessionViewModel(
             if (recognition == null) return@synchronized
             firstEstimateSeen = false
             samplingAttempts = 0
+            // IDC-02 (#37 decision 2): natural-end / auto-advance re-listens
+            // arm a REDUCED 2-fix gate — the full 3-fix [IDENT_CONFIRM_MIN_FIXES]
+            // stays reserved for [onTrackLost]. Same "arm right before the
+            // re-bootstrap" placement as onTrackLost's own arming call.
+            armIdentCorroboration(IDENT_RELISTEN_MIN_FIXES)
             onMatchInFlight()
             scope.launch(dispatcher) {
                 // The pause has to actually take effect before the mic is
