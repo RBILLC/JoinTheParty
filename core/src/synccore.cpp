@@ -258,6 +258,28 @@ struct sc_session {
         // the confirmed anchor and disarmed the self-match guard.
         int64_t cand_offset_ms = -1;
         uint64_t cand_ns = 0;
+        // CTL-05 (docs/ctl05-investigation.md §6.2): after a local
+        // corrective seek, a single fix must not alone regain the
+        // self-match guard's full arbitration authority. FT10's cascade was
+        // exactly this — the first post-seek fix happened to track the
+        // STALE pre-seek room_anchor_offset_ms within kRoomContinuityGateMs
+        // by a ~100 ms coincidence, instantly re-confirmed it, and the
+        // guard then spent ~25 s rejecting three real, mutually-consistent
+        // fixes from the ACTUAL room timeline as self-hearing. Mirrors the
+        // anti-poisoning rule that a session's very first fix can't
+        // arbitrate (cand_offset_ms's own comment above): while
+        // anchor_pending_reconfirm is set, room_anchor_offset_ms/
+        // room_anchor_confirmed are FROZEN at their pre-seek values — still
+        // fully able to reject, exactly as before the seek, so protection
+        // is not weakened — while this SEPARATE post-seek candidate slot
+        // requires two agreeing post-seek fixes (same kRoomContinuityGateMs
+        // tolerance already trusted for "two fixes agree on a new room
+        // timeline" below) before the live anchor is replaced. Cleared by a
+        // fresh seek, by successful promotion, by kMaxConsecutiveSelfRejects
+        // dropping the anchor outright, or by a track-lost epoch reset.
+        bool anchor_pending_reconfirm = false;
+        int64_t post_seek_cand_offset_ms = -1;
+        uint64_t post_seek_cand_ns = 0;
         std::vector<float> scratch;
         // CAL-05: one-pole envelope follower state (full double precision;
         // only the published atomic is truncated to float).
@@ -491,6 +513,11 @@ struct sc_session {
                 wk.room_anchor_confirmed = false;
                 wk.consecutive_self_rejects = 0;
                 wk.cand_offset_ms = -1;
+                // CTL-05: a re-listen is a new epoch for the post-seek
+                // reconfirmation state too — no pending flag or candidate
+                // may survive into it, exactly like room_anchor_* above.
+                wk.anchor_pending_reconfirm = false;
+                wk.post_seek_cand_offset_ms = -1;
                 beat_comb_mirror.store(0, std::memory_order_relaxed);
                 beat_period_ms_mirror.store(0.0, std::memory_order_relaxed);
                 // DSP-03a epoch rule (tech-req §2.12): a re-listen is a new
@@ -767,16 +794,65 @@ struct sc_session {
                                     static_cast<double>(t - wk.cand_ns) / 1e6)) <=
                         kRoomContinuityGateMs;
 
-                if (anchor_usable && wk.room_anchor_confirmed && !tracks_room &&
+                // Snapshot the self-hearing verdict BEFORE the CTL-05
+                // post-seek corroboration bookkeeping below can mutate
+                // room_anchor_confirmed — a fix that itself corroborates
+                // (promotes) the post-seek anchor must be judged against the
+                // anchor as it stood at entry, not the one it just created;
+                // promotion never retroactively un-rejects the fix that
+                // triggered it (architecture-spec §7.3: a rejected fix must
+                // not gain adoption power it didn't have).
+                const bool self_hearing_candidate =
+                    anchor_usable && wk.room_anchor_confirmed && !tracks_room &&
                     wk.estimator.has_player_state() &&
                     std::abs(off - wk.estimator.local_audible_ms(t)) <=
-                        kSelfMatchWindowMs) {
+                        kSelfMatchWindowMs;
+
+                // CTL-05 (docs/ctl05-investigation.md §6.1): while a
+                // post-seek anchor awaits reconfirmation, this SEPARATE
+                // candidate slot tracks whether consecutive post-seek fixes
+                // agree with EACH OTHER — run for every fix, accepted or
+                // (about to be) rejected below, which is what lets a real,
+                // coherent second timeline promote itself once two of its
+                // fixes agree, rather than only after
+                // kMaxConsecutiveSelfRejects fixes have been discarded
+                // outright. The verdict on THIS fix was already decided
+                // above; this only affects fixes AFTER it.
+                const bool was_pending = wk.anchor_pending_reconfirm;
+                if (was_pending) {
+                    const bool corroborates_post_seek =
+                        wk.post_seek_cand_offset_ms >= 0 && t > wk.post_seek_cand_ns &&
+                        std::abs(off - (static_cast<double>(wk.post_seek_cand_offset_ms) +
+                                        static_cast<double>(t - wk.post_seek_cand_ns) /
+                                            1e6)) <= kRoomContinuityGateMs;
+                    if (corroborates_post_seek) {
+                        // Two post-seek fixes agree with each other on a
+                        // timeline that may or may not be the stale
+                        // pre-seek anchor: promote it to the live,
+                        // arbitration-capable anchor.
+                        wk.room_anchor_offset_ms = cmd.fix.match_offset_ms;
+                        wk.room_anchor_ns = t;
+                        wk.room_anchor_confirmed = true;
+                        wk.anchor_pending_reconfirm = false;
+                        wk.post_seek_cand_offset_ms = -1;
+                        wk.cand_offset_ms = -1;
+                    } else {
+                        wk.post_seek_cand_offset_ms = cmd.fix.match_offset_ms;
+                        wk.post_seek_cand_ns = t;
+                    }
+                }
+
+                if (self_hearing_candidate) {
                     if (++wk.consecutive_self_rejects >=
                         kMaxConsecutiveSelfRejects) {
                         // We are almost certainly judging with a bad
                         // reference. Forget it; the next fix re-seeds.
                         wk.room_anchor_offset_ms = -1;
                         wk.room_anchor_confirmed = false;
+                        // CTL-05: the anchor this pending reconfirmation was
+                        // guarding is gone — nothing left to (re)confirm.
+                        wk.anchor_pending_reconfirm = false;
+                        wk.post_seek_cand_offset_ms = -1;
                         wk.consecutive_self_rejects = 0;
                     }
                     sc_evt_fix_rejected_t rej{SC_REJECT_SELF_HEARING};
@@ -814,26 +890,38 @@ struct sc_session {
                 // and the engine settled 1.7 s ahead of the room while
                 // reporting −3 ms. The established timeline has to survive an
                 // isolated bad offset.
-                if (tracks_room) {
-                    wk.room_anchor_offset_ms = cmd.fix.match_offset_ms;
-                    wk.room_anchor_ns = t;
-                    wk.room_anchor_confirmed = true;
-                    wk.cand_offset_ms = -1;
-                } else if (tracks_cand) {
-                    // Two fixes now agree on a DIFFERENT continuous timeline:
-                    // the room really did move (new song, someone skipped).
-                    wk.room_anchor_offset_ms = cmd.fix.match_offset_ms;
-                    wk.room_anchor_ns = t;
-                    wk.room_anchor_confirmed = true;
-                    wk.cand_offset_ms = -1;
-                } else {
-                    // Hold it aside; keep whatever room timeline we had.
-                    wk.cand_offset_ms = cmd.fix.match_offset_ms;
-                    wk.cand_ns = t;
-                    if (!anchor_usable) {
+                //
+                // CTL-05: skipped while `was_pending` — the post-seek
+                // corroboration block above already decided this fix's
+                // effect on the anchor (either promoted it, or left it
+                // frozen pending a second agreeing fix). Letting this ALSO
+                // run would let a fix that merely tracks the FROZEN
+                // pre-seek anchor silently re-confirm on its own — exactly
+                // the FT10 bug (fix B tracked the stale anchor by a ~100 ms
+                // coincidence and instantly regained full authority).
+                if (!was_pending) {
+                    if (tracks_room) {
                         wk.room_anchor_offset_ms = cmd.fix.match_offset_ms;
                         wk.room_anchor_ns = t;
-                        wk.room_anchor_confirmed = false;
+                        wk.room_anchor_confirmed = true;
+                        wk.cand_offset_ms = -1;
+                    } else if (tracks_cand) {
+                        // Two fixes now agree on a DIFFERENT continuous
+                        // timeline: the room really did move (new song,
+                        // someone skipped).
+                        wk.room_anchor_offset_ms = cmd.fix.match_offset_ms;
+                        wk.room_anchor_ns = t;
+                        wk.room_anchor_confirmed = true;
+                        wk.cand_offset_ms = -1;
+                    } else {
+                        // Hold it aside; keep whatever room timeline we had.
+                        wk.cand_offset_ms = cmd.fix.match_offset_ms;
+                        wk.cand_ns = t;
+                        if (!anchor_usable) {
+                            wk.room_anchor_offset_ms = cmd.fix.match_offset_ms;
+                            wk.room_anchor_ns = t;
+                            wk.room_anchor_confirmed = false;
+                        }
                     }
                 }
                 wk.consecutive_self_rejects = 0;
@@ -913,6 +1001,12 @@ struct sc_session {
                 // A seek re-commands our own playback position — keep the
                 // self-hearing guard's reference fresh.
                 wk.last_commanded_position_ms = cmd.value_ms;
+                // CTL-05: arm post-seek anchor reconfirmation (see
+                // anchor_pending_reconfirm's declaration) — a fresh seek
+                // always restarts the corroboration requirement, even if a
+                // prior one was still outstanding.
+                wk.anchor_pending_reconfirm = true;
+                wk.post_seek_cand_offset_ms = -1;
                 break;
             case Command::Kind::kLocalPlayback:
                 wk.last_commanded_position_ms = cmd.value_ms;

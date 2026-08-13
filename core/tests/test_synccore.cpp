@@ -115,6 +115,10 @@ struct EventLog {
     std::atomic<uint64_t> callback_thread_hash{0};
     std::atomic<int> corrections{0};
     std::atomic<int64_t> last_seek_to_ms{0};
+    // CTL-05: drift observability for the FT10 cascade repro (the drift
+    // clamp is what turned one mis-anchored fix into a long monotonic
+    // climb — see docs/ctl05-investigation.md §2).
+    std::atomic<double> last_drift_ppm{0.0};
 };
 
 void event_cb(sc_event_type_t type, const void* payload, void* user) {
@@ -124,6 +128,7 @@ void event_cb(sc_event_type_t type, const void* payload, void* user) {
     if (type == SC_EVT_SYNC_ESTIMATE) {
         auto* est = static_cast<const sc_evt_sync_estimate_t*>(payload);
         log->last_error_ms.store(est->error_ms);
+        log->last_drift_ppm.store(est->drift_ppm);
         log->estimates.fetch_add(1);
     } else if (type == SC_EVT_FIX_REJECTED) {
         auto* rej = static_cast<const sc_evt_fix_rejected_t*>(payload);
@@ -502,6 +507,298 @@ void test_self_match_guard_recovers_from_bad_reference() {
     submit(41200, t0 + 30 * kSec);
     processed();
     CHECK(log.rejects.load() == before);
+}
+
+// CTL-05 (docs/ctl05-investigation.md §6.2, GitHub issue #36): a single
+// post-seek fix that happens to track the STALE pre-seek room anchor must
+// not regain the guard's full arbitration authority on its own — that is
+// exactly what mis-anchored FT10. This proves the guard stays FULLY armed
+// (not weakened) through that one fix: a genuinely self-hearing fix
+// arriving right after still gets rejected.
+void test_post_seek_single_fix_cannot_reanchor() {
+    constexpr uint64_t kSec = 1'000'000'000ull;
+    sc_config_t cfg = valid_config();
+    cfg.deadband_ms = 5000;
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    EventLog log;
+    sc_set_event_callback(s, event_cb, &log);
+
+    const uint64_t t0 = mono_ns();
+    sc_player_state_t ps{};
+    ps.position_ms = 10000;
+    ps.received_mono_ns = t0;
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+    CHECK(sc_set_aec_mode(s, SC_AEC_FULL) == SC_OK);
+
+    auto submit = [&](int64_t offset_ms, uint64_t t) {
+        sc_recognition_fix_t fix{};
+        fix.source = SC_FIX_SHAZAMKIT;
+        fix.match_offset_ms = offset_ms;
+        fix.capture_mono_ns = t;
+        fix.confidence = 0.9f;
+        CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    };
+    auto processed = [&] {
+        const int before = log.estimates.load();
+        for (int i = 0; i < 400 && log.estimates.load() == before; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    };
+
+    // Establish and confirm a room reference 1 200 ms ahead of us, exactly
+    // like the pre-existing self-match tests above.
+    submit(16200, t0 + 5 * kSec);
+    processed();
+    submit(21200, t0 + 10 * kSec);
+    processed();
+    CHECK(log.rejects.load() == 0);
+
+    // A local corrective seek — arms post-seek reconfirmation.
+    // Target chosen to land close to projected_local at the landing time
+    // (10 000 + 11 250 = 21 250) plus a small +50 ms correction — this
+    // keeps the estimator's error state near its pre-seek value instead of
+    // injecting an unrelated large jump that would trip the OUTLIER gate
+    // (estimator.cpp's innovation gate) on the fixes below; this test is
+    // about guard/anchor state, not seek-execution accounting.
+    CHECK(sc_notify_seek_issued(s, 21300, t0 + 11 * kSec) == SC_OK);
+
+    // First post-seek fix: tracks the STALE pre-seek anchor (21 200 + 6 000
+    // = 27 200) within the 500 ms gate by a ~90 ms coincidence — the exact
+    // shape of FT10's fix B. It must be accepted (tracks_room bypasses
+    // self-hearing), but must NOT alone regain full arbitration authority.
+    submit(27290, t0 + 16 * kSec);
+    processed();
+    CHECK(log.rejects.load() == 0);
+
+    // A genuinely self-hearing fix arrives next: it lands exactly on our
+    // own audible position (10 000 + 21 000 = 31 000) while breaking room
+    // continuity. If the single prior fix had silently re-armed the guard
+    // pointed at ITSELF, or — worse — had disarmed the guard entirely, this
+    // would sail through. It must still be rejected.
+    submit(31000, t0 + 21 * kSec);
+    for (int i = 0; i < 400 && log.rejects.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.rejects.load() == 1);
+    CHECK(log.last_reject_reason.load() == SC_REJECT_SELF_HEARING);
+
+    sc_destroy(s);
+}
+
+// CTL-05: the flip side of the test above — two post-seek fixes that agree
+// with EACH OTHER (not with the stale pre-seek anchor) must be able to
+// promote themselves to the live, arbitration-capable anchor, and that
+// promotion must carry REAL rejection authority afterward (not just passive
+// acceptance) — proving the guard was correctly re-pointed, not weakened.
+void test_post_seek_two_agreeing_fixes_reanchor() {
+    constexpr uint64_t kSec = 1'000'000'000ull;
+    sc_config_t cfg = valid_config();
+    cfg.deadband_ms = 20000;
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    EventLog log;
+    sc_set_event_callback(s, event_cb, &log);
+
+    const uint64_t t0 = mono_ns();
+    sc_player_state_t ps{};
+    ps.position_ms = 10000;
+    ps.received_mono_ns = t0;
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+    CHECK(sc_set_aec_mode(s, SC_AEC_FULL) == SC_OK);
+
+    auto submit = [&](int64_t offset_ms, uint64_t t) {
+        sc_recognition_fix_t fix{};
+        fix.source = SC_FIX_SHAZAMKIT;
+        fix.match_offset_ms = offset_ms;
+        fix.capture_mono_ns = t;
+        fix.confidence = 0.9f;
+        CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    };
+    auto processed = [&] {
+        const int before = log.estimates.load();
+        for (int i = 0; i < 400 && log.estimates.load() == before; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    };
+
+    submit(16200, t0 + 5 * kSec);
+    processed();
+    submit(21200, t0 + 10 * kSec);
+    processed();
+    CHECK(log.rejects.load() == 0);
+
+    // Target chosen to land close to projected_local at the landing time
+    // (10 000 + 11 250 = 21 250) plus a small +50 ms correction — this
+    // keeps the estimator's error state near its pre-seek value instead of
+    // injecting an unrelated large jump that would trip the OUTLIER gate
+    // (estimator.cpp's innovation gate) on the fixes below; this test is
+    // about guard/anchor state, not seek-execution accounting.
+    CHECK(sc_notify_seek_issued(s, 21300, t0 + 11 * kSec) == SC_OK);
+
+    // P1: an offset that neither tracks the stale pre-seek anchor
+    // (predicted 27 200, off by 650 ms) nor matches our own audible
+    // position (26 000, off by 550 ms) — accepted outright (falls through
+    // both the tracks_room and self-hearing checks) but does not yet earn
+    // anchor authority (only one post-seek fix so far). Chosen close enough
+    // to the estimator's current error to stay clear of the unrelated
+    // OUTLIER innovation gate (estimator.cpp), same reasoning as the seek
+    // target above.
+    submit(26550, t0 + 16 * kSec);
+    processed();
+    CHECK(log.rejects.load() == 0);
+
+    // P2, 5 s later, agrees with P1 exactly (26 550 + 5 000): two post-seek
+    // fixes now corroborate each other on a timeline that is NOT the stale
+    // anchor — this promotes it.
+    submit(31550, t0 + 21 * kSec);
+    processed();
+    CHECK(log.rejects.load() == 0);
+
+    // P3 is judged against the FRESH anchor and tracks it exactly — proof
+    // the new timeline is now the live, trusted reference.
+    submit(36550, t0 + 26 * kSec);
+    processed();
+    CHECK(log.rejects.load() == 0);
+
+    // P4 is a genuinely self-hearing fix relative to the NEW anchor (our
+    // own audible position at t0+31s is 10 000 + 31 000 = 41 000, while the
+    // new anchor predicts 41 550). If promotion had only granted passive
+    // acceptance rather than real arbitration authority, this would sail
+    // through uncaught.
+    submit(41000, t0 + 31 * kSec);
+    for (int i = 0; i < 400 && log.rejects.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.rejects.load() == 1);
+    CHECK(log.last_reject_reason.load() == SC_REJECT_SELF_HEARING);
+
+    sc_destroy(s);
+}
+
+// CTL-05: full reproduction of FT10's mis-anchoring cascade shape (GitHub
+// issue #36) — a corrective seek, a first post-seek fix that coincidentally
+// tracks the stale pre-seek anchor, then three fixes from a real, mutually
+// consistent SECOND timeline. Pre-fix (verified by temporarily reverting
+// the CTL-05 change and rerunning — see docs/ctl05-implementation-review.md
+// for the readback), this exact sequence reproduces the bug: the second
+// timeline's fixes are rejected SELF_HEARING three times running, the
+// anchor only drops on the third, and a FOURTH fix is needed before the
+// engine recovers — 20 s during which a large frequency_skew on the very
+// first (mis-anchored) fix leaves the drift state pegged at the hard clamp
+// the whole time. Post-fix, the second timeline corroborates itself (two
+// fixes agreeing) and the THIRD fix of that timeline — not the fourth —
+// is accepted directly, carrying the corrective skew that un-pegs drift
+// five seconds sooner.
+void test_ft10_cascade_repro_recovers_without_fourth_fix() {
+    constexpr uint64_t kSec = 1'000'000'000ull;
+    sc_config_t cfg = valid_config();
+    cfg.deadband_ms = 20000;  // this test is about guard/drift state, not
+                              // correction firing
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    EventLog log;
+    sc_set_event_callback(s, event_cb, &log);
+
+    const uint64_t t0 = mono_ns();
+    sc_player_state_t ps{};
+    ps.position_ms = 10000;
+    ps.received_mono_ns = t0;
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+    CHECK(sc_set_aec_mode(s, SC_AEC_FULL) == SC_OK);
+
+    auto submit = [&](int64_t offset_ms, uint64_t t, double skew = 0.0) {
+        sc_recognition_fix_t fix{};
+        fix.source = SC_FIX_SHAZAMKIT;
+        fix.match_offset_ms = offset_ms;
+        fix.capture_mono_ns = t;
+        fix.confidence = 0.9f;
+        fix.frequency_skew = skew;
+        CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    };
+    auto processed = [&] {
+        const int before = log.estimates.load();
+        for (int i = 0; i < 400 && log.estimates.load() == before; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    };
+
+    // Establish and confirm the pre-seek room anchor (21 200 @ t0+10s).
+    submit(16200, t0 + 5 * kSec);
+    processed();
+    submit(21200, t0 + 10 * kSec);
+    processed();
+    CHECK(log.rejects.load() == 0);
+
+    // Target chosen to land close to projected_local at the landing time
+    // (10 000 + 11 250 = 21 250) plus a small +50 ms correction — this
+    // keeps the estimator's error state near its pre-seek value instead of
+    // injecting an unrelated large jump that would trip the OUTLIER gate
+    // (estimator.cpp's innovation gate) on the fixes below; this test is
+    // about guard/anchor state, not seek-execution accounting.
+    CHECK(sc_notify_seek_issued(s, 21300, t0 + 11 * kSec) == SC_OK);
+
+    // Fix B: tracks the STALE pre-seek anchor (predicted 27 200) within
+    // ~90 ms — accepted, exactly like FT10's fix B. Carries a strong
+    // negative skew (frequency_skew < 0 ⇒ drift observation > 0), which
+    // (EstimatorConfig::drift_clamp_ms_per_s = 0.8 ms/s, estimator.h:35)
+    // is what pegs the drift clamp at 800 ppm — the mechanism behind FT10's
+    // "drift pegged at 800ppm on 178 log lines" finding.
+    submit(27290, t0 + 16 * kSec, -0.001);
+    processed();
+    CHECK(log.rejects.load() == 0);
+    CHECK(std::abs(log.last_drift_ppm.load() - 800.0) < 5.0);  // clamped
+
+    // Fixes C and D: a real, mutually-consistent SECOND timeline (40 ms
+    // apart from each other, per the investigation's own C→D reading),
+    // ~1 000-1 090 ms off the stale anchor/candidate, and each individually
+    // within kSelfMatchWindowMs of our own dead-reckoned audible position —
+    // the exact false-positive shape the investigation traces (§2). Both
+    // carry a correcting positive skew that, per §7.3, must NOT reach the
+    // estimator while they are rejected.
+    submit(31200, t0 + 21 * kSec, 0.0009);   // C
+    submit(36200, t0 + 26 * kSec, 0.0009);   // D
+    for (int i = 0; i < 400 && log.rejects.load() < 2; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // Both C and D are still individually rejected — a rejected fix must
+    // never gain adoption power it didn't have (§7.3) — but D's agreement
+    // with C (40 ms, well inside kRoomContinuityGateMs) has now promoted
+    // the anchor for fixes AFTER it.
+    CHECK(log.rejects.load() == 2);
+    CHECK(log.last_reject_reason.load() == SC_REJECT_SELF_HEARING);
+    // Drift is UNCHANGED since B — neither C's nor D's skew reached the
+    // estimator, exactly as required.
+    CHECK(std::abs(log.last_drift_ppm.load() - 800.0) < 5.0);
+
+    // Fix E: judged against the FRESHLY PROMOTED anchor (D, 36 200 @ t=26s)
+    // and tracks it exactly (predicted 41 200) — accepted directly, the
+    // THIRD fix of the real timeline, not a fourth. This is "the coherent
+    // second timeline wins promptly": no fourth fix, no
+    // kMaxConsecutiveSelfRejects drop-and-reseed was needed.
+    submit(41200, t0 + 31 * kSec, 0.0009);
+    processed();
+    CHECK(log.rejects.load() == 2);  // no third reject was needed for E
+
+    // Drift must have moved OFF the clamp — E's corrective skew reached the
+    // estimator this fix, not stuck waiting for a fourth. This is the
+    // direct test of "drift must not peg at the clamp": under the pre-fix
+    // guard, this same sequence needs a FOURTH fix (5 s later) before any
+    // corrective skew reaches the estimator at all, so drift would still
+    // read exactly 800 ppm at this point (verified by temporary revert).
+    // E lands 15 s after the last ACCEPTED fix (B) — C and D's rejection
+    // means no on_fix call, hence no predict_to, ran for either of them —
+    // so E's own position update also sees the covariance growth
+    // predict_to accumulates over that full 15 s gap (including a nonzero
+    // p01 cross-term), not just its skew update in isolation; the resulting
+    // drift lands well short of a full return to zero. The load-bearing
+    // property under test is simply that it is materially off the clamp,
+    // not pegged at it.
+    const double drift_after_e = log.last_drift_ppm.load();
+    CHECK(std::abs(drift_after_e) < 750.0);          // below the clamp, not pegged
+    CHECK(std::abs(drift_after_e - 800.0) > 300.0);  // materially moved
+
+    // The estimator must not be left sitting in a stable wrong band: E's
+    // own large position correction (41 200, tracking the real room) must
+    // have moved the filtered error, not left it at whatever B alone set.
+    const double error_after_e = log.last_error_ms.load();
+    CHECK(std::abs(error_after_e) < 20000.0);  // inside the widened deadband
+
+    sc_destroy(s);
 }
 
 // NAT-06b: the capture-history tee returns the newest frames in order with
@@ -1180,6 +1477,9 @@ int main() {
     test_self_hearing_guard();
     test_self_match_guard_recovers_from_bad_reference();
     test_self_match_guard_ignores_unconfirmed_reference();
+    test_post_seek_single_fix_cannot_reanchor();
+    test_post_seek_two_agreeing_fixes_reanchor();
+    test_ft10_cascade_repro_recovers_without_fourth_fix();
     test_correction_leads_by_recognition_age();
     test_copy_recent_capture();
     test_concurrent_capture_and_control();

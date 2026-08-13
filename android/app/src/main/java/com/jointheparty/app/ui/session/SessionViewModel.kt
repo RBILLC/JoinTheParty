@@ -2141,7 +2141,15 @@ class SessionViewModel(
                     com.jointheparty.app.debug.DebugLog.log(
                         "fixdbg: offset=${fix.matchOffsetMs} zEnd=$zEnd " +
                             "zResp=${zEnd + capAge} capAge=${capAge}ms " +
-                            "(ps=${ps.positionMs}@-${(System.nanoTime() - ps.receivedMonoNs) / 1_000_000}ms)",
+                            "(ps=${ps.positionMs}@-${(System.nanoTime() - ps.receivedMonoNs) / 1_000_000}ms) " +
+                            // CTL-05 (docs/ctl05-investigation.md §6.3): the
+                            // core has no logging of its own, and this raw
+                            // fix's skew is the only input that can move the
+                            // estimator's drift state to its hard clamp — a
+                            // clamped, wrong-signed drift turned one
+                            // mis-anchored fix into 40+ s of monotonic climb
+                            // in FT10 (§2 of the investigation).
+                            "skew=${fix.frequencySkew}",
                     )
                 }
                 engine.submitRecognitionFix(
