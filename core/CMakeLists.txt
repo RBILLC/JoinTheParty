@@ -54,7 +54,13 @@ if(SYNCCORE_SANITIZE)
         target_compile_options(synccore PRIVATE /fsanitize=address)
     else()
         target_compile_options(synccore PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
-        target_link_options(synccore PRIVATE -fsanitize=address,undefined)
+        # PUBLIC, not PRIVATE: every consumer of the sanitized static lib
+        # (lag_analyzer, synccore_abi_c_check — targets NOT created via
+        # synccore_add_test, which adds its own flags) must link the
+        # sanitizer runtime too, or the link dies on undefined
+        # __asan_*/__ubsan_* references. This was core-ci's
+        # linux-asan-ubsan job failing on every run since SCAF-01.
+        target_link_options(synccore PUBLIC -fsanitize=address,undefined)
     endif()
 endif()
 

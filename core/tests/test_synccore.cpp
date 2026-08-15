@@ -1123,8 +1123,23 @@ void test_beat_comb_cross_check_wiring() {
         dsp_push_click_range(s, click, off, chunk_samples, &ts);
         off += chunk_samples;
         CHECK(sc_sample_latency_residual(s) == SC_OK);
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        sc_test_get_beat_state(s, &beat_comb, &beat_period_ms);
+        // The analysis worker publishes beat state to the mirror atomics
+        // asynchronously; one fixed 150 ms sleep assumes it finishes within
+        // a beat, which TSan's 5-15x slowdown breaks (core-ci linux-tsan
+        // observed the mirror a full pass stale: pass 0 printed 0.00 where
+        // an unsanitized run prints 626.19, and the comb latch never caught
+        // up within the 4 available chunks). Poll bounded instead — same
+        // acoustic assertion, no single-sleep timing assumption. The
+        // deadline (20 x 150 ms) only burns fully on passes where the flag
+        // is legitimately still down.
+        for (int w = 0; w < 20; ++w) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            sc_test_get_beat_state(s, &beat_comb, &beat_period_ms);
+            if (std::abs(beat_period_ms - kPeriodMs) <= 10.0 &&
+                beat_comb == 1) {
+                break;
+            }
+        }
         std::printf("  [comb] pass %d beat_period_ms=%.2f beat_comb=%d\n",
                    i, beat_period_ms, beat_comb);
         if (std::abs(beat_period_ms - kPeriodMs) <= 10.0 && beat_comb == 1 &&
