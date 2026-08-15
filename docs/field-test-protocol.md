@@ -290,6 +290,18 @@ phones' media volume to a known, repeatable level (and write it down in the
 run notes) before the first join. `adb -t N shell media volume --show
 --stream 3 --set <idx>` does it without touching the screen.
 
+### One phone can appear as TWO adb transports (FT10)
+
+With wireless debugging, `adb devices -l` routinely lists the same phone
+twice — once as the `IP:port` transport you connected, once as an
+`adb-<serial>...adb-tls-connect` mDNS entry. FT10's first launch nearly
+counted the Pixel 10's mDNS ghost as the second phone. Rules: identify
+phones by `product:`/`model:`, not by row count; address every command
+with an explicit `-s IP:port` (the mDNS serial contains a space and
+breaks quoting); and when the wireless-debugging port changes after a
+reconnect (it will), re-run `adb connect` to the new port rather than
+trusting a stale transport.
+
 ### Check the audio ROUTE, not just Bluetooth power (FT10)
 
 A connected Bluetooth audio device silently steals the media stream: the
