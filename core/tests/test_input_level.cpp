@@ -150,17 +150,24 @@ void test_ballistics_attack_and_release() {
     }
     CHECK(attack_blocks <= 4);
 
-    // Run to full convergence.
-    for (int i = 0; i < 30; ++i) {
-        sc_push_capture(s, loud.data(), kBlockFrames, ts);
-        ts += 10'000'000ull;
-    }
+    // Run to full convergence — pushing WHILE polling, per this file's own
+    // header doctrine (continuous draining is immune to worker scheduling;
+    // a push-then-poll gap is not). The earlier push-30-then-wait_until
+    // shape lost exactly the race the comment below describes on core-ci's
+    // loaded macos runner (2026-08-15: converged read below 0.8·A after
+    // the queued blocks drained and the idle release pulled the level down
+    // before this thread's poll caught the peak).
     // Bounded below rather than a tight band around kAmplitude: the idle
     // release starts pulling the level down the moment the queued blocks are
     // drained, and how far it gets before this thread observes it depends on
     // machine load.
-    const float converged = wait_until(
-        s, [&](float v) { return v > 0.9f * kAmplitude; });
+    float converged = 0.0f;
+    for (int i = 0; i < 200; ++i) {
+        sc_push_capture(s, loud.data(), kBlockFrames, ts);
+        ts += 10'000'000ull;
+        converged = read_level_settled(s);
+        if (converged > 0.9f * kAmplitude) break;
+    }
     CHECK(converged > 0.8f * kAmplitude);
     CHECK(converged <= kAmplitude + 0.01f);
 
