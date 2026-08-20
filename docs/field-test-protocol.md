@@ -90,8 +90,10 @@ ffmpeg -hide_banner -loglevel error -f dshow -audio_buffer_size 100 \
 background job, which does not inherit an interactive `PATH` edit — it fails
 with `error while loading shared libraries: libunwind.dll`, and because the
 failure is on the far side of a pipe, ffmpeg reports a confusing muxer error
-instead. Both DLLs now sit permanently next to the binary in `build/core/`;
-if you rebuild into a clean tree, copy them again.
+instead. The DLLs must sit next to the binary in `build/core/` — and a fresh
+reconfigure/rebuild of the tree WIPES them (this bit FT11: the tree was
+rebuilt 2026-08-15, the DLLs were gone at rig time). Always check they are
+present and re-copy from the llvm-mingw `bin/` before launching the pipeline.
 
 Omit `-t 600` unless you want the capture to self-terminate — an open-ended
 capture lets one pipeline serve a whole session, and `wc -l` on the CSV gives
