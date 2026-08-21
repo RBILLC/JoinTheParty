@@ -2056,6 +2056,8 @@ class SessionViewModel(
             is SyncCore.Event.LatencyResidual -> onLatencyResidual(event)
             is SyncCore.Event.ActiveProbe -> onActiveProbe(event)
             is SyncCore.Event.ActiveDuck -> onActiveDuck(event)
+            is SyncCore.Event.PolicyState -> onPolicyState(event)
+            is SyncCore.Event.FixDiag -> onFixDiag(event)
             // INT-02: execute the engine's micro-seek; the controller echoes
             // notifySeekIssued (settle window + latency learning).
             is SyncCore.Event.Correction -> {
@@ -2420,6 +2422,44 @@ class SessionViewModel(
         if (event.converged && _syncState.value.phase == SessionPhase.LOCKED) {
             maybeSampleReferee()
         }
+    }
+
+    /**
+     * CTL-06/W1 (technical-requirements.md §2.17): tracks the last LOGGED
+     * settled value so `"policy: settled → true|false"` prints only on
+     * TRANSITION, never per tick (SC_EVT_POLICY_STATE rides the same ≤15 Hz
+     * cadence as SC_EVT_SYNC_ESTIMATE, and this must stay a clean, rare
+     * line — not a second 1 Hz stream). null until the first event arrives,
+     * so that very first observation always logs once — this is precisely
+     * the visibility FT10/FT11 lacked (`grep -i settl` → zero hits both
+     * runs, docs/ctl05-investigation.md §7).
+     */
+    private var lastLoggedSettled: Boolean? = null
+
+    private fun onPolicyState(event: SyncCore.Event.PolicyState) {
+        if (event.settled != lastLoggedSettled) {
+            lastLoggedSettled = event.settled
+            com.jointheparty.app.debug.DebugLog.log("policy: settled → ${event.settled}")
+        }
+    }
+
+    /**
+     * CTL-06/W1 (technical-requirements.md §2.17): one line per submitted
+     * fix that reached CORE-06 guard arbitration, pairing with the existing
+     * `fixdbg:` line above via the shared offset value — realizing
+     * docs/ctl05-investigation.md §7's own instrumentation ask ("log the
+     * guard's inputs, not just the verdict") without hand-reconstructing
+     * them from timestamps the way that investigation had to.
+     */
+    private fun onFixDiag(event: SyncCore.Event.FixDiag) {
+        com.jointheparty.app.debug.DebugLog.log(
+            "fixdiag: off=${event.offsetMs} verdict=${event.verdict} " +
+                "trackR=${if (event.tracksRoom) 1 else 0} " +
+                "trackC=${if (event.tracksCand) 1 else 0} " +
+                "anchor=${event.roomAnchorOffsetMs}@${event.roomAnchorAgeMs} " +
+                "pred=${"%.0f".format(event.predictedRoom)} " +
+                "localAud=${"%.0f".format(event.localAudibleMs)}",
+        )
     }
 
     /**

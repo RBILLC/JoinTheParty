@@ -119,6 +119,21 @@ struct EventLog {
     // clamp is what turned one mis-anchored fix into a long monotonic
     // climb — see docs/ctl05-investigation.md §2).
     std::atomic<double> last_drift_ppm{0.0};
+
+    // tech-req §2.17 (CTL-06/W1): the two new diagnostic events.
+    std::atomic<int> policy_state_events{0};
+    std::atomic<int> last_policy_settled{-1};  // -1 = never seen, else 0/1
+    std::atomic<int> last_policy_in_deadband_streak{0};
+    std::atomic<int> fix_diag_events{0};
+    std::atomic<int64_t> last_fix_diag_offset_ms{0};
+    std::atomic<int> last_fix_diag_verdict{-1};
+    std::atomic<int> last_fix_diag_tracks_room{0};
+    std::atomic<int> last_fix_diag_tracks_cand{0};
+    std::atomic<int64_t> last_fix_diag_anchor_offset_ms{0};
+    std::atomic<int64_t> last_fix_diag_anchor_age_ms{0};
+    std::atomic<double> last_fix_diag_off{0.0};
+    std::atomic<double> last_fix_diag_predicted_room{0.0};
+    std::atomic<double> last_fix_diag_local_audible_ms{0.0};
 };
 
 void event_cb(sc_event_type_t type, const void* payload, void* user) {
@@ -138,6 +153,23 @@ void event_cb(sc_event_type_t type, const void* payload, void* user) {
         auto* corr = static_cast<const sc_evt_correction_t*>(payload);
         log->last_seek_to_ms.store(corr->seek_to_ms);
         log->corrections.fetch_add(1);
+    } else if (type == SC_EVT_POLICY_STATE) {
+        auto* ps = static_cast<const sc_evt_policy_state_t*>(payload);
+        log->last_policy_settled.store(ps->settled ? 1 : 0);
+        log->last_policy_in_deadband_streak.store(ps->in_deadband_streak);
+        log->policy_state_events.fetch_add(1);
+    } else if (type == SC_EVT_FIX_DIAG) {
+        auto* fd = static_cast<const sc_evt_fix_diag_t*>(payload);
+        log->last_fix_diag_offset_ms.store(fd->match_offset_ms);
+        log->last_fix_diag_verdict.store(static_cast<int>(fd->verdict));
+        log->last_fix_diag_tracks_room.store(fd->tracks_room ? 1 : 0);
+        log->last_fix_diag_tracks_cand.store(fd->tracks_cand ? 1 : 0);
+        log->last_fix_diag_anchor_offset_ms.store(fd->room_anchor_offset_ms);
+        log->last_fix_diag_anchor_age_ms.store(fd->room_anchor_age_ms);
+        log->last_fix_diag_off.store(fd->off);
+        log->last_fix_diag_predicted_room.store(fd->predicted_room);
+        log->last_fix_diag_local_audible_ms.store(fd->local_audible_ms);
+        log->fix_diag_events.fetch_add(1);
     }
 }
 
@@ -1483,6 +1515,261 @@ void test_reset_capture_history_clears_the_ring() {
     sc_destroy(s);
 }
 
+// tech-req §2.17 (CTL-06/W1): SC_EVT_POLICY_STATE is dispatched at the exact
+// same two call sites as SC_EVT_SYNC_ESTIMATE (synccore.cpp's emit_estimate/
+// emit_policy_state pairing), so the two counts must always match — no
+// timer of its own, no missed or extra emission. settled_ (tech-req §2.15)
+// starts false, is explicitly kept false by the correction this test fires,
+// and becomes observably true only once a LATER fix's pre-decision snapshot
+// reads back the value the verify fix's own on_estimate call just set — the
+// same "emitted before this call's own decision" timing SC_EVT_SYNC_ESTIMATE
+// itself already has, so a THIRD fix is needed to observe the transition.
+void test_policy_state_cadence_and_settled_transition() {
+    constexpr uint64_t kSec = 1'000'000'000ull;
+    sc_config_t cfg = valid_config();  // default deadband (25 ms)
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    EventLog log;
+    sc_set_event_callback(s, event_cb, &log);
+
+    const uint64_t t0 = mono_ns();
+    sc_player_state_t ps{};
+    ps.position_ms = 10000;
+    ps.received_mono_ns = t0;
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+
+    // fix1: local ahead by 200 ms — above the 25 ms default deadband, well
+    // below large_correction_threshold_ms (1000) — an ordinary, immediate
+    // correction.
+    sc_recognition_fix_t fix1{};
+    fix1.source = SC_FIX_SHAZAMKIT;
+    fix1.match_offset_ms = 9800;
+    fix1.capture_mono_ns = t0;
+    fix1.confidence = 0.9f;
+    CHECK(sc_submit_recognition_fix(s, &fix1) == SC_OK);
+    for (int i = 0; i < 400 && log.corrections.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.corrections.load() == 1);
+    CHECK(log.estimates.load() == 1);
+    CHECK(log.policy_state_events.load() == log.estimates.load());
+    CHECK(log.last_policy_settled.load() == 0);
+
+    // Ack the seek — starts the 3 s settle window.
+    const int64_t seek_to_ms = log.last_seek_to_ms.load();
+    CHECK(sc_notify_seek_issued(s, seek_to_ms, t0) == SC_OK);
+
+    // fix2: the post-settle verify fix (tech-req §2.15's "the one place a
+    // landed correction gets confirmed"), past the 3 s settle window, with
+    // an offset matching the SAME never-updated player-state projection the
+    // seek's own aim was computed from — error settles back near zero.
+    sc_recognition_fix_t fix2{};
+    fix2.source = SC_FIX_SHAZAMKIT;
+    fix2.match_offset_ms = 14000;  // projected_local_ms(t0+4s) = 10000+4000
+    fix2.capture_mono_ns = t0 + 4 * kSec;
+    fix2.confidence = 0.9f;
+    int before = log.estimates.load();
+    CHECK(sc_submit_recognition_fix(s, &fix2) == SC_OK);
+    for (int i = 0; i < 400 && log.estimates.load() == before; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.estimates.load() == before + 1);
+    CHECK(log.policy_state_events.load() == log.estimates.load());
+    CHECK(std::abs(log.last_error_ms.load()) < 150.0);
+    // settled_ was just set true INSIDE this fix's own on_estimate call,
+    // which runs AFTER this fix's policy-state snapshot was already taken
+    // (mirroring SC_EVT_SYNC_ESTIMATE's own pre-decision timing) — so THIS
+    // event still reads false; the transition becomes visible on the NEXT
+    // one.
+    CHECK(log.last_policy_settled.load() == 0);
+
+    // fix3: any further small-error fix. Its pre-decision snapshot now
+    // reads back fix2's settled_=true — the transition tech-req §2.17 exists
+    // to make visible (FT10/FT11's own failed `grep -i settl` probe).
+    sc_recognition_fix_t fix3{};
+    fix3.source = SC_FIX_SHAZAMKIT;
+    fix3.match_offset_ms = 14100;  // projected_local_ms(t0+4.1s) = 10000+4100
+    fix3.capture_mono_ns = t0 + 4 * kSec + 100'000'000ull;
+    fix3.confidence = 0.9f;
+    before = log.estimates.load();
+    CHECK(sc_submit_recognition_fix(s, &fix3) == SC_OK);
+    for (int i = 0; i < 400 && log.estimates.load() == before; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.estimates.load() == before + 1);
+    CHECK(log.policy_state_events.load() == log.estimates.load());
+    CHECK(log.last_policy_settled.load() == 1);
+
+    sc_destroy(s);
+}
+
+// tech-req §2.17 (CTL-06/W1): SC_EVT_FIX_DIAG must carry the CORE-06 guard's
+// own arbitration inputs/outputs. Reuses test_self_hearing_guard's exact
+// scenario and offsets (unmodified elsewhere in this file) so every expected
+// diagnostic value below is checked against that already-verified test's own
+// geometry (its inline comments/assertions), rather than an unverified one.
+void test_fix_diag_accepted_and_self_hearing() {
+    constexpr uint64_t kSec = 1'000'000'000ull;
+    sc_config_t cfg = valid_config();
+    cfg.deadband_ms = 5000;
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    EventLog log;
+    sc_set_event_callback(s, event_cb, &log);
+
+    const uint64_t t0 = mono_ns();
+    sc_player_state_t ps{};
+    ps.position_ms = 10000;
+    ps.received_mono_ns = t0;
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+    CHECK(sc_set_aec_mode(s, SC_AEC_FULL) == SC_OK);
+
+    auto submit = [&](int64_t offset_ms, uint64_t t) {
+        sc_recognition_fix_t fix{};
+        fix.source = SC_FIX_SHAZAMKIT;
+        fix.match_offset_ms = offset_ms;
+        fix.capture_mono_ns = t;
+        fix.confidence = 0.9f;
+        CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    };
+    auto processed = [&] {
+        const int before = log.estimates.load();
+        for (int i = 0; i < 400 && log.estimates.load() == before; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    };
+
+    // Bootstrap fix: the session's very first, accepted unconditionally
+    // (no anchor existed yet to arbitrate against).
+    submit(16200, t0 + 5 * kSec);
+    processed();
+    CHECK(log.fix_diag_events.load() == 1);
+    CHECK(log.last_fix_diag_verdict.load() == SC_FIX_DIAG_ACCEPTED);
+    CHECK(log.last_fix_diag_offset_ms.load() == 16200);
+    CHECK(log.last_fix_diag_tracks_room.load() == 0);
+    CHECK(log.last_fix_diag_anchor_offset_ms.load() == -1);
+    CHECK(log.last_fix_diag_anchor_age_ms.load() == -1);
+
+    // Second room fix: corroborates and confirms the anchor — tracks_room
+    // is now true (it tracks the just-seeded anchor), and the anchor
+    // reported is the LIVE one as it stood BEFORE this fix's own promotion
+    // (the bootstrap's 16 200 @ t0+5s, aged 5 s at this fix's capture time).
+    submit(21200, t0 + 10 * kSec);
+    processed();
+    CHECK(log.fix_diag_events.load() == 2);
+    CHECK(log.last_fix_diag_verdict.load() == SC_FIX_DIAG_ACCEPTED);
+    CHECK(log.last_fix_diag_tracks_room.load() == 1);
+    CHECK(log.last_fix_diag_anchor_offset_ms.load() == 16200);
+    CHECK(log.last_fix_diag_anchor_age_ms.load() == 5000);
+
+    // Self-match against the CONFIRMED reference (test_self_hearing_guard's
+    // own scenario, verbatim): lands on our OWN audible position (25 000)
+    // while the room prediction says 26 200.
+    submit(25000, t0 + 15 * kSec);
+    for (int i = 0; i < 400 && log.rejects.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.rejects.load() == 1);
+    CHECK(log.fix_diag_events.load() == 3);
+    CHECK(log.last_fix_diag_verdict.load() == SC_FIX_DIAG_SELF_HEARING);
+    CHECK(log.last_fix_diag_offset_ms.load() == 25000);
+    CHECK(log.last_fix_diag_tracks_room.load() == 0);
+    CHECK(log.last_fix_diag_tracks_cand.load() == 0);
+    // Live anchor as it stood at arbitration time: the confirmed 21 200 @
+    // t0+10s, aged 5 s at this fix's capture time (t0+15s).
+    CHECK(log.last_fix_diag_anchor_offset_ms.load() == 21200);
+    CHECK(log.last_fix_diag_anchor_age_ms.load() == 5000);
+    CHECK(std::abs(log.last_fix_diag_off.load() - 25000.0) < 0.5);
+    CHECK(std::abs(log.last_fix_diag_predicted_room.load() - 26200.0) < 0.5);
+    CHECK(std::abs(log.last_fix_diag_local_audible_ms.load() - 25000.0) < 0.5);
+
+    sc_destroy(s);
+}
+
+// tech-req §2.17 (CTL-06/W1): SC_EVT_FIX_DIAG across the exact CTL-05
+// post-seek corroboration sequence test_post_seek_two_agreeing_fixes_reanchor
+// already established (same setup, same offsets, unmodified elsewhere in
+// this file) — every expected diagnostic value below is checked against
+// that already-verified test's own geometry.
+void test_fix_diag_post_seek_corroboration() {
+    constexpr uint64_t kSec = 1'000'000'000ull;
+    sc_config_t cfg = valid_config();
+    cfg.deadband_ms = 20000;
+    sc_session_t* s = nullptr;
+    CHECK(sc_create(&cfg, &s) == SC_OK);
+    EventLog log;
+    sc_set_event_callback(s, event_cb, &log);
+
+    const uint64_t t0 = mono_ns();
+    sc_player_state_t ps{};
+    ps.position_ms = 10000;
+    ps.received_mono_ns = t0;
+    CHECK(sc_submit_player_state(s, &ps) == SC_OK);
+    CHECK(sc_set_aec_mode(s, SC_AEC_FULL) == SC_OK);
+
+    auto submit = [&](int64_t offset_ms, uint64_t t) {
+        sc_recognition_fix_t fix{};
+        fix.source = SC_FIX_SHAZAMKIT;
+        fix.match_offset_ms = offset_ms;
+        fix.capture_mono_ns = t;
+        fix.confidence = 0.9f;
+        CHECK(sc_submit_recognition_fix(s, &fix) == SC_OK);
+    };
+    auto processed = [&] {
+        const int before = log.estimates.load();
+        for (int i = 0; i < 400 && log.estimates.load() == before; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    };
+
+    submit(16200, t0 + 5 * kSec);
+    processed();
+    submit(21200, t0 + 10 * kSec);
+    processed();
+    CHECK(log.fix_diag_events.load() == 2);
+
+    CHECK(sc_notify_seek_issued(s, 21300, t0 + 11 * kSec) == SC_OK);
+
+    // P1: accepted, but only one post-seek fix so far — not yet promoted.
+    submit(26550, t0 + 16 * kSec);
+    processed();
+    CHECK(log.fix_diag_events.load() == 3);
+    CHECK(log.last_fix_diag_verdict.load() == SC_FIX_DIAG_ACCEPTED);
+    CHECK(log.last_fix_diag_tracks_room.load() == 0);
+    CHECK(log.last_fix_diag_anchor_offset_ms.load() == 21200);
+    CHECK(log.last_fix_diag_anchor_age_ms.load() == 6000);
+
+    // P2: agrees with P1, promoting the anchor — but the diagnostic reports
+    // the anchor as it stood BEFORE this fix's own promotion (still
+    // 21 200), the same pre-mutation snapshot rule self_hearing_candidate
+    // itself already follows.
+    submit(31550, t0 + 21 * kSec);
+    processed();
+    CHECK(log.fix_diag_events.load() == 4);
+    CHECK(log.last_fix_diag_verdict.load() == SC_FIX_DIAG_ACCEPTED);
+    CHECK(log.last_fix_diag_anchor_offset_ms.load() == 21200);
+    CHECK(log.last_fix_diag_anchor_age_ms.load() == 11000);
+
+    // P3: judged against the FRESH (just-promoted) anchor and tracks it
+    // exactly.
+    submit(36550, t0 + 26 * kSec);
+    processed();
+    CHECK(log.fix_diag_events.load() == 5);
+    CHECK(log.last_fix_diag_verdict.load() == SC_FIX_DIAG_ACCEPTED);
+    CHECK(log.last_fix_diag_tracks_room.load() == 1);
+    CHECK(log.last_fix_diag_anchor_offset_ms.load() == 31550);
+    CHECK(log.last_fix_diag_anchor_age_ms.load() == 5000);
+
+    // P4: self-hearing against the anchor P3 just re-established.
+    submit(41000, t0 + 31 * kSec);
+    for (int i = 0; i < 400 && log.rejects.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(log.rejects.load() == 1);
+    CHECK(log.fix_diag_events.load() == 6);
+    CHECK(log.last_fix_diag_verdict.load() == SC_FIX_DIAG_SELF_HEARING);
+    CHECK(log.last_fix_diag_anchor_offset_ms.load() == 36550);
+    CHECK(log.last_fix_diag_anchor_age_ms.load() == 5000);
+    CHECK(std::abs(log.last_fix_diag_off.load() - 41000.0) < 0.5);
+    CHECK(std::abs(log.last_fix_diag_predicted_room.load() - 41550.0) < 0.5);
+    CHECK(std::abs(log.last_fix_diag_local_audible_ms.load() - 41000.0) < 0.5);
+
+    sc_destroy(s);
+}
+
 int main() {
     test_reset_capture_history_clears_the_ring();
     test_config_validation();
@@ -1505,6 +1792,9 @@ int main() {
     test_duck_executed_echo_contract();
     test_duck_deferred_detector_finds_dip();
     test_duck_deferred_detector_no_dip_reads_near_zero();
+    test_policy_state_cadence_and_settled_transition();
+    test_fix_diag_accepted_and_self_hearing();
+    test_fix_diag_post_seek_corroboration();
 
     if (g_failures == 0) {
         std::printf("synccore_tests: all tests passed\n");

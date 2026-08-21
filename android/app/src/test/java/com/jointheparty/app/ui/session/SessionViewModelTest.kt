@@ -10,6 +10,7 @@ import com.jointheparty.app.core.SyncEngine
 import com.jointheparty.app.data.CalibrationProfile
 import com.jointheparty.app.data.NudgeStore
 import com.jointheparty.app.data.sortedByUpdatedAtDescending
+import com.jointheparty.app.debug.DebugLog
 import com.jointheparty.app.recognition.RecognitionProvider
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
@@ -2357,6 +2358,95 @@ class SessionViewModelTest {
         assertEquals(listOf("setVolume(0)", "setVolume(2)", "notifyDuckExecuted"), callLog)
         assertEquals(listOf(40), engine.duckAchievedDeciDbLog)
     }
+
+    // ---- CTL-06/W1: Event.PolicyState / Event.FixDiag (technical-requirements.md §2.17) ----
+
+    @Test
+    fun policyStateLogsOnlyOnSettledTransition() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val vm = viewModel(engine)
+
+        // First-ever observation always logs — the field-test visibility
+        // §2.17/§7 exists to guarantee (FT10/FT11's `grep -i settl` found
+        // zero hits either run).
+        engine.emit(SyncCore.Event.PolicyState(settled = false, inDeadbandStreak = 0))
+        advanceUntilIdle()
+        assertTrue(DebugLog.lines.value.any { it.contains("policy: settled → false") })
+        val settledLogCountAfterFirst =
+            DebugLog.lines.value.count { it.contains("policy: settled") }
+
+        // Same value again (a different inDeadbandStreak, same settled) must
+        // NOT add a second line — transition-only, never per tick.
+        engine.emit(SyncCore.Event.PolicyState(settled = false, inDeadbandStreak = 2))
+        advanceUntilIdle()
+        assertEquals(
+            settledLogCountAfterFirst,
+            DebugLog.lines.value.count { it.contains("policy: settled") },
+        )
+
+        // Flips to true: logs again.
+        engine.emit(SyncCore.Event.PolicyState(settled = true, inDeadbandStreak = 5))
+        advanceUntilIdle()
+        assertTrue(DebugLog.lines.value.any { it.contains("policy: settled → true") })
+    }
+
+    @Test
+    fun fixDiagLogsOneLineWithEventValues() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val vm = viewModel(engine)
+
+        engine.emit(
+            SyncCore.Event.FixDiag(
+                offsetMs = 25000L,
+                verdict = SyncCore.FixDiagVerdict.SELF_HEARING,
+                tracksRoom = false,
+                tracksCand = true,
+                roomAnchorOffsetMs = 16200L,
+                roomAnchorAgeMs = 5000L,
+                off = 25000.0,
+                predictedRoom = 26200.0,
+                localAudibleMs = 25010.0,
+            ),
+        )
+        advanceUntilIdle()
+
+        val line = DebugLog.lines.value.last { it.contains("fixdiag:") }
+        assertTrue(line.contains("off=25000"))
+        assertTrue(line.contains("verdict=SELF_HEARING"))
+        assertTrue(line.contains("trackR=0"))
+        assertTrue(line.contains("trackC=1"))
+        assertTrue(line.contains("anchor=16200@5000"))
+        assertTrue(line.contains("pred=26200"))
+        assertTrue(line.contains("localAud=25010"))
+    }
+
+    @Test
+    fun fixDiagAcceptedVerdictRenders() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val vm = viewModel(engine)
+
+        engine.emit(
+            SyncCore.Event.FixDiag(
+                offsetMs = 21200L,
+                verdict = SyncCore.FixDiagVerdict.ACCEPTED,
+                tracksRoom = true,
+                tracksCand = false,
+                roomAnchorOffsetMs = 16200L,
+                roomAnchorAgeMs = 5000L,
+                off = 21200.0,
+                predictedRoom = 21200.0,
+                localAudibleMs = 11000.0,
+            ),
+        )
+        advanceUntilIdle()
+
+        val line = DebugLog.lines.value.last { it.contains("fixdiag:") }
+        assertTrue(line.contains("verdict=ACCEPTED"))
+        assertTrue(line.contains("trackR=1"))
+        assertTrue(line.contains("trackC=0"))
+    }
+
+    // ---- end CTL-06/W1 ----
 
     private fun livePlayerState(isPaused: Boolean = false) = SpotifyController.RemotePlayerState(
         trackUri = "spotify:track:abc",

@@ -40,6 +40,14 @@ struct BridgeHandle {
     // nativeCreate; started/stopped explicitly via nativeStartCapture /
     // nativeStopCapture.
     std::unique_ptr<synccore_android::OboeCapture> capture;
+    // CTL-06/W1 (technical-requirements.md §2.17): SC_EVT_POLICY_STATE and
+    // SC_EVT_FIX_DIAG carry more fields (2 and 9 respectively) than the
+    // generic packed onNativeEvent(type,d0,d1,d2,i0,i1,l0) signature has
+    // slots for (6), so they get their own dedicated callback methods/IDs
+    // instead of trying to shoehorn them into that packing scheme. Every
+    // existing event keeps using on_event unchanged.
+    jmethodID on_policy_state = nullptr;
+    jmethodID on_fix_diag = nullptr;
 };
 
 JNIEnv* attached_env() {
@@ -61,10 +69,41 @@ JNIEnv* attached_env() {
 // ACTIVE_PROBE:       i0=pause_ms (CTL-01b)
 // ACTIVE_DUCK:        i0=duck_ms (DSP-03b)
 // REQUEST_FIX / TRACK_LOST: no payload
+// POLICY_STATE / FIX_DIAG (CTL-06/W1): NOT packed into this signature — too
+// many fields (2 and 9). Dispatched via their own dedicated onPolicyStateEvent
+// / onFixDiagEvent callback methods instead; see event_trampoline below.
 void event_trampoline(sc_event_type_t type, const void* payload, void* user) {
     auto* h = static_cast<BridgeHandle*>(user);
     JNIEnv* env = attached_env();
     if (!env) return;
+
+    // CTL-06/W1 (technical-requirements.md §2.17): dedicated dispatch, ahead
+    // of the generic packed switch below — see BridgeHandle's on_policy_state
+    // / on_fix_diag comment for why these two don't fit the (d0,d1,d2,i0,i1,
+    // l0) packing scheme every other event below uses.
+    if (type == SC_EVT_POLICY_STATE) {
+        auto* e = static_cast<const sc_evt_policy_state_t*>(payload);
+        env->CallVoidMethod(h->target, h->on_policy_state,
+                            e->settled ? JNI_TRUE : JNI_FALSE,
+                            static_cast<jint>(e->in_deadband_streak));
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return;
+    }
+    if (type == SC_EVT_FIX_DIAG) {
+        auto* e = static_cast<const sc_evt_fix_diag_t*>(payload);
+        env->CallVoidMethod(h->target, h->on_fix_diag,
+                            static_cast<jlong>(e->match_offset_ms),
+                            static_cast<jint>(e->verdict),
+                            e->tracks_room ? JNI_TRUE : JNI_FALSE,
+                            e->tracks_cand ? JNI_TRUE : JNI_FALSE,
+                            static_cast<jlong>(e->room_anchor_offset_ms),
+                            static_cast<jlong>(e->room_anchor_age_ms),
+                            static_cast<jdouble>(e->off),
+                            static_cast<jdouble>(e->predicted_room),
+                            static_cast<jdouble>(e->local_audible_ms));
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return;
+    }
 
     jdouble d0 = 0, d1 = 0, d2 = 0;
     jint i0 = 0, i1 = 0;
@@ -110,6 +149,11 @@ void event_trampoline(sc_event_type_t type, const void* payload, void* user) {
         case SC_EVT_REQUEST_FIX:
         case SC_EVT_TRACK_LOST:
             break;
+        // CTL-06/W1: both handled and returned above via their own dedicated
+        // methods; listed here only so -Wswitch sees an exhaustive switch.
+        case SC_EVT_POLICY_STATE:
+        case SC_EVT_FIX_DIAG:
+            break;
     }
     env->CallVoidMethod(h->target, h->on_event, static_cast<jint>(type), d0,
                         d1, d2, i0, i1, l0);
@@ -148,8 +192,13 @@ Java_com_jointheparty_app_core_SyncCore_nativeCreate(
     h->target = env->NewGlobalRef(thiz);
     jclass cls = env->GetObjectClass(thiz);
     h->on_event = env->GetMethodID(cls, "onNativeEvent", "(IDDDIIJ)V");
+    // CTL-06/W1 (technical-requirements.md §2.17): dedicated method IDs for
+    // the two new diagnostic events (see BridgeHandle's field comment).
+    h->on_policy_state = env->GetMethodID(cls, "onPolicyStateEvent", "(ZI)V");
+    h->on_fix_diag =
+        env->GetMethodID(cls, "onFixDiagEvent", "(JIZZJJDDD)V");
     env->DeleteLocalRef(cls);
-    if (!h->target || !h->on_event) {
+    if (!h->target || !h->on_event || !h->on_policy_state || !h->on_fix_diag) {
         sc_destroy(session);
         if (h->target) env->DeleteGlobalRef(h->target);
         delete h;

@@ -43,6 +43,13 @@ class SyncCore(
     enum class FixSource { SHAZAMKIT, ACRCLOUD }
     enum class RejectReason { SELF_HEARING, LOW_CONFIDENCE, SETTLING }
 
+    /**
+     * CTL-06/W1 (technical-requirements.md §2.17). Ordinal order matches the
+     * native `sc_fix_diag_verdict_t` exactly — the JNI bridge passes the raw
+     * ordinal through [onFixDiagEvent].
+     */
+    enum class FixDiagVerdict { ACCEPTED, SELF_HEARING, LOW_CONFIDENCE, SETTLING }
+
     sealed interface Event {
         data class SyncEstimate(
             val errorMs: Double,
@@ -87,6 +94,43 @@ class SyncCore(
          * -6.0 dB exactly is rarely reachable.
          */
         data class ActiveDuck(val duckMs: Int) : Event
+
+        /**
+         * CTL-06/W1 (technical-requirements.md §2.17): the dedicated
+         * per-tick policy-state diagnostic, emitted on the same cadence as
+         * [SyncEstimate] — pure observation, never fed back into any
+         * decision. [settled] is the §2.15 (CTL-04) hysteresis state;
+         * [inDeadbandStreak] is the §2.7 (CTL-02) persistence ring's current
+         * occupancy.
+         */
+        data class PolicyState(val settled: Boolean, val inDeadbandStreak: Int) : Event
+
+        /**
+         * CTL-06/W1 (technical-requirements.md §2.17): emitted once per
+         * submitted recognition fix that reaches the CORE-06 self-match
+         * guard's arbitration (accepted, [FixDiagVerdict.SELF_HEARING], or
+         * [FixDiagVerdict.LOW_CONFIDENCE]) — a fix rejected for
+         * [RejectReason.SETTLING] never reaches arbitration and has no
+         * [FixDiag] counterpart (see [FixRejected] for that case). Carries
+         * the arbitration's own inputs/outputs: [tracksRoom]/[tracksCand]
+         * (the CORE-06 guard's room/candidate-timeline checks),
+         * [roomAnchorOffsetMs]/[roomAnchorAgeMs] (the live room anchor as it
+         * stood at arbitration time; -1/-1 = no anchor yet), and the
+         * self-hearing comparison values [off]/[predictedRoom]/
+         * [localAudibleMs] (docs/ctl05-investigation.md §2's own
+         * hand-reconstructed arithmetic, now logged directly).
+         */
+        data class FixDiag(
+            val offsetMs: Long,
+            val verdict: FixDiagVerdict,
+            val tracksRoom: Boolean,
+            val tracksCand: Boolean,
+            val roomAnchorOffsetMs: Long,
+            val roomAnchorAgeMs: Long,
+            val off: Double,
+            val predictedRoom: Double,
+            val localAudibleMs: Double,
+        ) : Event
     }
 
     private val eventFlow = MutableSharedFlow<Event>(
@@ -249,6 +293,52 @@ class SyncCore(
             else -> return
         }
         eventFlow.tryEmit(event)
+    }
+
+    /**
+     * CTL-06/W1 (technical-requirements.md §2.17). Called from the native
+     * worker thread, same as [onNativeEvent] — dedicated signature (ZI)V
+     * rather than shoehorning [Event.PolicyState]'s 2 fields into the
+     * generic packed callback.
+     */
+    @Keep
+    private fun onPolicyStateEvent(settled: Boolean, inDeadbandStreak: Int) {
+        eventFlow.tryEmit(Event.PolicyState(settled, inDeadbandStreak))
+    }
+
+    /**
+     * CTL-06/W1 (technical-requirements.md §2.17). Called from the native
+     * worker thread, same as [onNativeEvent] — dedicated signature
+     * (JIZZJJDDD)V rather than shoehorning [Event.FixDiag]'s 9 fields into
+     * the generic packed callback. [verdict] is the raw `sc_fix_diag_
+     * verdict_t` ordinal — see [FixDiagVerdict]'s doc comment for why the
+     * mapping is a direct index, not a `when`.
+     */
+    @Keep
+    private fun onFixDiagEvent(
+        offsetMs: Long,
+        verdict: Int,
+        tracksRoom: Boolean,
+        tracksCand: Boolean,
+        roomAnchorOffsetMs: Long,
+        roomAnchorAgeMs: Long,
+        off: Double,
+        predictedRoom: Double,
+        localAudibleMs: Double,
+    ) {
+        eventFlow.tryEmit(
+            Event.FixDiag(
+                offsetMs = offsetMs,
+                verdict = FixDiagVerdict.entries.getOrElse(verdict) { FixDiagVerdict.LOW_CONFIDENCE },
+                tracksRoom = tracksRoom,
+                tracksCand = tracksCand,
+                roomAnchorOffsetMs = roomAnchorOffsetMs,
+                roomAnchorAgeMs = roomAnchorAgeMs,
+                off = off,
+                predictedRoom = predictedRoom,
+                localAudibleMs = localAudibleMs,
+            ),
+        )
     }
 
     private external fun nativeCreate(

@@ -18,6 +18,14 @@
  *
  * DSP-03a (technical-requirements.md §2.12) coverage: same shape, for
  * SC_EVT_ACTIVE_DUCK / sc_evt_active_duck_t / sc_notify_duck_executed.
+ *
+ * CTL-06/W1 (technical-requirements.md §2.17) coverage: same shape again,
+ * for SC_EVT_POLICY_STATE / sc_evt_policy_state_t and SC_EVT_FIX_DIAG /
+ * sc_evt_fix_diag_t / sc_fix_diag_verdict_t. Both are diagnostic-only —
+ * emitted by the worker off existing cadences/call sites, with no new
+ * sc_notify_ or sc_ entry point of their own — so this file's job for them is
+ * exhaustiveness plus "these are valid C99 aggregates with the documented
+ * field shapes," mirroring the ACTIVE_PROBE/ACTIVE_DUCK coverage above.
  */
 #include <synccore/synccore.h>
 
@@ -36,6 +44,20 @@ static int event_is_known(sc_event_type_t type) {
         case SC_EVT_LATENCY_RESIDUAL:
         case SC_EVT_ACTIVE_PROBE:
         case SC_EVT_ACTIVE_DUCK:
+        case SC_EVT_POLICY_STATE:
+        case SC_EVT_FIX_DIAG:
+            return 1;
+    }
+    return 0;
+}
+
+/* Same exhaustiveness discipline, for the new verdict enum. */
+static int fix_diag_verdict_is_known(sc_fix_diag_verdict_t v) {
+    switch (v) {
+        case SC_FIX_DIAG_ACCEPTED:
+        case SC_FIX_DIAG_SELF_HEARING:
+        case SC_FIX_DIAG_LOW_CONFIDENCE:
+        case SC_FIX_DIAG_SETTLING:
             return 1;
     }
     return 0;
@@ -51,6 +73,28 @@ int main(void) {
     duck.duck_ms = 150;
     if (duck.duck_ms != 150) return 1;
     if (!event_is_known(SC_EVT_ACTIVE_DUCK)) return 1;
+
+    sc_evt_policy_state_t policy_state;
+    policy_state.settled = 1;
+    policy_state.in_deadband_streak = 3;
+    if (!policy_state.settled) return 1;
+    if (policy_state.in_deadband_streak != 3) return 1;
+    if (!event_is_known(SC_EVT_POLICY_STATE)) return 1;
+
+    sc_evt_fix_diag_t fix_diag;
+    fix_diag.match_offset_ms = 12345;
+    fix_diag.verdict = SC_FIX_DIAG_SELF_HEARING;
+    fix_diag.tracks_room = 0;
+    fix_diag.tracks_cand = 1;
+    fix_diag.room_anchor_offset_ms = -1;
+    fix_diag.room_anchor_age_ms = -1;
+    fix_diag.off = 100.0;
+    fix_diag.predicted_room = 200.0;
+    fix_diag.local_audible_ms = 100.5;
+    if (fix_diag.match_offset_ms != 12345) return 1;
+    if (!fix_diag_verdict_is_known(fix_diag.verdict)) return 1;
+    if (fix_diag.tracks_room || !fix_diag.tracks_cand) return 1;
+    if (!event_is_known(SC_EVT_FIX_DIAG)) return 1;
 
     {
         sc_config_t cfg;

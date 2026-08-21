@@ -352,6 +352,17 @@ public:
     // echo with no outstanding request is safely ignored.
     void on_probe_executed(double current_error_ms, uint64_t now_ns);
 
+    // tech-req §2.17 (CTL-06/W1): read-only accessors for the new
+    // SC_EVT_POLICY_STATE diagnostic event. Neither has any side effect —
+    // both simply expose existing private state (settled_ has had no event
+    // path at all, per docs/ctl05-investigation.md §7; ring_count_ already
+    // backs §2.7's persistence gate). Observation only: nothing reads these
+    // back into a decision.
+    bool settled() const { return settled_; }
+    int32_t in_deadband_streak() const {
+        return static_cast<int32_t>(ring_count_);
+    }
+
     // tech-req §2.12 (DSP-03a): the worker reads this to fill
     // sc_evt_active_duck_t.duck_ms when dispatching SC_EVT_ACTIVE_DUCK.
     int32_t duck_ms() const { return cfg_.duck_ms; }

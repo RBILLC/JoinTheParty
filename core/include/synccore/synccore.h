@@ -270,7 +270,26 @@ typedef enum {
      * documents. Appended at the END of this enum per the same
      * ABI-stability rule; SC_EVT_ACTIVE_PROBE/sc_evt_active_probe_t/
      * sc_notify_probe_executed above are byte-untouched by this addition. */
-    SC_EVT_ACTIVE_DUCK        /* payload: sc_evt_active_duck_t */
+    SC_EVT_ACTIVE_DUCK,       /* payload: sc_evt_active_duck_t */
+    /* CTL-06/W1 (technical-requirements.md §2.17): diagnostic instrumentation
+     * only — pure observation, zero effect on any decision. Dedicated
+     * per-tick policy-state event, emitted on the SAME worker cadence as
+     * SC_EVT_SYNC_ESTIMATE (no new timer). Appended at the END of this enum
+     * per the §2.9/§2.12 ABI-stability precedent; every prior value above is
+     * byte-untouched. */
+    SC_EVT_POLICY_STATE,      /* payload: sc_evt_policy_state_t */
+    /* CTL-06/W1 (technical-requirements.md §2.17): emitted once per
+     * submitted recognition fix that reaches the CORE-06 self-match guard's
+     * arbitration (accepted, SELF_HEARING-rejected, or LOW_CONFIDENCE-
+     * rejected), immediately after that arbitration, carrying its own inputs
+     * and outputs. A fix rejected for SC_REJECT_SETTLING never reaches
+     * arbitration at all (the settle-window suppression in synccore.cpp
+     * runs strictly before it) and has no SC_EVT_FIX_DIAG counterpart; its
+     * existing SC_EVT_FIX_REJECTED/SC_REJECT_SETTLING event is unchanged and
+     * is the complete record of that case. Appended at the END of this enum;
+     * every prior value, including SC_EVT_POLICY_STATE just above, is
+     * byte-untouched. */
+    SC_EVT_FIX_DIAG           /* payload: sc_evt_fix_diag_t */
 } sc_event_type_t;
 
 typedef struct {
@@ -326,6 +345,71 @@ typedef struct {
 typedef struct {
     int32_t duck_ms;
 } sc_evt_active_duck_t;
+
+/* CTL-06/W1 (technical-requirements.md §2.17): the dedicated per-tick
+ * policy-state diagnostic. Emitted on the same worker cadence as
+ * SC_EVT_SYNC_ESTIMATE (no new timer, no new config) — pure observation of
+ * state CorrectionPolicy already tracks; never influences any decision. */
+typedef struct {
+    bool    settled;             /* §2.15 (CTL-04) hysteresis state: true
+                                   * once a correction has been confirmed at
+                                   * floor by the post-settle verify fix. */
+    int32_t in_deadband_streak;  /* Current occupancy of the §2.7 (CTL-02)
+                                   * persistence ring — converged (or, while
+                                   * settled, every) fresh-fix samples
+                                   * accumulated toward the corroboration
+                                   * gates. Convergence context the policy
+                                   * already tracked before this event
+                                   * existed; 0 whenever the ring is empty. */
+} sc_evt_policy_state_t;
+
+/* CTL-06/W1 (technical-requirements.md §2.17): fix-arbitration diagnostic.
+ * See sc_event_type_t's SC_EVT_FIX_DIAG comment for exactly which submitted
+ * fixes get one of these (every one that reaches the CORE-06 self-match
+ * guard's arbitration; SC_REJECT_SETTLING rejections do not). */
+typedef enum {
+    SC_FIX_DIAG_ACCEPTED,
+    SC_FIX_DIAG_SELF_HEARING,
+    SC_FIX_DIAG_LOW_CONFIDENCE,
+    /* Not emitted by this version of the worker (SC_REJECT_SETTLING never
+     * reaches arbitration) — included so the verdict enum is a strict
+     * superset of sc_reject_reason_t, in case a future change needs it. */
+    SC_FIX_DIAG_SETTLING
+} sc_fix_diag_verdict_t;
+
+typedef struct {
+    int64_t match_offset_ms;         /* the submitted fix's own offset */
+    sc_fix_diag_verdict_t verdict;
+    bool    tracks_room;             /* CORE-06 guard input: did this fix
+                                       * track the live room-anchor
+                                       * prediction (docs/ctl05-investigation
+                                       * .md §2's kRoomContinuityGateMs)? */
+    bool    tracks_cand;             /* CORE-06 guard input: did this fix
+                                       * track the held-aside candidate
+                                       * timeline instead? */
+    int64_t room_anchor_offset_ms;   /* live anchor at arbitration time, as
+                                       * it stood before this fix could
+                                       * mutate it; -1 = no anchor yet */
+    int64_t room_anchor_age_ms;      /* anchor's age at this fix's capture
+                                       * time; -1 when room_anchor_offset_ms
+                                       * is -1 (no anchor to age) */
+    double  off;                     /* self-hearing comparison input: this
+                                       * fix's own offset (ms), duplicated
+                                       * here as a double alongside the exact
+                                       * integer match_offset_ms above for
+                                       * direct comparison against the next
+                                       * two fields, mirroring
+                                       * docs/ctl05-investigation.md §2's own
+                                       * arithmetic */
+    double  predicted_room;          /* self-hearing comparison input: the
+                                       * room-anchor prediction at this fix's
+                                       * capture time (0.0 when no anchor was
+                                       * usable) */
+    double  local_audible_ms;        /* self-hearing comparison input: what a
+                                       * mic hearing OUR OWN output would
+                                       * read at this fix's capture time
+                                       * (SyncEstimator::local_audible_ms) */
+} sc_evt_fix_diag_t;
 
 typedef void (*sc_event_cb)(sc_event_type_t, const void* payload, void* user_data);
 

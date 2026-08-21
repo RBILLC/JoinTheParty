@@ -480,6 +480,19 @@ struct sc_session {
         dispatch(SC_EVT_SYNC_ESTIMATE, &out);
     }
 
+    // tech-req §2.17 (CTL-06/W1): dedicated per-tick policy-state diagnostic,
+    // dispatched at the exact same call sites as emit_estimate above — "the
+    // same worker cadence as SC_EVT_SYNC_ESTIMATE, no new timer." Pure
+    // observation of wk.policy's own already-tracked state (settled_,
+    // ring_count_ via the new read-only accessors); never influences
+    // anything downstream.
+    void emit_policy_state() {
+        sc_evt_policy_state_t out{};
+        out.settled = wk.policy.settled();
+        out.in_deadband_streak = wk.policy.in_deadband_streak();
+        dispatch(SC_EVT_POLICY_STATE, &out);
+    }
+
     void apply(const synccore::Action& action) {
         switch (action.kind) {
             case synccore::ActionKind::kNone:
@@ -702,6 +715,7 @@ struct sc_session {
             wk.now_ns - wk.last_emit_ns >= kEstimateEmitPeriodNs) {
             wk.last_emit_ns = wk.now_ns;
             emit_estimate(est);
+            emit_policy_state();  // tech-req §2.17: same cadence, no new timer
         }
         if (wk.policy.fix_request_due(wk.now_ns))
             dispatch(SC_EVT_REQUEST_FIX, nullptr);
@@ -808,6 +822,44 @@ struct sc_session {
                     std::abs(off - wk.estimator.local_audible_ms(t)) <=
                         kSelfMatchWindowMs;
 
+                // tech-req §2.17 (CTL-06/W1): snapshot the diagnostic values
+                // at the SAME point self_hearing_candidate is judged — "as
+                // it stood at entry," exactly like the comment above
+                // self_hearing_candidate's own computation. The CTL-05
+                // post-seek corroboration block just below (and, for an
+                // accepted fix, the room-timeline-maintenance block further
+                // down) can go on to replace the live anchor; SC_EVT_FIX_DIAG
+                // must report what arbitration actually SAW this fix
+                // against, not what this fix's own consequences left
+                // behind. local_audible_ms(t) is safe to call unconditionally
+                // (no side effects) even when has_player_state() is false —
+                // it is exactly the value self_hearing_candidate's own
+                // comparison above already reads, computed once here for
+                // reuse rather than recomputed.
+                const int64_t diag_anchor_offset_ms = wk.room_anchor_offset_ms;
+                const int64_t diag_anchor_age_ms =
+                    diag_anchor_offset_ms < 0
+                        ? -1
+                        : static_cast<int64_t>(
+                              (t > wk.room_anchor_ns ? (t - wk.room_anchor_ns)
+                                                      : 0ull) /
+                              1'000'000ull);
+                const double diag_local_audible_ms =
+                    wk.estimator.local_audible_ms(t);
+                auto emit_fix_diag = [&](sc_fix_diag_verdict_t verdict) {
+                    sc_evt_fix_diag_t diag{};
+                    diag.match_offset_ms = cmd.fix.match_offset_ms;
+                    diag.verdict = verdict;
+                    diag.tracks_room = tracks_room;
+                    diag.tracks_cand = tracks_cand;
+                    diag.room_anchor_offset_ms = diag_anchor_offset_ms;
+                    diag.room_anchor_age_ms = diag_anchor_age_ms;
+                    diag.off = off;
+                    diag.predicted_room = predicted_room;
+                    diag.local_audible_ms = diag_local_audible_ms;
+                    dispatch(SC_EVT_FIX_DIAG, &diag);
+                };
+
                 // CTL-05 (docs/ctl05-investigation.md §6.1): while a
                 // post-seek anchor awaits reconfirmation, this SEPARATE
                 // candidate slot tracks whether consecutive post-seek fixes
@@ -857,6 +909,7 @@ struct sc_session {
                     }
                     sc_evt_fix_rejected_t rej{SC_REJECT_SELF_HEARING};
                     dispatch(SC_EVT_FIX_REJECTED, &rej);
+                    emit_fix_diag(SC_FIX_DIAG_SELF_HEARING);
                     return;
                 }
                 if (!wk.estimator.on_fix(cmd.fix.match_offset_ms, t,
@@ -864,9 +917,11 @@ struct sc_session {
                                          cmd.fix.confidence)) {
                     sc_evt_fix_rejected_t rej{SC_REJECT_LOW_CONFIDENCE};
                     dispatch(SC_EVT_FIX_REJECTED, &rej);
+                    emit_fix_diag(SC_FIX_DIAG_LOW_CONFIDENCE);
                     return;
                 }
                 wk.policy.on_fix_accepted(t);
+                emit_fix_diag(SC_FIX_DIAG_ACCEPTED);
                 // MHT-01 (tech-req §2.16 hard limit, restated verbatim: "the
                 // bank never touches self-match"). This call sits STRICTLY
                 // downstream of every §7.3 self-match-guard early return
@@ -959,6 +1014,7 @@ struct sc_session {
                     dom.valid ? dom.estimate : wk.estimator.estimate_at(decide_ns);
                 wk.last_emit_ns = decide_ns;
                 emit_estimate(est);
+                emit_policy_state();  // tech-req §2.17: same cadence
                 // projected_local_ms stays the SHARED estimator's own
                 // projection unconditionally (§2.16 doesn't touch the
                 // player-state projection, only which offset/drift
