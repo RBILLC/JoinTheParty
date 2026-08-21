@@ -739,6 +739,30 @@ The human reported "3–4 corrections then an interfering 5th"; FT9's own read i
 
 ---
 
+### 2.17 CTL-06 Diagnostic Instrumentation — policy-state event & fix-arbitration diagnostics
+
+**Status.** Implementation-authorized (wayfinder map #41, ticket #42 / CTL-06/W1; charter decisions recorded on the map 2026-08-20). **Additive instrumentation only — zero behavior change anywhere.** The estimator, `CorrectionPolicy` decisions, and the self-match guard's arbitration remain byte-identical in outcome; this section only makes what they already do observable. Two consumers: the §6.4 control run (CTL-06/W2, #43) that discriminates the chronic-zEnd-bias root cause, and CTL-04 field observability — `settled_` has now been unobservable through two field tests (FT10, FT11: `grep -i settl` → zero hits both runs).
+
+**Evidence base.** `docs/ctl05-investigation.md` §7 (every number in that investigation's §2 walkthrough had to be hand-reconstructed from timestamps because the guard's inputs aren't logged); FT11's verification addendum (`docs/field-test-11-results.md`); the CTL-06/W3 clamp reproduction (`research/ctl06-clamp-repro` branch, `7a46c0a`) — which additionally established that the offline harness can replay field logs through the real estimator, making per-fix diagnostics directly valuable to future offline reproductions.
+
+**Design — two new events, appended to the end of `sc_event_type_t` per the §2.9/§2.12 ABI precedent (never reorder):**
+
+1. **`SC_EVT_POLICY_STATE`** (payload `sc_evt_policy_state_t`): the dedicated per-tick policy-state event — the charter explicitly chose this over piggybacking a bool on `sc_evt_sync_estimate_t`, to give policy state a proper owned surface with room for future fields. Initial payload: `settled` (the §2.15 hysteresis state) and `in_deadband_streak`-derived convergence context the policy already tracks; future policy fields append to the struct end. Emitted on the same worker cadence as `SC_EVT_SYNC_ESTIMATE` (no new timer, no new config). Fixed-size payload, zero-allocation-after-init convention holds.
+2. **`SC_EVT_FIX_DIAG`** (payload `sc_evt_fix_diag_t`): emitted **once per submitted fix, accepted or rejected**, immediately after guard arbitration, carrying the arbitration's own inputs and outputs: the fix offset, the verdict (accepted / rejection reason), `tracks_room`, `tracks_cand`, the live `room_anchor_offset_ms` and its age, and — for self-hearing arbitration specifically — the comparison values the guard computed (`off`, `predicted_room`, `local_audible_ms`). This is §7's "log the guard's inputs, not just the verdict," realized as one event instead of retrofitting existing payload structs (existing `sc_evt_fix_rejected_t` stays byte-identical).
+
+**Android shell.** JNI forwards both events. Logging is **new-lines-only — no existing log-line format changes** (FT analysis tooling greps the current formats):
+
+- `fixdiag: off=<ms> verdict=<ACCEPTED|SELF_HEARING|...> trackR=<0|1> trackC=<0|1> anchor=<ms>@<age_ms> pred=<ms> localAud=<ms>` — one line per fix, pairing with its `fixdbg:` line via the shared offset value.
+- `policy: settled → true|false` — logged on **transition only** (not per tick; the 1 Hz stream stays clean). Satisfies the two field tests' failed `grep -i settl` probe.
+
+**Unchanged:** the state machine (§2.4), every existing event payload struct, all existing log-line formats, the estimator, `CorrectionPolicy` behavior (§2.7/§2.8/§2.15), the self-match guard and CTL-05 post-seek machinery (§7.3), and all existing tests byte-unmodified (house rule).
+
+**New config:** none. Cadence reuses the estimate emit period; everything else is unconditional diagnostic emission.
+
+**Test obligations (seams confirmed with PM 2026-08-21 — existing seams only, no new hooks):** (1) core: new ctest coverage driving the public C API + event pump exactly as the CTL-05 tests do — assert `SC_EVT_POLICY_STATE` emission cadence and `settled` transitions, and assert `SC_EVT_FIX_DIAG` values across an accepted fix, a SELF_HEARING rejection (values must match the §2 hand-reconstruction method's arithmetic), and a post-seek corroboration sequence; (2) ABI: `abi_c_check.c` coverage for both new events/structs, mirroring §2.9/§2.12; (3) Android: SessionViewModel JVM-suite assertions that the two new log lines are emitted with the event's values; no test reaches into policy internals — the event surface is the test surface.
+
+---
+
 ## 3. Authentication & Token Flows
 
 ### 3.1 Spotify — OAuth 2.0 Authorization Code + PKCE (no client secret in app)
