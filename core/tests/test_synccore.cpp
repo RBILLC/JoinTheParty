@@ -539,6 +539,13 @@ void test_self_match_guard_recovers_from_bad_reference() {
     submit(41200, t0 + 30 * kSec);
     processed();
     CHECK(log.rejects.load() == before);
+
+    // Missing since this test was written: without this join, the session's
+    // worker outlives the test and keeps dispatching events through the
+    // callback into this (dead) stack frame's EventLog — a use-after-scope
+    // race the linux-tsan CI job caught the moment CTL-06/W1's extra
+    // per-tick event widened the dispatch traffic.
+    sc_destroy(s);
 }
 
 // CTL-05 (docs/ctl05-investigation.md §6.2, GitHub issue #36): a single
