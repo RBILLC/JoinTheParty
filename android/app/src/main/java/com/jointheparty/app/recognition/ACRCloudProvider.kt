@@ -67,14 +67,10 @@ class ACRCloudProvider(
         val window = source?.latestWindow() ?: return null
         return withContext(Dispatchers.IO) {
             try {
-                identify(cfg, window).also {
-                    if (it != null) {
-                        DebugLog.log(
-                            "MATCH ✓ '${it.title}' offset=${it.matchOffsetMs}ms " +
-                                "uri=${it.spotifyUri ?: "none(enable 3rd-party integ.)"}",
-                        )
-                    }
-                }
+                // Match-path logging (MATCH ✓ + the CTL-06/W8 acrtime line
+                // right after it) lives in parseMatch, next to the `music`
+                // JSONObject it reads from — see parseMatch below.
+                identify(cfg, window)
             } catch (e: Exception) {
                 DebugLog.log("ACR request failed: ${e.javaClass.simpleName}: ${e.message}")
                 null
@@ -148,7 +144,7 @@ class ACRCloudProvider(
             ?.optJSONArray("music")?.optJSONObject(0) ?: return null
         val offsetMs = music.optLong("play_offset_ms", -1L)
         if (offsetMs < 0) return null
-        return RecognitionProvider.RecognitionFixResult(
+        val result = RecognitionProvider.RecognitionFixResult(
             // play_offset_ms references the END of the sample; endMonoNs is
             // exactly that instant on our clock — the pairing SyncCore wants.
             matchOffsetMs = offsetMs,
@@ -163,13 +159,28 @@ class ACRCloudProvider(
                 ?.optString("name")?.ifEmpty { null },
             isrc = music.optJSONObject("external_ids")
                 ?.optString("isrc")?.ifEmpty { null },
-            // Requires "3rd Party Integration" enabled on the ACR console
-            // project; absent otherwise.
+            // "3rd Party Integration" is enabled on this project's ACR
+            // console (confirmed via the console pass) — absent here means
+            // the matched catalog entry itself has no Spotify mapping, not
+            // that integration is off.
             spotifyUri = music.optJSONObject("external_metadata")
                 ?.optJSONObject("spotify")?.optJSONObject("track")
                 ?.optString("id")?.ifEmpty { null }
                 ?.let { "spotify:track:$it" },
         )
+        DebugLog.log(
+            "MATCH ✓ '${result.title}' offset=${result.matchOffsetMs}ms " +
+                "uri=${result.spotifyUri ?: "none(no spotify mapping)"}",
+        )
+        // CTL-06/W8 (wayfinder #41): raw ACRCloud timing/skew fields the app
+        // otherwise ignores — SyncCore only ever sees matchOffsetMs (paired
+        // with play_offset_ms) and frequencySkew. ACRCloud's own docs
+        // example pairs play_offset_ms with the sample window's END, not
+        // its begin, and document the skew field as `time_skew` (we read
+        // `frequency_skew`). This line is purely observational: it feeds no
+        // computation, only a future control-run decision.
+        DebugLog.log(acrTimeLine(music, offsetMs))
+        return result
     }
 
     companion object {
@@ -191,6 +202,52 @@ class ACRCloudProvider(
                 android.util.Base64.NO_WRAP,
             )
         }
+
+        /**
+         * CTL-06/W8: builds the `acrtime: ...` diagnostic line from the raw
+         * `music` JSONObject a match was parsed from. `offsetMs` is passed
+         * in (rather than re-read) so it is always identical to the value
+         * the MATCH ✓ line just logged. Missing numeric fields print -1;
+         * the two skew fields print the raw value if the key is present
+         * (any JSON type) else the literal "absent". The actual formatting
+         * is delegated to [formatAcrTimeLine] — org.json.JSONObject isn't
+         * usable under this module's plain JVM unit tests (no Robolectric;
+         * android.jar's org.json methods throw "not mocked"), so that pure
+         * function is what's unit tested, not this JSONObject-reading
+         * wrapper.
+         */
+        internal fun acrTimeLine(music: JSONObject, offsetMs: Long): String {
+            fun rawOrAbsent(key: String): String =
+                if (music.has(key)) music.get(key).toString() else "absent"
+            return formatAcrTimeLine(
+                offsetMs = offsetMs,
+                sampleBeginMs = music.optLong("sample_begin_time_offset_ms", -1L),
+                sampleEndMs = music.optLong("sample_end_time_offset_ms", -1L),
+                dbBeginMs = music.optLong("db_begin_time_offset_ms", -1L),
+                dbEndMs = music.optLong("db_end_time_offset_ms", -1L),
+                timeSkew = rawOrAbsent("time_skew"),
+                frequencySkew = rawOrAbsent("frequency_skew"),
+                durationMs = music.optLong("duration_ms", -1L),
+            )
+        }
+
+        /**
+         * Pure string assembly for the `acrtime: ...` line — no JSONObject
+         * involved, so it's directly unit-testable in this module's plain
+         * JVM `testDebugUnitTest` suite. Internal for unit testing.
+         */
+        internal fun formatAcrTimeLine(
+            offsetMs: Long,
+            sampleBeginMs: Long,
+            sampleEndMs: Long,
+            dbBeginMs: Long,
+            dbEndMs: Long,
+            timeSkew: String,
+            frequencySkew: String,
+            durationMs: Long,
+        ): String = "acrtime: off=$offsetMs sBeg=$sampleBeginMs sEnd=$sampleEndMs " +
+            "dbBeg=$dbBeginMs dbEnd=$dbEndMs tskew=$timeSkew fskew=$frequencySkew " +
+            "dur=$durationMs"
 
         private fun multipartBody(
             boundary: String,
