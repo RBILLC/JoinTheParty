@@ -1,5 +1,7 @@
 package com.jointheparty.app.recognition
 
+import com.jointheparty.app.core.SyncCore
+
 /**
  * NAT-06: abstracts the recognition engine behind the (offset, timestamp,
  * ISRC) tuple `SyncEngine.submitRecognitionFix` actually needs
@@ -32,6 +34,14 @@ interface RecognitionProvider {
          */
         val spotifyUri: String? = null,
     )
+
+    /**
+     * REC-03 (#53): which engine this provider's fixes come from — the
+     * label `SyncEngine.submitRecognitionFix` is given for every fix
+     * [recognizeOnce] returns. Owned by the provider so the caller never
+     * has to know (or hardcode) which engine is wired in.
+     */
+    val fixSource: SyncCore.FixSource
 
     /**
      * Runs exactly one recognition pass and suspends until it resolves —

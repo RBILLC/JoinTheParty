@@ -1,5 +1,6 @@
 package com.jointheparty.app.recognition
 
+import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.debug.DebugLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -57,6 +58,8 @@ class ACRCloudProvider(
 
         fun latestWindow(): PcmWindow?
     }
+
+    override val fixSource: SyncCore.FixSource = SyncCore.FixSource.ACRCLOUD
 
     override suspend fun recognizeOnce(): RecognitionProvider.RecognitionFixResult? {
         val cfg = config

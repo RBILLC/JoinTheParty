@@ -2261,7 +2261,7 @@ class SessionViewModel(
                     )
                 }
                 engine.submitRecognitionFix(
-                    SyncCore.FixSource.SHAZAMKIT,
+                    recognizer.fixSource,
                     fix.matchOffsetMs,
                     fix.captureMonoNs,
                     fix.frequencySkew,

@@ -442,6 +442,41 @@ class SessionViewModelTest {
         assertEquals("USABC1234567", vm.syncState.value.track?.isrc)
     }
 
+    // ---- REC-03 (#53): the fix's source label comes from the provider -------
+
+    @Test
+    fun acrCloudFixReachesTheEngineLabelledAcrCloud() = runTest(testDispatcher) {
+        val engine = FakeSyncEngine()
+        val recognition = FakeRecognitionProvider(
+            fixResult("spotify:track:xyz", offsetMs = 12_345L, captureNs = 999L),
+            fixSource = SyncCore.FixSource.ACRCLOUD,
+        )
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, recognition)
+
+        vm.startListening()
+        advanceUntilIdle()
+
+        assertEquals(listOf(SyncCore.FixSource.ACRCLOUD), engine.submittedFixes.map { it.source })
+    }
+
+    @Test
+    fun fixSourceLabelFollowsWhicheverProviderProducedTheFix() = runTest(testDispatcher) {
+        // Guards against the call site swapping one hardcoded constant for
+        // another: a provider reporting SHAZAMKIT (planned, #10/#16) must
+        // be labelled SHAZAMKIT, not whatever the ACRCloud path uses.
+        val engine = FakeSyncEngine()
+        val recognition = FakeRecognitionProvider(
+            fixResult("spotify:track:xyz", offsetMs = 12_345L, captureNs = 999L),
+            fixSource = SyncCore.FixSource.SHAZAMKIT,
+        )
+        val vm = SessionViewModel(engine, FakeNudgeStore(), testDispatcher, recognition)
+
+        vm.startListening()
+        advanceUntilIdle()
+
+        assertEquals(listOf(SyncCore.FixSource.SHAZAMKIT), engine.submittedFixes.map { it.source })
+    }
+
     // ---- CAL-04: acoustic referee aggregation ------------------------------
 
     @Test
@@ -2754,6 +2789,7 @@ private class FakeNudgeStore : NudgeStore {
 /** NAT-06: records calls; returns a fixed fix (or null) without touching ShazamKit. */
 private class FakeRecognitionProvider(
     private val result: RecognitionProvider.RecognitionFixResult?,
+    override val fixSource: SyncCore.FixSource = SyncCore.FixSource.ACRCLOUD,
 ) : RecognitionProvider {
     var callCount = 0
         private set
@@ -2772,6 +2808,8 @@ private class FakeRecognitionProvider(
 private class FakeQueuedRecognitionProvider(
     private val results: List<RecognitionProvider.RecognitionFixResult?>,
 ) : RecognitionProvider {
+    override val fixSource: SyncCore.FixSource = SyncCore.FixSource.ACRCLOUD
+
     var callCount = 0
         private set
 

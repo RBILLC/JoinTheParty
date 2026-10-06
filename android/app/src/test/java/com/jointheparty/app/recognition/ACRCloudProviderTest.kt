@@ -1,5 +1,6 @@
 package com.jointheparty.app.recognition
 
+import com.jointheparty.app.core.SyncCore
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -23,6 +24,13 @@ import org.junit.Test
  * the formatting it delegates to is covered.
  */
 class ACRCloudProviderTest {
+
+    @Test
+    fun reportsAcrCloudAsItsFixSource() {
+        // REC-03 (#53): the label SessionViewModel hands the engine. A null
+        // config is the inert provider — no network, no android.* touched.
+        assertEquals(SyncCore.FixSource.ACRCLOUD, ACRCloudProvider(config = null).fixSource)
+    }
 
     @Test
     fun formatAcrTimeLineReportsEveryFieldWhenTheResponseCarriedThem() {
