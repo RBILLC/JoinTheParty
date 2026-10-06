@@ -235,8 +235,8 @@ void test_setters_clamp_and_validate() {
     sc_session_t* s = nullptr;
     CHECK(sc_create(&cfg, &s) == SC_OK);
 
-    CHECK(sc_set_user_nudge_ms(s, 5000) == SC_OK);   // clamps to +750
-    CHECK(sc_set_user_nudge_ms(s, -5000) == SC_OK);  // clamps to -750
+    CHECK(sc_set_user_nudge_ms(s, 5000) == SC_OK);   // clamps to +4000
+    CHECK(sc_set_user_nudge_ms(s, -5000) == SC_OK);  // clamps to -4000
     CHECK(sc_set_output_route(s, SC_ROUTE_BLUETOOTH, 180) == SC_OK);
     CHECK(sc_set_output_route(s, static_cast<sc_route_t>(99), 0) ==
           SC_ERR_INVALID_ARG);

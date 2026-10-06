@@ -65,7 +65,7 @@ typedef struct {
 } sc_player_state_t;
 sc_status_t sc_submit_player_state(sc_session_t*, const sc_player_state_t*);
 
-sc_status_t sc_set_user_nudge_ms(sc_session_t*, int32_t nudge_ms);      // ±750 clamp
+sc_status_t sc_set_user_nudge_ms(sc_session_t*, int32_t nudge_ms);      // ±4000 clamp
 sc_status_t sc_set_output_route(sc_session_t*, sc_route_t, int32_t latency_prior_ms);
 sc_status_t sc_set_aec_mode(sc_session_t*, sc_aec_mode_t);
 sc_status_t sc_notify_seek_issued(sc_session_t*, int64_t target_ms,

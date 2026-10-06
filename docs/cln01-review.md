@@ -3,8 +3,8 @@
 **Ticket:** GitHub issue #55 (CLN-01), from the 2026-10-06 shallow-module
 audit. **Archive tag:** `archive/pre-cleanup` (39d90c6) marks `main` before
 the audit work. **Status:** all seven items implemented; core and Android
-green. One item is not verified: the pill merge (item 6) has not been
-looked at on a device or in previews.
+green. The pill merge (item 6) was checked on a device afterwards — see
+"Follow-up" at the end.
 
 The removal rule that scoped the ticket held throughout: nothing parked or
 dark was touched (duck tier, hypothesis bank, AEC / `sc_push_reference`,
@@ -79,8 +79,7 @@ call sites use `SheetPill`. `SheetPill` gained one parameter,
 `DT.Space.gutter` (24dp), so their padding is unchanged and the 13 existing
 callers are unchanged.
 
-Visual differences, by reading the code (**not yet looked at on a device or
-in previews**):
+Visual differences, by reading the code (device check: see "Follow-up"):
 
 | | before (migrated sites) | after | expected effect |
 |---|---|---|---|
@@ -164,14 +163,30 @@ Two judgment calls inside those edits:
   `kLocalPlayback` or `last_commanded_position_ms` remains under `core/`,
   `android/app/src/` or `technical-requirements.md`.
 
-## Not done / reported instead
+## Follow-up (2026-10-06, after review)
 
-- **Item 6 has not been seen rendered.** The table above is from the code.
-- `core/tests/test_synccore.cpp:238-239` still comments `// clamps to +750`
-  / `// clamps to -750`. The real clamp is ±4000. Editing it was not
-  authorized.
-- `technical-requirements.md:68` still says `// ±750 clamp` beside
-  `sc_set_user_nudge_ms`. It was not in the ticket's list, so it was left.
-- `architecture-spec.md:140` gives the wheel's range as ±750 ms; the code
-  comment in `synccore.cpp` says the wheel's UI range is ±1500. Not checked
-  further, not in scope.
+- **Item 6 checked on a device** (Pixel 10 Pro). The idle screen was
+  screenshotted on the previously installed build (2026-08-15, old
+  `JoinButton`) and again after installing this build over it: identical
+  pixel for pixel below the status bar, join pill bounds unchanged. The
+  onboarding join pill and the two concierge pills were not rendered (they
+  need cleared app data or a missing Spotify app); they use the same
+  `SheetPill` call shape as the join pill that was checked.
+- The two stale clamp comments were corrected to ±4000 with PM
+  authorization given after the review: `core/tests/test_synccore.cpp`
+  (comment-only, the fifth test-file change) and
+  `technical-requirements.md:68`.
+- Two-axis code review (Standards + Spec) run on a2c0f54: no blocking
+  findings.
+
+## Still open
+
+- `architecture-spec.md:140` and `ui-ux-design-system.md:173` give the
+  wheel's range as ±750 ms; `DT.Wheel.rangeMs` is 1500. Design-doc
+  question, not changed.
+- `SessionViewModelTest.kt`: a double blank line where the
+  `notifyLocalPlayback` override was, a `CFX-02` divider with no test under
+  it, and the test name `backToDeviceShelfReturnsFromDetailToTheShelf`.
+  Test files are frozen beyond the authorized edits.
+- `SheetPill` is now the app-wide pill but keeps its sheet name and lives
+  in `CalibrationSheet.kt` (Standards review). Filed separately.
