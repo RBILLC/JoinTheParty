@@ -871,8 +871,9 @@ class SessionViewModel(
 
     /**
      * Prefers the provider-supplied Spotify URI (ACRCloud external_metadata
-     * — real, playable) over the backend ISRC resolver (which is MOCKED
-     * until AUTH-03's server deploys and would hand playback a fake URI).
+     * — real, playable) over the backend ISRC resolver. REC-02 (#52):
+     * production wires no backend until AUTH-03's server deploys (see
+     * `PRODUCTION_BACKEND`), so there an ISRC-only fix resolves to nothing.
      *
      * IDC-01 (tech-req §2.14): while the identity corroboration gate is
      * armed (see [armIdentCorroboration]), a resolved identity is recorded

@@ -66,18 +66,22 @@ sealed interface TrackResolution {
  * mirroring `SpotifyAuthManager`'s plumbing style (10s timeouts, typed
  * error mapping, `Dispatchers.IO`).
  *
- * MOCK MODE: [baseUrl] is null in the current state — no backend is
- * deployed yet (architecture-spec.md §12's `backend/` directory has no
- * service running). With a null [baseUrl], every method short-circuits to
+ * MOCK MODE: no backend is deployed yet (architecture-spec.md §12's
+ * `backend/` directory has no service running), so the only usable
+ * [baseUrl] today is null. With a null [baseUrl], every method short-circuits to
  * a canned success (below the `MOCK constants` marker) after a small
  * `delay(50)` so downstream wiring — [com.jointheparty.app.recognition
  * .ShazamKitProvider], `SessionViewModel`'s recognition pass — can be
  * built, wired, and unit-tested end-to-end today (unblocks INT-02) without
  * waiting on the AUTH-03/04 server work. Swap procedure: once the backend
- * is deployed, construct `HttpBackendClient(realBaseUrl)` — the one call
- * site (`SessionGraph`, INT-06a) is the only place that needs to change;
- * [HttpBackendClient] itself, [ShazamKitProvider], and every other caller
- * are already written against the real HTTP path below.
+ * is deployed, assign `HttpBackendClient(realBaseUrl)` to
+ * `PRODUCTION_BACKEND` in `SessionGraph.kt` — the only place that needs
+ * to change; [HttpBackendClient] itself, [ShazamKitProvider], and every
+ * other caller are already written against the real HTTP path below.
+ *
+ * REC-02 (#52): mock mode is for tests and wiring work only. Production
+ * passes no backend at all until that server exists — the canned
+ * [MOCK_SPOTIFY_URI] is not playable and must never reach playback.
  */
 class HttpBackendClient(private val baseUrl: String?) : BackendClient {
 

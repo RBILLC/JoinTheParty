@@ -12,6 +12,7 @@ import com.jointheparty.app.data.NudgeStore
 import com.jointheparty.app.data.sortedByUpdatedAtDescending
 import com.jointheparty.app.debug.DebugLog
 import com.jointheparty.app.recognition.RecognitionProvider
+import com.jointheparty.app.session.PRODUCTION_BACKEND
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import kotlinx.coroutines.CoroutineScope
@@ -441,6 +442,40 @@ class SessionViewModelTest {
         assertEquals("spotify:track:xyz", vm.syncState.value.track?.spotifyUri)
         assertEquals("USABC1234567", vm.syncState.value.track?.isrc)
     }
+
+    // ---- REC-02 (#52): no ISRC resolver is wired in production yet ----------
+
+    @Test
+    fun isrcOnlyFixUnderProductionWiringStaysInMatchingAndStartsNoPlayback() =
+        runTest(testDispatcher) {
+            // The mock-mode HttpBackendClient resolves every ISRC to
+            // spotify:track:mock; wired into production it turned an
+            // ISRC-only match into a play request for that fake URI.
+            val engine = FakeSyncEngine()
+            // fixResult always carries an ISRC; null leaves it URI-less.
+            val recognition = FakeRecognitionProvider(
+                fixResult(uri = null, offsetMs = 12_345L, captureNs = 999L),
+            )
+            val spotify = FakeSpotifyController()
+            val vm = SessionViewModel(
+                engine = engine,
+                nudgeStore = FakeNudgeStore(),
+                dispatcher = testDispatcher,
+                recognition = recognition,
+                backend = PRODUCTION_BACKEND,
+                spotify = spotify,
+            )
+
+            vm.startListening()
+            advanceUntilIdle()
+
+            // The fix is still a sync observation for the engine; only the
+            // track resolution comes up empty.
+            assertTrue(engine.submittedFixes.isNotEmpty())
+            assertEquals(SessionPhase.MATCHING, vm.syncState.value.phase)
+            assertNull(vm.syncState.value.track)
+            assertEquals(emptyList<String>(), spotify.played)
+        }
 
     // ---- REC-03 (#53): the fix's source label comes from the provider -------
 

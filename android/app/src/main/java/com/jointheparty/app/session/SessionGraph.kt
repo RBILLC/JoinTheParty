@@ -6,7 +6,7 @@ import com.jointheparty.app.audio.AudioManagerStreamVolumeController
 import com.jointheparty.app.audio.AudioRouteObserver
 import com.jointheparty.app.audio.AudioTrackChirpPlayer
 import com.jointheparty.app.audio.AudioTrackTonePlayer
-import com.jointheparty.app.backend.HttpBackendClient
+import com.jointheparty.app.backend.BackendClient
 import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.data.DataStoreNudgeStore
 import com.jointheparty.app.recognition.ACRCloudProvider
@@ -24,8 +24,24 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 
 /**
+ * The [BackendClient] the production [SessionGraph] hands to
+ * [SessionViewModel]. Top-level (not a [SessionGraph] member) so the JVM
+ * suite can build a view model with exactly this wiring without
+ * constructing the graph, which needs a Context and the native engine.
+ *
+ * REC-02 (#52): null until AUTH-03 (#15) deploys a real server. The only
+ * client that exists today is the mock-mode `HttpBackendClient(baseUrl =
+ * null)`, which resolves every ISRC to a fake Spotify URI — wired in here
+ * it turned an ISRC-only match into a play request for that URI. With no
+ * backend, such a match resolves to nothing and the session stays in
+ * MATCHING. Swap procedure once the server exists: construct
+ * `HttpBackendClient(realBaseUrl)` here (see its class doc).
+ */
+internal val PRODUCTION_BACKEND: BackendClient? = null
+
+/**
  * INT-06a (technical-requirements.md §2.5): the process-scoped owner of the
- * session object graph — SyncCore, recognition, backend, chirp playback,
+ * session object graph — SyncCore, recognition, chirp playback,
  * Spotify control, route observation, and the [SessionViewModel] built on
  * top of them. Previously this graph was built by `SessionViewModel
  * .Companion.Factory` and lived only as long as `MainActivity`'s
@@ -67,11 +83,6 @@ class SessionGraph(context: Context) {
         source = EnginePcmWindowSource(engine),
     )
 
-    // AUTH-03/04: no backend is deployed yet, so this is the mock-mode
-    // HttpBackendClient(baseUrl = null) — see its class doc for the swap
-    // procedure once one exists.
-    private val backend = HttpBackendClient(baseUrl = null)
-
     private val chirp = AudioTrackChirpPlayer()
 
     // CAL-07: the by-ear tone-match reference tone.
@@ -97,7 +108,7 @@ class SessionGraph(context: Context) {
         engine = engine,
         nudgeStore = nudgeStore,
         recognition = recognition,
-        backend = backend,
+        backend = PRODUCTION_BACKEND,
         chirp = chirp,
         tonePlayer = tonePlayer,
         spotify = spotify,
