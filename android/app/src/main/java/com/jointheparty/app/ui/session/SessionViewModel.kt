@@ -2342,14 +2342,14 @@ class SessionViewModel(
     /** Throttle for the field overlay: estimates arrive at ≤15 Hz. */
     private var lastEstimateLogMs = 0L
 
-    /** Latest engine-measured error; consumed by wheel-commit rebasing. */
-    @Volatile
     /** Track URI we have already reacted to auto-advancing onto (§ above). */
     private var autoAdvanceHandled: String? = null
 
     /** Pending end-of-track pause; re-armed by every fresh player state. */
     private var endOfTrackJob: kotlinx.coroutines.Job? = null
 
+    /** Latest engine-measured error; consumed by wheel-commit rebasing. */
+    @Volatile
     private var lastEstimateErrorMs: Double = 0.0
 
     /** Freshness guard for the rebase (audit §4.4): a stale, low-confidence
