@@ -30,7 +30,7 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import com.jointheparty.app.ui.components.SheetPill
+import com.jointheparty.app.ui.components.BilletPill
 import com.jointheparty.app.ui.theme.BilletTheme
 import com.jointheparty.app.ui.theme.BilletType
 import com.jointheparty.app.ui.theme.DT
@@ -89,7 +89,7 @@ fun OnboardingScreen(onDone: () -> Unit, modifier: Modifier = Modifier) {
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             if (pagerState.currentPage == lastPage) {
-                SheetPill("Join the party", primary = true, onTap = onDone, horizontalPadding = DT.Space.gutter)
+                BilletPill("Join the party", primary = true, onTap = onDone, horizontalPadding = DT.Space.gutter)
                 Spacer(modifier = Modifier.height(DT.Space.sectionGap))
             }
             PageIndicator(pageCount = pageCount, currentPage = pagerState.currentPage)

@@ -154,7 +154,7 @@ fun DeviceDetail(
                 // connected route — never a tappable pill that either
                 // no-ops or opens a guided flow titled with some other
                 // device.
-                SheetPill(DETAIL_RECALIBRATE_LABEL, primary = false, enabled = connected, onTap = onRecalibrate)
+                BilletPill(DETAIL_RECALIBRATE_LABEL, primary = false, enabled = connected, onTap = onRecalibrate)
                 if (!connected) {
                     Spacer(Modifier.height(4.dp))
                     Text(
@@ -178,7 +178,7 @@ private fun DriftBanner(connected: Boolean, onRecalibrate: () -> Unit, onLater: 
         textAlign = TextAlign.Center,
     )
     Spacer(Modifier.height(DT.Space.sectionGap))
-    SheetPill(DRIFT_BANNER_PRIMARY, primary = true, enabled = connected, onTap = onRecalibrate)
+    BilletPill(DRIFT_BANNER_PRIMARY, primary = true, enabled = connected, onTap = onRecalibrate)
     if (!connected) {
         Spacer(Modifier.height(4.dp))
         Text(
@@ -209,7 +209,7 @@ private fun TrimPromotionBanner(state: TrimPromotionBannerState) {
             color = DT.Colors.ink3,
         )
     } else {
-        SheetPill(TRIM_PROMOTION_PRIMARY, primary = true, onTap = state.onAccept)
+        BilletPill(TRIM_PROMOTION_PRIMARY, primary = true, onTap = state.onAccept)
         Spacer(Modifier.height(DT.Space.grid))
         QuietText(TRIM_PROMOTION_QUIET, onTap = state.onDecline)
     }

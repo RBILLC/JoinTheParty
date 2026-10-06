@@ -1,7 +1,6 @@
 package com.jointheparty.app.ui.components
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -18,11 +17,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.jointheparty.app.ui.session.CalibrationState
 import com.jointheparty.app.ui.session.DeviceReviewPane
@@ -228,7 +224,7 @@ private fun GuidedCalibrationContent(
                         color = DT.Colors.ink2,
                     )
                     Spacer(Modifier.height(DT.Space.sectionGap))
-                    SheetPill("Start calibration", primary = true, onTap = onStart)
+                    BilletPill("Start calibration", primary = true, onTap = onStart)
                 }
                 CalibrationState.Running -> {
                     Text(
@@ -237,7 +233,7 @@ private fun GuidedCalibrationContent(
                         color = DT.Colors.ink2,
                     )
                     Spacer(Modifier.height(DT.Space.sectionGap))
-                    SheetPill("Cancel", primary = false, onTap = onCancel)
+                    BilletPill("Cancel", primary = false, onTap = onCancel)
                 }
                 is CalibrationState.Success -> {
                     Text(
@@ -253,7 +249,7 @@ private fun GuidedCalibrationContent(
                         color = DT.Colors.ink3,
                     )
                     Spacer(Modifier.height(DT.Space.sectionGap))
-                    SheetPill("Done", primary = true, onTap = onDismiss)
+                    BilletPill("Done", primary = true, onTap = onDismiss)
                 }
                 CalibrationState.Failed -> {
                     Text(
@@ -262,7 +258,7 @@ private fun GuidedCalibrationContent(
                         color = DT.Colors.ink2,
                     )
                     Spacer(Modifier.height(DT.Space.sectionGap))
-                    SheetPill("Try again", primary = true, onTap = onStart)
+                    BilletPill("Try again", primary = true, onTap = onStart)
                     Spacer(Modifier.height(8.dp))
                     // ui-ux §6.5: "The Quiet exit on Failed is new: By ear
                     // is a fallback on every route, not just headphones" —
@@ -282,7 +278,7 @@ private fun GuidedCalibrationContent(
                         color = DT.Colors.ink2,
                     )
                     Spacer(Modifier.height(DT.Space.sectionGap))
-                    SheetPill("Start calibration", primary = true, onTap = onStart)
+                    BilletPill("Start calibration", primary = true, onTap = onStart)
                 }
 
                 // ---- CAL-07: tone-match (by ear) -----------------------
@@ -296,7 +292,7 @@ private fun GuidedCalibrationContent(
                         color = DT.Colors.ink2,
                     )
                     Spacer(Modifier.height(DT.Space.sectionGap))
-                    SheetPill("Start", primary = true, onTap = onStartByEar)
+                    BilletPill("Start", primary = true, onTap = onStartByEar)
                 }
                 CalibrationState.ByEarRunning -> {
                     ToneMatchCaliper(onCommit = onCommitByEar)
@@ -324,7 +320,7 @@ private fun GuidedCalibrationContent(
                         color = DT.Colors.ink3,
                     )
                     Spacer(Modifier.height(DT.Space.sectionGap))
-                    SheetPill("Done", primary = true, onTap = onDismiss)
+                    BilletPill("Done", primary = true, onTap = onDismiss)
                 }
             }
         }
@@ -393,7 +389,7 @@ private fun ToneMatchCaliper(onCommit: (Int) -> Unit) {
             .recessedWell(RoundedCornerShape(DT.Shape.radiusCard)),
     )
     Spacer(Modifier.height(DT.Space.sectionGap))
-    SheetPill(
+    BilletPill(
         "That's it",
         primary = true,
         enabled = hasDragged.value,
@@ -402,41 +398,8 @@ private fun ToneMatchCaliper(onCommit: (Int) -> Unit) {
 }
 
 /**
- * The §6.3 pill: `brass` fill / `void` text when [primary], otherwise a 1px
- * `hairline` outline with `ink` text. `internal`, not `private` — the one
- * pill idiom for the sheets, the session screen and onboarding alike.
- * [horizontalPadding] exists because the full-screen pills (join, concierge)
- * sit on the [DT.Space.gutter] rhythm while the sheet pills are 28dp.
- */
-@Composable
-internal fun SheetPill(
-    label: String,
-    primary: Boolean,
-    onTap: () -> Unit,
-    enabled: Boolean = true,
-    horizontalPadding: Dp = 28.dp,
-) {
-    val shape = RoundedCornerShape(44.dp)
-    val base = Modifier
-        .alpha(if (enabled) 1f else 0.4f)
-        .clip(shape)
-        .let {
-            if (primary) it.background(DT.Colors.brass)
-            else it.border(1.dp, DT.Colors.hairline, shape)
-        }
-        .clickable(enabled = enabled, onClick = onTap)
-        .padding(horizontal = horizontalPadding, vertical = 14.dp)
-    Text(
-        text = label,
-        style = BilletType.label,
-        color = if (primary) DT.Colors.void else DT.Colors.ink,
-        modifier = base,
-    )
-}
-
-/**
  * Quiet variant (ui-ux §6.3): "Text-only, ink2" — tertiary dismissals/exits.
- * `internal` for the same reuse reason as [SheetPill] above.
+ * `internal` for the same reuse reason as [BilletPill].
  */
 @Composable
 internal fun QuietText(label: String, onTap: () -> Unit) {

@@ -98,7 +98,7 @@ internal fun FirstContactGateContent(
         Spacer(Modifier.height(DT.Space.sectionGap))
         Text(text = GATE_BODY, style = BilletType.body, color = DT.Colors.ink2, textAlign = TextAlign.Center)
         Spacer(Modifier.height(DT.Space.sectionGap))
-        SheetPill(GATE_PRIMARY, primary = true, onTap = onAccept)
+        BilletPill(GATE_PRIMARY, primary = true, onTap = onAccept)
         Spacer(Modifier.height(DT.Space.grid))
         QuietText(GATE_QUIET, onTap = onDecline)
         Spacer(Modifier.height(8.dp))

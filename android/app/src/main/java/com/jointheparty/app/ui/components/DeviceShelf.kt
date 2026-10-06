@@ -89,7 +89,7 @@ private fun EmptyDeviceShelf(onCalibratePhoneSpeaker: () -> Unit, modifier: Modi
             textAlign = TextAlign.Center,
         )
         Spacer(Modifier.height(DT.Space.sectionGap))
-        SheetPill(DEVICE_SHELF_EMPTY_PRIMARY, primary = true, onTap = onCalibratePhoneSpeaker)
+        BilletPill(DEVICE_SHELF_EMPTY_PRIMARY, primary = true, onTap = onCalibratePhoneSpeaker)
     }
 }
 

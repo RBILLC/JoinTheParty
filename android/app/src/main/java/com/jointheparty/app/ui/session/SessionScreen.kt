@@ -38,10 +38,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.jointheparty.app.core.SyncCore
+import com.jointheparty.app.ui.components.BilletPill
 import com.jointheparty.app.ui.components.CalibrationSheet
 import com.jointheparty.app.ui.components.FirstContactGateSheet
 import com.jointheparty.app.ui.components.NudgeWheel
-import com.jointheparty.app.ui.components.SheetPill
 import com.jointheparty.app.ui.components.SyncMeter
 import com.jointheparty.app.ui.model.MeterFrame
 import com.jointheparty.app.ui.theme.BilletTheme
@@ -469,7 +469,7 @@ private fun IdleContent(
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             // The screen's one-and-only warm accent — see the
             // [SessionScreen] doc comment.
-            SheetPill("Join the party", primary = true, onTap = onJoinTap, horizontalPadding = DT.Space.gutter)
+            BilletPill("Join the party", primary = true, onTap = onJoinTap, horizontalPadding = DT.Space.gutter)
             // Field feedback: don't invite a connection that already exists.
             if (spotifyLinked) {
                 Text(
@@ -796,9 +796,9 @@ private fun ConciergeGate(
             // green, untouched, per Spotify's brand guidelines) — assets
             // aren't available yet, so these stay text-only pills for now.
             Spacer(modifier = Modifier.height(DT.Space.sectionGap))
-            SheetPill(primaryLabel, primary = true, onTap = onPrimary, horizontalPadding = DT.Space.gutter)
+            BilletPill(primaryLabel, primary = true, onTap = onPrimary, horizontalPadding = DT.Space.gutter)
             Spacer(modifier = Modifier.height(DT.Space.grid))
-            SheetPill(
+            BilletPill(
                 "Keep identifying songs",
                 primary = false,
                 onTap = onSecondary,
