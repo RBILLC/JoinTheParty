@@ -10,10 +10,9 @@ import kotlinx.coroutines.flow.SharedFlow
  * which a plain JVM test can't satisfy). [SyncCore] implements this
  * directly; tests substitute a fake.
  *
- * Deliberately excludes the real-time/audio-thread and reference/
- * calibration surface (`pushCapture`, `pushReference`, `setAecMode`,
- * `beginCalibration`, `cancelCalibration`) — none of that is
- * ViewModel-driven per technical-requirements.md §2.3.
+ * Deliberately excludes the real-time/audio-thread and reference surface
+ * (`pushCapture`, `pushReference`) — none of that is ViewModel-driven per
+ * technical-requirements.md §2.3.
  *
  * `startCapture`/`stopCapture` (NAT-02) are the exception: they don't touch
  * the audio thread themselves, only start/stop the native Oboe capture
@@ -86,8 +85,6 @@ interface SyncEngine {
     fun sampleLatencyResidual(): Boolean
 
     fun notifySeekIssued(targetMs: Long, issuedMonoNs: Long): Boolean
-
-    fun notifyLocalPlayback(commandedPositionMs: Long): Boolean
 
     /**
      * CTL-01b (technical-requirements.md §2.9): echoes an executed

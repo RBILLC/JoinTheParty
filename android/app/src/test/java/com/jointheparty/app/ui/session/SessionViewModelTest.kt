@@ -756,7 +756,7 @@ class SessionViewModelTest {
         vm.selectDevice("speaker")
         assertTrue(vm.syncState.value.deviceReview is DeviceReviewPane.Detail)
 
-        vm.backToDeviceShelf()
+        vm.openDeviceShelf()
         advanceUntilIdle()
 
         assertTrue(vm.syncState.value.deviceReview is DeviceReviewPane.Shelf)
@@ -1303,12 +1303,6 @@ class SessionViewModelTest {
     }
 
     // ---- CFX-02: recalibrate / empty-state targeting -----------------------
-
-    @Test
-    fun shouldOpenGuidedCalibrationPaneReflectsWhetherRequestRecalibrateStartedSomething() {
-        assertTrue(shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest { true })
-        assertFalse(shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest { false })
-    }
 
     private suspend fun TestScope.driveToLocked(vm: SessionViewModel, engine: FakeSyncEngine) {
         vm.startListening()
@@ -2603,7 +2597,6 @@ private class FakeSyncEngine : SyncEngine {
 
     override fun notifySeekIssued(targetMs: Long, issuedMonoNs: Long) = true
 
-    override fun notifyLocalPlayback(commandedPositionMs: Long) = true
 
     override fun submitPlayerState(positionMs: Long, isPaused: Boolean, receivedMonoNs: Long) = true
 

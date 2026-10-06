@@ -65,10 +65,9 @@ import kotlin.math.roundToInt
  *
  * Ownership: the caller holds the committed [trimMs] (per-route persistence
  * lives above this composable). The wheel keeps its own gesture-local
- * optimistic value so the drum tracks the finger instantly; [onTrimChange]
- * fires per detent crossed, [onTrimCommit] fires once, [DT.Wheel.commitDebounceMs]
- * after the value last changed (§6.2: "committed value debounced 400 ms →
- * one micro-seek").
+ * optimistic value so the drum tracks the finger instantly; [onTrimCommit]
+ * fires once, [DT.Wheel.commitDebounceMs] after the value last changed
+ * (§6.2: "committed value debounced 400 ms → one micro-seek").
  *
  * Two-stream rule (SyncMeter precedent, technical-requirements.md §2.3): the
  * drum's drag offset lives in its own [mutableStateOf] and is read ONLY
@@ -81,7 +80,6 @@ import kotlin.math.roundToInt
 fun NudgeWheel(
     trimMs: Int,
     routeName: String?,
-    onTrimChange: (Int) -> Unit,
     onTrimCommit: (Int) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -131,7 +129,6 @@ fun NudgeWheel(
                         onDoubleTap = {
                             liveTrimMs.value = 0
                             dragOffsetPt.value = 0f
-                            onTrimChange(0)
                         },
                     )
                 }
@@ -166,7 +163,6 @@ fun NudgeWheel(
                                         initialVelocityPtPerSec = velocityPtPerSec,
                                         liveTrimMs = liveTrimMs,
                                         dragOffsetPt = dragOffsetPt,
-                                        onTrimChange = onTrimChange,
                                         haptics = haptics,
                                     )
                                 }
@@ -185,7 +181,6 @@ fun NudgeWheel(
 
                             val newMs = advanceDetents(beforePt, rawPt, haptics)
                             liveTrimMs.value = newMs
-                            onTrimChange(newMs)
 
                             dragOffsetPt.value = rubberBandPt(rawPt, RANGE_PT)
                             val overshoot = abs(rawPt) > RANGE_PT
@@ -342,7 +337,6 @@ private suspend fun rollInertia(
     initialVelocityPtPerSec: Float,
     liveTrimMs: MutableState<Int>,
     dragOffsetPt: MutableState<Float>,
-    onTrimChange: (Int) -> Unit,
     haptics: BilletHaptics,
 ) {
     var lastPt = startPt
@@ -358,7 +352,6 @@ private suspend fun rollInertia(
             lastPt = clamped
             liveTrimMs.value = newMs
             dragOffsetPt.value = clamped
-            onTrimChange(newMs)
 
             if (stoppedAtBound) cancelAnimation()
         }
@@ -523,7 +516,6 @@ private fun NudgeWheelPreviewZero() {
         NudgeWheel(
             trimMs = 0,
             routeName = null,
-            onTrimChange = {},
             onTrimCommit = {},
         )
     }
@@ -536,7 +528,6 @@ private fun NudgeWheelPreviewTrimmed() {
         NudgeWheel(
             trimMs = -180,
             routeName = "AirPods Pro",
-            onTrimChange = {},
             onTrimCommit = {},
         )
     }

@@ -6,12 +6,10 @@ import org.junit.Test
 
 /**
  * CFX-04 (technical-requirements.md §2.6 "Sheet lifetime & precedence" /
- * ui-ux §6.5 "Sheet lifetime") and CFX-05 (tech-req §2.6 "Entry points"):
- * JVM coverage for [shouldShowCalibrationSheet] and [openDeviceShelfAction]
- * — the two pieces of `SessionScreen.kt`'s sheet-visibility/entry-point
- * wiring that were extracted to plain functions so they're testable without
- * composing anything, same convention as
- * [shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest] (CFX-02).
+ * ui-ux §6.5 "Sheet lifetime"): JVM coverage for
+ * [shouldShowCalibrationSheet] — the piece of `SessionScreen.kt`'s
+ * sheet-visibility wiring that was extracted to a plain function so it's
+ * testable without composing anything.
  *
  * What this file CANNOT cover, and why: whether the actual `ModalBottomSheet`
  * never visually double-renders during a live phase transition (no
@@ -85,22 +83,5 @@ class SessionScreenTest {
         // tap.
         assertFalse(shouldShowCalibrationSheet(true, SessionPhase.LOCKED, firstContactGate = gate))
         assertTrue(shouldShowCalibrationSheet(true, SessionPhase.LOCKED, firstContactGate = null))
-    }
-
-    // ---- CFX-05: IDLE device-shelf entry point wiring -----------------------
-
-    @Test
-    fun openDeviceShelfActionSetsShowDeviceReviewAndInvokesTheCallback() {
-        var shown = false
-        var callbackFired = false
-        val action = openDeviceShelfAction(
-            setShowDeviceReview = { shown = it },
-            onOpenDeviceShelf = { callbackFired = true },
-        )
-
-        action()
-
-        assertTrue(shown)
-        assertTrue(callbackFired)
     }
 }

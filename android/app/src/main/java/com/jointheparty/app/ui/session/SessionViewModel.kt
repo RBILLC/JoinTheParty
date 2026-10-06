@@ -238,26 +238,6 @@ private const val TRIM_PROMOTION_COOLDOWN_MS = 7L * 24 * 60 * 60 * 1000
 private const val TRIM_PROMOTION_FLOOR_MS = 30
 
 /**
- * CAL-10 detection rule (technical-requirements.md §2.6 "Trim promotion"):
- * the most recent [DT.Calibration.trimPromotionSampleCount] (3) wheel
- * commits must ALL fall within [DT.Calibration.trimPromotionToleranceMs]
- * (25 ms) of their own median, AND that median's magnitude must clear
- * [TRIM_PROMOTION_FLOOR_MS] (30 ms) — a strict `>`, not `>=`: a median
- * sitting exactly at the floor is exactly as unpromotable as one below it.
- *
- * The 25 ms tolerance is deliberately not tighter than the engine's own
- * correction deadband: the trim comes from a human ear, whose own
- * repeatability is only ±[DT.Calibration.byEarAccuracyMs] (30 ms) —
- * demanding the wheel agree with itself more precisely than the very
- * instrument doing the judging would mean this rule could never fire
- * (`DT.Calibration.trimPromotionToleranceMs`'s own token doc, ui-ux §6.5).
- *
- * `internal`, not `private`, and a plain function rather than a method —
- * same reasoning as [com.jointheparty.app.ui.components.provenanceLabel]:
- * lets the threshold math be pinned directly by a JVM test, no
- * ViewModel/store/coroutine scaffolding required.
- */
-/**
  * CFX-09 (technical-requirements.md §2.6 "Shelf ordering"): the shell-side
  * half of the ordering contract — [NudgeStore.allCalibrationProfiles]
  * already returns a deterministic updatedAtMs-descending base order (the
@@ -283,6 +263,26 @@ internal fun List<CalibrationProfile>.withConnectedFirst(connectedRouteId: Strin
     return reordered
 }
 
+/**
+ * CAL-10 detection rule (technical-requirements.md §2.6 "Trim promotion"):
+ * the most recent [DT.Calibration.trimPromotionSampleCount] (3) wheel
+ * commits must ALL fall within [DT.Calibration.trimPromotionToleranceMs]
+ * (25 ms) of their own median, AND that median's magnitude must clear
+ * [TRIM_PROMOTION_FLOOR_MS] (30 ms) — a strict `>`, not `>=`: a median
+ * sitting exactly at the floor is exactly as unpromotable as one below it.
+ *
+ * The 25 ms tolerance is deliberately not tighter than the engine's own
+ * correction deadband: the trim comes from a human ear, whose own
+ * repeatability is only ±[DT.Calibration.byEarAccuracyMs] (30 ms) —
+ * demanding the wheel agree with itself more precisely than the very
+ * instrument doing the judging would mean this rule could never fire
+ * (`DT.Calibration.trimPromotionToleranceMs`'s own token doc, ui-ux §6.5).
+ *
+ * `internal`, not `private`, and a plain function rather than a method —
+ * same reasoning as [com.jointheparty.app.ui.components.provenanceLabel]:
+ * lets the threshold math be pinned directly by a JVM test, no
+ * ViewModel/store/coroutine scaffolding required.
+ */
 internal fun trimPromotionMedian(commits: List<Int>): Int? {
     val sampleCount = DT.Calibration.trimPromotionSampleCount.roundToInt()
     if (commits.size < sampleCount) return null
@@ -1771,7 +1771,7 @@ class SessionViewModel(
     /**
      * Drift banner's "Later" (CFX-08, ui-ux §6.5 "Both Quiet actions dismiss
      * in place"): closes the banner on the SAME `DeviceReviewPane.Detail`
-     * the user is already looking at — never [backToDeviceShelf]. Mirrors
+     * the user is already looking at — never [openDeviceShelf]. Mirrors
      * [declineTrimPromotion]'s exact shape (a no-persistence, in-memory
      * flag flip on the currently-open `Detail`, ignored if the pane has
      * since navigated elsewhere or moved to a different device).
@@ -1783,9 +1783,6 @@ class SessionViewModel(
             state.copy(deviceReview = detail.copy(driftDismissed = true))
         }
     }
-
-    /** Detail's back affordance: re-opens the shelf (a fresh read, same as [openDeviceShelf]). */
-    fun backToDeviceShelf() = openDeviceShelf()
 
     /** Closes the review pane entirely — the sheet's dismiss, or a banner's "Later"/"Keep as is" exit. */
     fun dismissDeviceReview() {
@@ -2089,25 +2086,6 @@ class SessionViewModel(
         }
     }
 
-    /**
-     * NAT-06: runs one recognition pass end-to-end — [RecognitionProvider
-     * .recognizeOnce], submit the resulting fix to [SyncEngine
-     * .submitRecognitionFix], and — only while still in MATCHING — resolve
-     * the fix's ISRC to a Spotify URI via [BackendClient
-     * .resolveIsrcToSpotifyUri] and advance to AIMING via [onTrackResolved].
-     * A fix with no ISRC, or a resolution that comes back NotFound/Failure,
-     * simply leaves the session in MATCHING for the next pass to try again
-     * — never a phase change, never an exception.
-     *
-     * [recognitionInFlight] rejects a second concurrent call outright (see
-     * its declaration for why two triggers can race here).
-     */
-    /**
-     * The shell samples on its own cadence only until SyncCore accepts a
-     * fix and takes over scheduling via SC_EVT_REQUEST_FIX. Covers the
-     * AIMING/CONVERGING window where the first fix was discarded for want
-     * of a player timeline.
-     */
     /** True when the fix's position is >5 s from our playback — a genuinely
      * different song, not an alternate release of the current one. */
     private fun isOffsetWildlyOff(fix: RecognitionProvider.RecognitionFixResult): Boolean {
@@ -2183,6 +2161,12 @@ class SessionViewModel(
         return false
     }
 
+    /**
+     * The shell samples on its own cadence only until SyncCore accepts a
+     * fix and takes over scheduling via SC_EVT_REQUEST_FIX. Covers the
+     * AIMING/CONVERGING window where the first fix was discarded for want
+     * of a player timeline.
+     */
     private fun shouldKeepSampling(): Boolean {
         if (firstEstimateSeen) return false
         // Bounded: every pass is a paid recognition request, so a session
@@ -2196,6 +2180,22 @@ class SessionViewModel(
         )
     }
 
+    /**
+     * NAT-06: runs one recognition pass end-to-end — [RecognitionProvider
+     * .recognizeOnce], submit the resulting fix to [SyncEngine
+     * .submitRecognitionFix], and — only while still in MATCHING, or once a
+     * fast-switch candidate is confirmed — resolve
+     * the fix to a track via [resolveTrack] (the provider's own Spotify URI
+     * when it carries one, otherwise the fix's ISRC through [BackendClient
+     * .resolveIsrcToSpotifyUri]), which advances to AIMING via
+     * [resolvedWithAim]. A fix that resolves to nothing (no URI and no
+     * ISRC, or a NotFound/Failure resolution) simply leaves the session in
+     * MATCHING for the next pass to try again — never a phase change, never
+     * an exception.
+     *
+     * [recognitionInFlight] rejects a second concurrent call outright (see
+     * its declaration for why two triggers can race here).
+     */
     private fun runRecognitionPass() {
         val recognizer = recognition ?: return
         if (!recognitionInFlight.compareAndSet(false, true)) return

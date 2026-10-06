@@ -120,7 +120,6 @@ struct Command {
         kRecognitionFix,
         kPlayerState,
         kSeekIssued,
-        kLocalPlayback,
         kSetNudge,
         kSetOutputLatency,
         kSetAecMode,
@@ -237,10 +236,6 @@ struct sc_session {
         synccore::SyncCoreAec aec{kSupportedRateHz};
         uint64_t now_ns = 0;        // latest input timestamp seen
         uint64_t last_emit_ns = 0;  // last SC_EVT_SYNC_ESTIMATE emission
-        // Retained for diagnostics only — the self-match guard no longer
-        // reads it (it was a frozen seek target that never advanced with the
-        // wall clock, which is why the old guard never fired).
-        int64_t last_commanded_position_ms = -1;
         // Room-timeline reference for the self-match guard: offset + capture
         // time of the last accepted fix. It only earns the right to REJECT
         // anything once a second accepted fix has corroborated it — the very
@@ -778,8 +773,8 @@ struct sc_session {
                 }
                 // CORE-06 self-match guard (architecture-spec §7.3).
                 //
-                // The previous form compared the fix against
-                // last_commanded_position_ms — a FROZEN seek target that
+                // The previous form compared the fix against the last
+                // commanded position — a FROZEN seek target that
                 // never advanced with the wall clock, so it went stale
                 // within a second and never fired. Field Test 3 caught the
                 // consequence: with the phone's own output audible to its
@@ -1054,18 +1049,12 @@ struct sc_session {
                 wk.mht.on_local_seek(cmd.value_ms, cmd.mono_ns,
                                      wk.policy.command_latency_ms());
                 wk.policy.on_seek_issued(cmd.mono_ns);
-                // A seek re-commands our own playback position — keep the
-                // self-hearing guard's reference fresh.
-                wk.last_commanded_position_ms = cmd.value_ms;
                 // CTL-05: arm post-seek anchor reconfirmation (see
                 // anchor_pending_reconfirm's declaration) — a fresh seek
                 // always restarts the corroboration requirement, even if a
                 // prior one was still outstanding.
                 wk.anchor_pending_reconfirm = true;
                 wk.post_seek_cand_offset_ms = -1;
-                break;
-            case Command::Kind::kLocalPlayback:
-                wk.last_commanded_position_ms = cmd.value_ms;
                 break;
             case Command::Kind::kSetNudge:
                 wk.estimator.set_nudge_ms(static_cast<double>(cmd.value_ms));
@@ -1413,15 +1402,6 @@ sc_status_t sc_notify_seek_issued(sc_session_t* s, int64_t target_ms,
     cmd.kind = Command::Kind::kSeekIssued;
     cmd.value_ms = target_ms;
     cmd.mono_ns = issued_mono_ns;
-    s->enqueue(std::move(cmd));
-    return SC_OK;
-}
-
-sc_status_t sc_notify_local_playback(sc_session_t* s, int64_t commanded_position_ms) {
-    if (!s || commanded_position_ms < 0) return SC_ERR_INVALID_ARG;
-    Command cmd;
-    cmd.kind = Command::Kind::kLocalPlayback;
-    cmd.value_ms = commanded_position_ms;
     s->enqueue(std::move(cmd));
     return SC_OK;
 }

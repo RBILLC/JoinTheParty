@@ -121,10 +121,8 @@ class AppRemoteSpotifyController(
                         // no Spotify app → needsSpotify; not-logged-in / not
                         // authorized (incl. Premium-gated actions rejected by
                         // the app) → needsPremium/re-auth, surfaced as
-                        // AuthFailed here — the caller (session flow) maps
-                        // AuthFailed to needsPremium once it has also
-                        // confirmed the app IS installed via
-                        // SpotifyAppDetector (AUTH-05).
+                        // AuthFailed here — the caller (SessionViewModel)
+                        // maps AuthFailed straight to needsPremium.
                         com.jointheparty.app.debug.DebugLog.log(
                             "AppRemote onFailure: ${throwable.javaClass.simpleName}: " +
                                 "${throwable.message}",
@@ -153,9 +151,6 @@ class AppRemoteSpotifyController(
         // Same main-thread rule as connect(): App Remote's transport posts
         // its result callbacks to the caller's Looper.
         mainHandler.post { playerApi.play(spotifyUri) }
-        // Self-hearing guard arm (spec §7.3): position 0 because play(uri)
-        // always starts a track from the top.
-        engine.notifyLocalPlayback(0)
         return true
     }
 
@@ -165,9 +160,8 @@ class AppRemoteSpotifyController(
         // timestamp must reflect when *this process* committed to the seek,
         // not whenever App Remote's (never-firing, in the stub) result
         // callback happens to return. SyncCore uses this both to open the
-        // ~3 s settle-window suppression (tech-req §1.2) and, via
-        // notifyLocalPlayback-adjacent bookkeeping, to learn command
-        // latency online (CORE-03 extra: sc_get_command_latency_ms).
+        // ~3 s settle-window suppression (tech-req §1.2) and to learn
+        // command latency online (CORE-03 extra: sc_get_command_latency_ms).
         val issuedMonoNs = System.nanoTime()
         com.jointheparty.app.debug.DebugLog.log(
             "seekTo ${positionMs}ms (player was " +

@@ -242,7 +242,6 @@ void test_setters_clamp_and_validate() {
           SC_ERR_INVALID_ARG);
     CHECK(sc_set_aec_mode(s, SC_AEC_FULL) == SC_OK);
     CHECK(sc_notify_seek_issued(s, -1, 0) == SC_ERR_INVALID_ARG);
-    CHECK(sc_notify_local_playback(s, 1234) == SC_OK);
     CHECK(sc_begin_calibration(s) == SC_OK);
     CHECK(sc_cancel_calibration(s) == SC_OK);
 

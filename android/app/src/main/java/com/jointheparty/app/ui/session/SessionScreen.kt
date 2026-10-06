@@ -6,7 +6,6 @@ import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -19,7 +18,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -32,7 +30,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
@@ -44,6 +41,7 @@ import com.jointheparty.app.core.SyncCore
 import com.jointheparty.app.ui.components.CalibrationSheet
 import com.jointheparty.app.ui.components.FirstContactGateSheet
 import com.jointheparty.app.ui.components.NudgeWheel
+import com.jointheparty.app.ui.components.SheetPill
 import com.jointheparty.app.ui.components.SyncMeter
 import com.jointheparty.app.ui.model.MeterFrame
 import com.jointheparty.app.ui.theme.BilletTheme
@@ -80,7 +78,6 @@ fun SessionScreen(
     state: SyncState,
     meterFrames: Flow<MeterFrame>,
     onJoinTap: () -> Unit,
-    onTrimChange: (Int) -> Unit,
     onTrimCommit: (Int) -> Unit,
     onGetSpotify: () -> Unit,
     onSeePremiumPlans: () -> Unit,
@@ -107,14 +104,12 @@ fun SessionScreen(
     // simple hosts terse, same convention as the calibration intents above).
     onOpenDeviceShelf: () -> Unit = {},
     onSelectDevice: (String) -> Unit = {},
-    onBackToDeviceShelf: () -> Unit = {},
     onDismissDeviceReview: () -> Unit = {},
     // CFX-02 (tech-req §2.6 "Recalibration targeting"): mirrors
     // [com.jointheparty.app.ui.session.SessionViewModel.requestRecalibrate]'s
-    // return — true exactly when a measurement actually started. See
-    // [shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest]'s doc
-    // comment for why the guided-calibration pane's visibility is gated on
-    // this instead of opening unconditionally.
+    // return — true exactly when a measurement actually started. The
+    // guided-calibration pane's visibility is gated on this instead of
+    // opening unconditionally (see the CalibrationSheet wiring below).
     onRequestRecalibrate: () -> Boolean = { false },
     // CAL-09: first-contact gate intents (defaults keep previews/simple
     // hosts terse, same convention as the calibration intents above).
@@ -155,15 +150,14 @@ fun SessionScreen(
         }
     }
 
-    // CFX-05 (tech-req §2.6 "Entry points"): the exact same open-shelf
-    // action ActiveContent's "Devices" already used, extracted so IDLE's
-    // entry point below wires to the identical closure shape — one
-    // definition, reused, rather than two composables independently
-    // deciding how "open the shelf" behaves.
-    val handleOpenDeviceShelf = openDeviceShelfAction(
-        setShowDeviceReview = { showDeviceReview = it },
-        onOpenDeviceShelf = onOpenDeviceShelf,
-    )
+    // CFX-05 (tech-req §2.6 "Entry points"): the open-shelf action shared
+    // by IdleContent's and ActiveContent's "Devices" entry points — one
+    // definition, reused, so the two can never drift into behaving
+    // differently from each other.
+    val handleOpenDeviceShelf = {
+        showDeviceReview = true
+        onOpenDeviceShelf()
+    }
 
     Box(
         modifier = modifier
@@ -203,7 +197,6 @@ fun SessionScreen(
                 PhaseGroup.ACTIVE -> ActiveContent(
                     state = state,
                     meterFrames = meterFrames,
-                    onTrimChange = onTrimChange,
                     onTrimCommit = onTrimCommit,
                     onOpenCalibration = { showCalibration = true },
                     onOpenDeviceShelf = handleOpenDeviceShelf,
@@ -231,9 +224,23 @@ fun SessionScreen(
         // the gate below is rendered completely independently, so this
         // condition excluding gate!=null is what makes the two sheets
         // structurally exclusive rather than a coincidence of layout.
+        //
+        // A calibration the user can't see isn't a calibration.
+        // FIELD FIX (device test, 2026-07-28): accepting the first-contact
+        // gate calls `startCalibration()` on the ViewModel, but nothing set
+        // `showCalibration` — that flag is only flipped by the "Calibrate"
+        // entry point. So "Calibrate now" dismissed the gate, armed a
+        // measurement, and returned the user to a bare idle screen with no
+        // sheet, no chirp feedback, and no result. The screen-local flags
+        // mean "the user asked to open this"; any non-Idle calibration
+        // state (in flight, or a result/failure not yet acknowledged) is a
+        // second, independent reason the sheet must be on screen. Deriving
+        // it from the ViewModel's own state means any future path that
+        // starts a calibration presents it, without having to remember to
+        // set a flag too.
         if (shouldShowCalibrationSheet(
                 sheetRequested = showCalibration || showDeviceReview ||
-                    state.calibration.isInProgress(),
+                    state.calibration != CalibrationState.Idle,
                 phase = state.phase,
                 firstContactGate = state.firstContactGate,
             )
@@ -261,7 +268,8 @@ fun SessionScreen(
                 deviceReview = if (showDeviceReview) state.deviceReview else DeviceReviewPane.Hidden,
                 connectedRouteId = state.routeId,
                 onSelectDevice = onSelectDevice,
-                onBackToShelf = onBackToDeviceShelf,
+                // Detail's back affordance re-opens the shelf (a fresh read).
+                onBackToShelf = onOpenDeviceShelf,
                 onRequestRecalibrate = {
                     // Detail's "Calibrate again": the review pane closes
                     // itself (the ViewModel sets deviceReview = Hidden).
@@ -272,7 +280,9 @@ fun SessionScreen(
                     // titled with whatever device happened to be connected
                     // even when nothing was started against it.
                     showDeviceReview = false
-                    showCalibration = shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest(onRequestRecalibrate)
+                    // CFX-02 rule: the guided pane opens only when a
+                    // recalibration actually started.
+                    showCalibration = onRequestRecalibrate()
                 },
                 onCalibratePhoneSpeaker = {
                     // CFX-02: DEVICE_SHELF_EMPTY_PRIMARY is now labelled
@@ -328,9 +338,7 @@ fun SessionScreen(
  *     (the sheet only becomes visible once accept/decline clears it).
  *
  * `internal`, not `private`: lets a JVM test drive this directly against a
- * scripted phase/gate combination without composing anything — same
- * "extract for testability" convention as
- * [shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest]. What this
+ * scripted phase/gate combination without composing anything. What this
  * function alone does NOT cover — actually resetting [SessionScreen]'s
  * local `showCalibration`/`showDeviceReview` flags so a sheet closed by
  * rule 1 doesn't resurrect itself the moment the phase returns to ACTIVE —
@@ -344,34 +352,6 @@ internal fun shouldShowCalibrationSheet(
     phase: SessionPhase,
     firstContactGate: FirstContactGateState?,
 ): Boolean = sheetRequested && firstContactGate == null && phase.allowsCalibrationSheet()
-
-/**
- * A calibration the user can't see isn't a calibration.
- *
- * FIELD FIX (device test, 2026-07-28): accepting the first-contact gate
- * calls `startCalibration()` on the ViewModel, but nothing set
- * `showCalibration` — that flag is only flipped by the "Calibrate" entry
- * point. So "Calibrate now" dismissed the gate, armed a measurement, and
- * returned the user to a bare idle screen with no sheet, no chirp
- * feedback, and no result. This predates the CFX wave; the audit missed it
- * because it traced states rather than driving the app.
- *
- * The screen-local flags mean "the user asked to open this"; an in-flight
- * measurement is a second, independent reason the sheet must be on screen.
- * Deriving it from the ViewModel's own state means any future path that
- * starts a calibration presents it, without having to remember to set a
- * flag too.
- */
-private fun CalibrationState.isInProgress(): Boolean = when (this) {
-    CalibrationState.Idle -> false
-    CalibrationState.Running,
-    CalibrationState.Failed,
-    CalibrationState.Cancelled,
-    CalibrationState.ByEarIdle,
-    CalibrationState.ByEarRunning,
-    -> true
-    is CalibrationState.Success, is CalibrationState.ByEarSuccess -> true
-}
 
 /**
  * IDLE and ACTIVE both host the sheet; everything else closes it.
@@ -398,44 +378,6 @@ private fun SessionPhase.allowsCalibrationSheet(): Boolean =
         PhaseGroup.IDLE, PhaseGroup.ACTIVE -> true
         PhaseGroup.WAITING, PhaseGroup.LOST, PhaseGroup.CONCIERGE -> false
     }
-
-/**
- * CFX-05 (tech-req §2.6 "Entry points"): the open-shelf action shared by
- * IdleContent's and ActiveContent's "Devices" entry points — flips the
- * screen-local `showDeviceReview` flag and fires the ViewModel's
- * [com.jointheparty.app.ui.session.SessionViewModel.openDeviceShelf] call,
- * exactly as the pre-CFX-05 inline lambda on ActiveContent's entry point
- * did. Extracted to a plain function (not a private inline lambda per call
- * site) for two reasons: it lets a JVM test assert the wiring directly —
- * same "extract for testability" convention as
- * [shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest] — and it
- * guarantees IDLE's and ACTIVE's entry points can never drift into
- * behaving differently from each other over time.
- */
-internal fun openDeviceShelfAction(
-    setShowDeviceReview: (Boolean) -> Unit,
-    onOpenDeviceShelf: () -> Unit,
-): () -> Unit = {
-    setShowDeviceReview(true)
-    onOpenDeviceShelf()
-}
-
-/**
- * CFX-02 (tech-req §2.6 "Recalibration targeting"): [SessionScreen]'s
- * "Calibrate again" pane-swap decision, extracted as a plain function so
- * it's unit-testable without composing anything — this file's sheet/pane
- * `remember`ed booleans aren't otherwise reachable from a JVM test.
- * [requestRecalibrate] mirrors [SessionViewModel.requestRecalibrate]'s
- * return value: true exactly when a measurement actually started. The
- * guided-calibration pane must open if and only if that's true — CFX-02's
- * bug was this happening unconditionally, which swapped the sheet into a
- * guided flow titled with whatever device happened to be connected even
- * when [SessionViewModel.requestRecalibrate] silently declined (mismatched
- * routeId) to start anything against it.
- */
-internal fun shouldOpenGuidedCalibrationPaneAfterRecalibrateRequest(
-    requestRecalibrate: () -> Boolean,
-): Boolean = requestRecalibrate()
 
 /**
  * Field request: the song's current position, quiet fine print under the
@@ -525,7 +467,9 @@ private fun IdleContent(
 ) {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            JoinButton(onClick = onJoinTap)
+            // The screen's one-and-only warm accent — see the
+            // [SessionScreen] doc comment.
+            SheetPill("Join the party", primary = true, onTap = onJoinTap, horizontalPadding = DT.Space.gutter)
             // Field feedback: don't invite a connection that already exists.
             if (spotifyLinked) {
                 Text(
@@ -673,7 +617,6 @@ private fun PhaseWord(word: String, level: Flow<Float>) {
 private fun ActiveContent(
     state: SyncState,
     meterFrames: Flow<MeterFrame>,
-    onTrimChange: (Int) -> Unit,
     onTrimCommit: (Int) -> Unit,
     onOpenCalibration: () -> Unit = {},
     onOpenDeviceShelf: () -> Unit = {},
@@ -703,7 +646,6 @@ private fun ActiveContent(
         NudgeWheel(
             trimMs = state.nudgeMs,
             routeName = state.routeName,
-            onTrimChange = onTrimChange,
             onTrimCommit = onTrimCommit,
         )
         // Quiet settings-tier actions (§4): calibration entry and — UX
@@ -778,12 +720,10 @@ private fun activePhaseWord(phase: SessionPhase): String = when (phase) {
  * running. This composable is purely a renderer of whatever phase it's
  * given; it holds no dismissal memory itself.
  *
- * TODO(UI-06 follow-up): §6.4 point 4 ("never repeat the gate more than once
- * per session after dismissal") is NOT yet enforced — [SessionViewModel]'s
- * transition table currently allows any phase → NEEDS_SPOTIFY/NEEDS_PREMIUM
- * unconditionally (see its `isLegalTransition`), so the gate can currently
- * reappear more than once in a session. That's state-machine-owned and out
- * of this ticket's file list (a concurrent change owns SessionViewModel.kt).
+ * §6.4 point 4 ("never repeat the gate more than once per session after
+ * dismissal") is enforced by [SessionViewModel], not here — its
+ * `gateDismissedThisSession` flag makes a dismissed gate decline to
+ * reappear until the session ends.
  *
  * ERROR keeps UI-05's quiet-text/tap-to-retry treatment; it isn't part of
  * the §6.4 gate copy.
@@ -856,40 +796,15 @@ private fun ConciergeGate(
             // green, untouched, per Spotify's brand guidelines) — assets
             // aren't available yet, so these stay text-only pills for now.
             Spacer(modifier = Modifier.height(DT.Space.sectionGap))
-            PrimaryPill(label = primaryLabel, onClick = onPrimary)
+            SheetPill(primaryLabel, primary = true, onTap = onPrimary, horizontalPadding = DT.Space.gutter)
             Spacer(modifier = Modifier.height(DT.Space.grid))
-            SecondaryPill(label = "Keep identifying songs", onClick = onSecondary)
+            SheetPill(
+                "Keep identifying songs",
+                primary = false,
+                onTap = onSecondary,
+                horizontalPadding = DT.Space.gutter,
+            )
         }
-    }
-}
-
-/** Primary pill (§6.3): `brass` fill, `void` text, [BilletType.label]. */
-@Composable
-private fun PrimaryPill(label: String, onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(percent = 50))
-            .background(DT.Colors.brass)
-            .clickable(onClick = onClick)
-            .padding(horizontal = DT.Space.gutter, vertical = 14.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(text = label, style = BilletType.label, color = DT.Colors.void)
-    }
-}
-
-/** Secondary pill (§6.3): no fill, 1px `hairline` outline, `ink` text. */
-@Composable
-private fun SecondaryPill(label: String, onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(percent = 50))
-            .border(width = 1.dp, color = DT.Colors.hairline, shape = RoundedCornerShape(percent = 50))
-            .clickable(onClick = onClick)
-            .padding(horizontal = DT.Space.gutter, vertical = 14.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(text = label, style = BilletType.label, color = DT.Colors.ink)
     }
 }
 
@@ -910,24 +825,6 @@ private fun QuietMessage(
     }
 }
 
-/**
- * Primary pill (§6.3): `brass` fill, `void` text, [BilletType.label]. The
- * screen's one-and-only warm accent — see the [SessionScreen] doc comment.
- */
-@Composable
-private fun JoinButton(onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(percent = 50))
-            .background(DT.Colors.brass)
-            .clickable(onClick = onClick)
-            .padding(horizontal = DT.Space.gutter, vertical = 14.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(text = "Join the party", style = BilletType.label, color = DT.Colors.void)
-    }
-}
-
 // ---- Previews ---------------------------------------------------------------
 
 @Preview(name = "Idle — the invitation", showBackground = true, backgroundColor = 0xFF131110)
@@ -938,7 +835,6 @@ private fun SessionScreenIdlePreview() {
             state = SyncState(phase = SessionPhase.IDLE),
             meterFrames = MutableStateFlow(MeterFrame.Initial),
             onJoinTap = {},
-            onTrimChange = {},
             onTrimCommit = {},
             onGetSpotify = {},
             onSeePremiumPlans = {},
@@ -954,7 +850,6 @@ private fun SessionScreenListeningPreview() {
             state = SyncState(phase = SessionPhase.LISTENING),
             meterFrames = MutableStateFlow(MeterFrame.Initial),
             onJoinTap = {},
-            onTrimChange = {},
             onTrimCommit = {},
             onGetSpotify = {},
             onSeePremiumPlans = {},
@@ -972,7 +867,6 @@ private fun SessionScreenListeningBrightPreview() {
             state = SyncState(phase = SessionPhase.LISTENING),
             meterFrames = MutableStateFlow(MeterFrame.Initial),
             onJoinTap = {},
-            onTrimChange = {},
             onTrimCommit = {},
             onGetSpotify = {},
             onSeePremiumPlans = {},
@@ -1003,7 +897,6 @@ private fun SessionScreenLockedPreview() {
                 MeterFrame(errorMs = 2.0, driftPpm = 10.0, confidence = 0.97f, converged = true),
             ),
             onJoinTap = {},
-            onTrimChange = {},
             onTrimCommit = {},
             onGetSpotify = {},
             onSeePremiumPlans = {},
@@ -1019,7 +912,6 @@ private fun SessionScreenNeedsSpotifyPreview() {
             state = SyncState(phase = SessionPhase.NEEDS_SPOTIFY),
             meterFrames = MutableStateFlow(MeterFrame.Initial),
             onJoinTap = {},
-            onTrimChange = {},
             onTrimCommit = {},
             onGetSpotify = {},
             onSeePremiumPlans = {},
@@ -1035,7 +927,6 @@ private fun SessionScreenNeedsPremiumPreview() {
             state = SyncState(phase = SessionPhase.NEEDS_PREMIUM),
             meterFrames = MutableStateFlow(MeterFrame.Initial),
             onJoinTap = {},
-            onTrimChange = {},
             onTrimCommit = {},
             onGetSpotify = {},
             onSeePremiumPlans = {},

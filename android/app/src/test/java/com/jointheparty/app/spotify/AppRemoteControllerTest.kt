@@ -45,7 +45,6 @@ class AppRemoteControllerTest {
         val result = controller.play("spotify:track:abc")
 
         assertFalse(result)
-        assertTrue(engine.notifyLocalPlaybackCalls.isEmpty())
     }
 
     @Test
@@ -81,7 +80,6 @@ private class FakeSyncEngine : SyncEngine {
     override fun inputLevel(): Flow<Float> = kotlinx.coroutines.flow.flowOf(0f)
 
     val notifySeekIssuedCalls = mutableListOf<Pair<Long, Long>>()
-    val notifyLocalPlaybackCalls = mutableListOf<Long>()
     val submitPlayerStateCalls = mutableListOf<Triple<Long, Boolean, Long>>()
 
     override fun startCapture(): Boolean = true
@@ -104,11 +102,6 @@ private class FakeSyncEngine : SyncEngine {
 
     override fun notifySeekIssued(targetMs: Long, issuedMonoNs: Long): Boolean {
         notifySeekIssuedCalls += targetMs to issuedMonoNs
-        return true
-    }
-
-    override fun notifyLocalPlayback(commandedPositionMs: Long): Boolean {
-        notifyLocalPlaybackCalls += commandedPositionMs
         return true
     }
 

@@ -22,6 +22,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.jointheparty.app.ui.session.CalibrationState
 import com.jointheparty.app.ui.session.DeviceReviewPane
@@ -401,9 +402,11 @@ private fun ToneMatchCaliper(onCommit: (Int) -> Unit) {
 }
 
 /**
- * Local pill matching §6.3 (SessionScreen's pills are private to it).
- * `internal`, not `private` — CAL-08's [DeviceShelf]/[DeviceDetail] reuse it
- * unchanged rather than duplicating the pill idiom.
+ * The §6.3 pill: `brass` fill / `void` text when [primary], otherwise a 1px
+ * `hairline` outline with `ink` text. `internal`, not `private` — the one
+ * pill idiom for the sheets, the session screen and onboarding alike.
+ * [horizontalPadding] exists because the full-screen pills (join, concierge)
+ * sit on the [DT.Space.gutter] rhythm while the sheet pills are 28dp.
  */
 @Composable
 internal fun SheetPill(
@@ -411,6 +414,7 @@ internal fun SheetPill(
     primary: Boolean,
     onTap: () -> Unit,
     enabled: Boolean = true,
+    horizontalPadding: Dp = 28.dp,
 ) {
     val shape = RoundedCornerShape(44.dp)
     val base = Modifier
@@ -421,7 +425,7 @@ internal fun SheetPill(
             else it.border(1.dp, DT.Colors.hairline, shape)
         }
         .clickable(enabled = enabled, onClick = onTap)
-        .padding(horizontal = 28.dp, vertical = 14.dp)
+        .padding(horizontal = horizontalPadding, vertical = 14.dp)
     Text(
         text = label,
         style = BilletType.label,

@@ -70,8 +70,6 @@ sc_status_t sc_set_output_route(sc_session_t*, sc_route_t, int32_t latency_prior
 sc_status_t sc_set_aec_mode(sc_session_t*, sc_aec_mode_t);
 sc_status_t sc_notify_seek_issued(sc_session_t*, int64_t target_ms,
                                   uint64_t issued_mono_ns);             // suppresses fixes during settle
-sc_status_t sc_notify_local_playback(sc_session_t*, int64_t commanded_position_ms);
-                                  // arms the self-hearing guard (spec §7.3)
 
 /* ---- AEC reference (synthesized; non-RT thread, chunked) ---- */
 sc_status_t sc_push_reference(sc_session_t*, const float* mono, int32_t frames,

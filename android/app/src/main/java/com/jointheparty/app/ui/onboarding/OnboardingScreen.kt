@@ -30,6 +30,7 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import com.jointheparty.app.ui.components.SheetPill
 import com.jointheparty.app.ui.theme.BilletTheme
 import com.jointheparty.app.ui.theme.BilletType
 import com.jointheparty.app.ui.theme.DT
@@ -88,7 +89,7 @@ fun OnboardingScreen(onDone: () -> Unit, modifier: Modifier = Modifier) {
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             if (pagerState.currentPage == lastPage) {
-                JoinButton(onClick = onDone)
+                SheetPill("Join the party", primary = true, onTap = onDone, horizontalPadding = DT.Space.gutter)
                 Spacer(modifier = Modifier.height(DT.Space.sectionGap))
             }
             PageIndicator(pageCount = pageCount, currentPage = pagerState.currentPage)
@@ -202,21 +203,6 @@ private fun PageIndicator(pageCount: Int, currentPage: Int, modifier: Modifier =
                     .background(if (index == currentPage) DT.Colors.ink2 else DT.Colors.hairline),
             )
         }
-    }
-}
-
-/** Primary pill (§6.3): `brass` fill, `void` text, [BilletType.label]. */
-@Composable
-private fun JoinButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
-    Box(
-        modifier = modifier
-            .clip(RoundedCornerShape(percent = 50))
-            .background(DT.Colors.brass)
-            .clickable(onClick = onClick)
-            .padding(horizontal = DT.Space.gutter, vertical = 14.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(text = "Join the party", style = BilletType.label, color = DT.Colors.void)
     }
 }
 

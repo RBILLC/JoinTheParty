@@ -353,14 +353,6 @@ Java_com_jointheparty_app_core_SyncCore_nativeNotifyDuckExecuted(
 }
 
 JNIEXPORT jint JNICALL
-Java_com_jointheparty_app_core_SyncCore_nativeNotifyLocalPlayback(
-    JNIEnv*, jobject, jlong handle, jlong commanded_position_ms) {
-    auto* h = handle_of(handle);
-    return h ? sc_notify_local_playback(h->session, commanded_position_ms)
-             : SC_ERR_INVALID_ARG;
-}
-
-JNIEXPORT jint JNICALL
 Java_com_jointheparty_app_core_SyncCore_nativePushReference(
     JNIEnv* env, jobject, jlong handle, jfloatArray samples, jint frames,
     jlong track_position_ms) {

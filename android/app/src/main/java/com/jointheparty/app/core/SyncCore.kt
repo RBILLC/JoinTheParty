@@ -216,9 +216,6 @@ class SyncCore(
     override fun notifySeekIssued(targetMs: Long, issuedMonoNs: Long): Boolean =
         nativeNotifySeekIssued(handle, targetMs, issuedMonoNs) == 0
 
-    override fun notifyLocalPlayback(commandedPositionMs: Long): Boolean =
-        nativeNotifyLocalPlayback(handle, commandedPositionMs) == 0
-
     /**
      * CTL-01b: echoes an executed [Event.ActiveProbe] (pause -> delay ->
      * resume already performed by the caller), mirroring [notifySeekIssued]'s
@@ -367,7 +364,6 @@ class SyncCore(
     private external fun nativeSetOutputRoute(handle: Long, route: Int, latencyPriorMs: Int): Int
     private external fun nativeSetAecMode(handle: Long, mode: Int): Int
     private external fun nativeNotifySeekIssued(handle: Long, targetMs: Long, issuedMonoNs: Long): Int
-    private external fun nativeNotifyLocalPlayback(handle: Long, commandedPositionMs: Long): Int
     private external fun nativeNotifyProbeExecuted(handle: Long): Int
     private external fun nativeNotifyDuckExecuted(handle: Long, achievedDeciDb: Int): Int
     private external fun nativePushReference(

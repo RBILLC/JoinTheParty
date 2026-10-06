@@ -110,7 +110,7 @@ typedef struct {
 
 sc_status_t sc_submit_player_state(sc_session_t*, const sc_player_state_t*);
 
-/* Values outside ±750 ms are clamped. */
+/* Values outside ±4000 ms are clamped. */
 sc_status_t sc_set_user_nudge_ms(sc_session_t*, int32_t nudge_ms);
 
 sc_status_t sc_set_output_route(sc_session_t*, sc_route_t, int32_t latency_prior_ms);
@@ -121,9 +121,6 @@ sc_status_t sc_set_aec_mode(sc_session_t*, sc_aec_mode_t);
  * estimator suppresses measurements during the settle window. */
 sc_status_t sc_notify_seek_issued(sc_session_t*, int64_t target_ms,
                                   uint64_t issued_mono_ns);
-
-/* Arms the self-hearing guard (architecture-spec.md §7.3). */
-sc_status_t sc_notify_local_playback(sc_session_t*, int64_t commanded_position_ms);
 
 /* CTL-01a (technical-requirements.md §2.9): the shell MUST call this after
  * actually executing an SC_EVT_ACTIVE_PROBE — pausing playback, waiting
@@ -153,13 +150,6 @@ sc_status_t sc_notify_probe_executed(sc_session_t*);
  * with no duck outstanding (silently ignored, still returns SC_OK). */
 sc_status_t sc_notify_duck_executed(sc_session_t*, int32_t achieved_deci_db);
 
-/* Copies up to max_frames of the MOST RECENT capture audio (post-AEC, mono
- * float, chronological order) into out. Returns the number of frames
- * copied (0 if none yet). If out_end_mono_ns is non-NULL it receives the
- * capture timestamp of the last copied frame — the pairing recognition
- * providers need (a match offset references the sample's end). Thread-safe,
- * non-RT (brief mutex against the worker's history writer; never touches
- * the RT ring). The engine retains ~12 s of history. */
 /* Clears the retained capture history (and the smoothed input level). Call
  * when the shell (re)opens its capture stream: the ring otherwise survives a
  * capture stop/start, so the first recognition window of a NEW session can
@@ -169,6 +159,13 @@ sc_status_t sc_notify_duck_executed(sc_session_t*, int32_t achieved_deci_db);
  * stale clock: consuming input recorded before the epoch it belongs to. */
 sc_status_t sc_reset_capture_history(sc_session_t*);
 
+/* Copies up to max_frames of the MOST RECENT capture audio (post-AEC, mono
+ * float, chronological order) into out. Returns the number of frames
+ * copied (0 if none yet). If out_end_mono_ns is non-NULL it receives the
+ * capture timestamp of the last copied frame — the pairing recognition
+ * providers need (a match offset references the sample's end). Thread-safe,
+ * non-RT (brief mutex against the worker's history writer; never touches
+ * the RT ring). The engine retains ~12 s of history. */
 int32_t sc_copy_recent_capture(sc_session_t*, float* out, int32_t max_frames,
                                uint64_t* out_end_mono_ns);
 
